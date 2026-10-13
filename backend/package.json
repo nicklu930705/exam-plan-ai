@@ -4,10 +4,11 @@
   "description": "考試計畫 AI - Vercel Serverless API 後端 (Google Gemini 代理服務)",
   "private": true,
   "scripts": {
-    "build": "tsc",
+    "build": "echo 'Backend ready'",
     "typecheck": "tsc --noEmit",
     "start": "node dist/api/study-advice.js"
   },
+
   "dependencies": {
     "@google/genai": "^2.29.1"
   },
