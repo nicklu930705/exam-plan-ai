@@ -1,17 +1,23 @@
 {
   "expo": {
-    "name": "exam-plan-ai",
+    "name": "考試計畫 AI",
     "slug": "exam-plan-ai",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
+    "scheme": "examplanai",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": false,
+      "bundleIdentifier": "com.examplanai.app",
+      "infoPlist": {
+        "CFBundleDevelopmentRegion": "zh_TW"
+      }
     },
     "android": {
+      "package": "com.examplanai.app",
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
+        "backgroundColor": "#F7F6F1",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
@@ -20,6 +26,12 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": [
+      "expo-router",
+      "@react-native-community/datetimepicker",
+      "expo-font",
+      "expo-iap"
+    ]
   }
 }

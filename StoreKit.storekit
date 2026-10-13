@@ -1,0 +1,170 @@
+{
+  "appPolicies" : {
+    "eula" : "",
+    "policies" : [
+      {
+        "locale" : "en_US",
+        "policyText" : ""
+      }
+    ]
+  },
+  "identifier" : "E2B7853A-42F7-4180-877A-72535F8E1C92",
+  "nonRenewingSubscriptions" : [
+
+  ],
+  "products" : [
+    {
+      "displayPrice" : "1690",
+      "familyShareable" : true,
+      "internalID" : "A103B901",
+      "localizations" : [
+        {
+          "description" : "一次購買，永久解鎖無限考試管理與核心排程引擎",
+          "displayName" : "Lifetime 終身買斷版",
+          "locale" : "zh_TW"
+        },
+        {
+          "description" : "One-time purchase for permanent Pro access and exam planning",
+          "displayName" : "Lifetime Pro",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "exampro_lifetime",
+      "referenceName" : "Exam Plan AI Lifetime",
+      "type" : "NonConsumable"
+    }
+  ],
+  "settings" : {
+    "_applicationInternalID" : "6740001001",
+    "_developerTeamID" : "XXXXXXXXXX",
+    "_failTransactionsEnabled" : false,
+    "_locale" : "zh_TW",
+    "_storefront" : "TWN",
+    "_storeKitErrors" : [
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Load Products"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Purchase"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Verification"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "App Store Sync"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Subscription Status"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "App Transaction"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Manage Subscriptions Sheet"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Refund Request Sheet"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Offer Code Redeem Sheet"
+      }
+    ]
+  },
+  "subscriptionGroups" : [
+    {
+      "id" : "21400001",
+      "localizations" : [
+        {
+          "description" : "考試計畫 AI Pro 會員方案群組",
+          "displayName" : "Exam Plan AI Pro",
+          "locale" : "zh_TW"
+        }
+      ],
+      "name" : "ExamPlanAIProGroup",
+      "subscriptions" : [
+        {
+          "adHocOffers" : [
+
+          ],
+          "codeOffers" : [
+
+          ],
+          "displayPrice" : "149",
+          "familyShareable" : true,
+          "groupNumber" : 2,
+          "internalID" : "B201C101",
+          "introductoryOffer" : null,
+          "localizations" : [
+            {
+              "description" : "解鎖無限考試計畫、智慧重新排程與個人化 AI 學習建議",
+              "displayName" : "Pro 月訂閱",
+              "locale" : "zh_TW"
+            },
+            {
+              "description" : "Monthly Pro subscription with smart scheduling",
+              "displayName" : "Pro Monthly",
+              "locale" : "en_US"
+            }
+          ],
+          "productID" : "exampro_monthly",
+          "recurringSubscriptionPeriod" : "P1M",
+          "referenceName" : "Exam Plan AI Pro Monthly",
+          "subscriptionGroupID" : "21400001",
+          "type" : "RecurringSubscription"
+        },
+        {
+          "adHocOffers" : [
+
+          ],
+          "codeOffers" : [
+
+          ],
+          "displayPrice" : "990",
+          "familyShareable" : true,
+          "groupNumber" : 1,
+          "internalID" : "B201C102",
+          "introductoryOffer" : null,
+          "localizations" : [
+            {
+              "description" : "長期備考首選，省 45%，享所有 Pro 完整功能與深度分析",
+              "displayName" : "Pro 年訂閱",
+              "locale" : "zh_TW"
+            },
+            {
+              "description" : "Annual Pro subscription with best savings",
+              "displayName" : "Pro Yearly",
+              "locale" : "en_US"
+            }
+          ],
+          "productID" : "exampro_yearly",
+          "recurringSubscriptionPeriod" : "P1Y",
+          "referenceName" : "Exam Plan AI Pro Yearly",
+          "subscriptionGroupID" : "21400001",
+          "type" : "RecurringSubscription"
+        }
+      ]
+    }
+  ],
+  "version" : {
+    "major" : 4,
+    "minor" : 0
+  }
+}

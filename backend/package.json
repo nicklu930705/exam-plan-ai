@@ -1,0 +1,19 @@
+{
+  "name": "exam-plan-ai-backend",
+  "version": "1.0.0",
+  "description": "考試計畫 AI - Vercel Serverless API 後端 (Google Gemini 代理服務)",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/api/study-advice.js"
+  },
+  "dependencies": {
+    "@google/genai": "^2.29.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@vercel/node": "^5.1.8",
+    "typescript": "^5.7.0"
+  }
+}
