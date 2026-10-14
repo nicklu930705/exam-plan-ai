@@ -29,7 +29,7 @@ export interface StructuredAdvice {
 export interface StudyAdviceResponse {
   success: boolean;
   advice?: StructuredAdvice;
-  source: 'gemini_ai' | 'fallback_rule_engine';
+  source: 'openai_ai' | 'gemini_ai' | 'fallback_rule_engine';
   disclaimer: string;
   error?: string;
   code?: string;

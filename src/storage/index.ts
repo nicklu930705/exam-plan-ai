@@ -49,29 +49,42 @@ export async function clearAppDataFromStorage(): Promise<void> {
 
 const BACKEND_URL_KEY = '@exam_plan_ai:backend_url';
 
-export async function getBackendUrlFromStorage(): Promise<string | null> {
+export const DEFAULT_BACKEND_URL = 'https://exam-plan-ai-backend-coral.vercel.app';
+
+export function normalizeBackendUrl(url: string | null | undefined): string | null {
+  if (!url) return null;
+  let trimmed = url.trim().replace(/\/+$/, '');
+  if (!trimmed) return null;
+  if (!/^https?:\/\//i.test(trimmed)) {
+    trimmed = `https://${trimmed}`;
+  }
+  return trimmed;
+}
+
+export async function getBackendUrlFromStorage(allowDefault: boolean = true): Promise<string | null> {
   try {
     const saved = await AsyncStorage.getItem(BACKEND_URL_KEY);
     if (saved && saved.trim().length > 0) {
-      return saved.trim();
+      return normalizeBackendUrl(saved);
     }
     // 環境變數預設值（非機密之 API 伺服器端點，嚴禁放入任何 API 金鑰）
     const envUrl = process.env.EXPO_PUBLIC_BACKEND_URL;
     if (envUrl && envUrl.trim().length > 0) {
-      return envUrl.trim();
+      return normalizeBackendUrl(envUrl);
     }
-    return null;
+    return allowDefault ? DEFAULT_BACKEND_URL : null;
   } catch {
-    return null;
+    return allowDefault ? DEFAULT_BACKEND_URL : null;
   }
 }
 
 export async function saveBackendUrlToStorage(url: string | null): Promise<void> {
   try {
-    if (!url || url.trim().length === 0) {
+    const normalized = normalizeBackendUrl(url);
+    if (!normalized) {
       await AsyncStorage.removeItem(BACKEND_URL_KEY);
     } else {
-      await AsyncStorage.setItem(BACKEND_URL_KEY, url.trim());
+      await AsyncStorage.setItem(BACKEND_URL_KEY, normalized);
     }
   } catch (error) {
     console.error('儲存後端伺服器網址失敗：', error);

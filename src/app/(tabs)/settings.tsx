@@ -35,15 +35,16 @@ export default function SettingsScreen() {
   const editBackendUrl = () => {
     Alert.prompt(
       '設定 Vercel 後端網址',
-      '請輸入您部署於 Vercel 的後端網址（例如：https://my-exam-ai.vercel.app）：',
+      '請輸入您的後端伺服器網址（預設已連線至您的正式 Vercel 後端）：',
       [
         { text: '取消', style: 'cancel' },
         {
-          text: '清除網址',
+          text: '恢復預設網址',
           style: 'destructive',
           onPress: async () => {
             await saveBackendUrlToStorage(null);
-            setBackendUrl(null);
+            const def = await getBackendUrlFromStorage();
+            setBackendUrl(def);
           },
         },
         {
@@ -51,10 +52,10 @@ export default function SettingsScreen() {
           onPress: async (val?: string) => {
             const trimmed = val ? val.trim() : null;
             await saveBackendUrlToStorage(trimmed);
-            setBackendUrl(trimmed);
+            const updated = await getBackendUrlFromStorage();
+            setBackendUrl(updated);
           },
         },
-
       ],
       'plain-text',
       backendUrl ?? '',

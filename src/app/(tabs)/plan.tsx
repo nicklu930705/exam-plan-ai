@@ -4,6 +4,7 @@ import { useMemo, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
 
 import { ActiveTimerBanner } from '../../components/ActiveTimerBanner';
+import { AiAdviceCard } from '../../components/AiAdviceCard';
 import { AppText } from '../../components/AppText';
 import { EmptyState } from '../../components/EmptyState';
 import { Segmented } from '../../components/FormControls';
@@ -13,9 +14,15 @@ import { ScreenHeader } from '../../components/ScreenHeader';
 import { TaskRow } from '../../components/TaskRow';
 import { useStudyTimer } from '../../hooks/useStudyTimer';
 import { useToday } from '../../hooks/useToday';
+import {
+  logDiagnostic,
+  requestAiStudyAdvice,
+  type AiAdviceServiceResult,
+} from '../../services/aiAdviceService';
 import { useAppStore } from '../../store/AppStore';
 import {
   computeProgress,
+  getBehindTasks,
   getExamById,
   getSubject,
   getUpcomingExam,
@@ -24,7 +31,7 @@ import {
   tasksForDate,
   tasksForExam,
 } from '../../store/selectors';
-import { colors, MIN_TOUCH, radius, spacing } from '../../theme';
+import { colors, MIN_TOUCH, radius, shadow, spacing } from '../../theme';
 import {
   addDays,
   formatFullDate,
@@ -47,6 +54,11 @@ export default function PlanScreen() {
   const [userSelectedExamId, setUserSelectedExamId] = useState<string | undefined>();
   const [viewMode, setViewMode] = useState<'week' | 'all'>('week');
   const [customWeekStart, setCustomWeekStart] = useState<string | null>(null);
+
+  // Gemini AI 讀書建議狀態
+  const [aiAdviceResult, setAiAdviceResult] = useState<AiAdviceServiceResult | null>(null);
+  const [isLoadingAi, setIsLoadingAi] = useState<boolean>(false);
+  const [showAiSection, setShowAiSection] = useState<boolean>(false);
 
   // 優先選取邏輯：
   // 1. 使用者手動在 Chips 選擇的考試 (userSelectedExamId)
@@ -78,6 +90,71 @@ export default function PlanScreen() {
   const firstFutureTask = sortedTasks.find((t) => t.date >= today) ?? sortedTasks[0];
   const defaultWeek = firstFutureTask ? startOfWeek(firstFutureTask.date) : thisWeek;
   const weekStart = customWeekStart ?? defaultWeek;
+
+  const handleFetchAiAdvice = async () => {
+    logDiagnostic('AI_BUTTON_PRESSED', { examName: selectedExam?.name, screen: 'plan' });
+    if (!selectedExam || isLoadingAi) return;
+
+    setIsLoadingAi(true);
+    setShowAiSection(true);
+    setAiAdviceResult(null);
+    logDiagnostic('AI_LOADING_STARTED', { screen: 'plan' });
+
+    try {
+      const examTasks = tasksForExam(data.tasks, selectedExam.id);
+      const completedTasks = examTasks.filter((t) => t.status === 'done');
+      const behindTasks = getBehindTasks(examTasks, today);
+
+      const completionRate =
+        examTasks.length > 0
+          ? Math.round((completedTasks.length / examTasks.length) * 100)
+          : 0;
+
+      const subjectsInput = selectedExam.subjects.map((s) => {
+        const sTasks = examTasks.filter((t) => t.subjectId === s.id);
+        const completedChapIds = new Set(
+          sTasks.filter((t) => t.status === 'done' && t.chapterId).map((t) => t.chapterId),
+        );
+        return {
+          name: s.name,
+          familiarity: s.familiarity,
+          totalChapters: s.chapters?.length ?? 0,
+          completedChapters: completedChapIds.size,
+        };
+      });
+
+      const result = await requestAiStudyAdvice({
+        request: {
+          examName: selectedExam.name,
+          examDate: selectedExam.examDate,
+          dailyAvailableMinutes: data.preferences.dailyMinutes,
+          intensity: data.preferences.intensity,
+          subjects: subjectsInput,
+          recentCompletionRate: completionRate,
+          behindTasksCount: behindTasks.length,
+        },
+        forceAi: true,
+        strictError: true,
+      });
+
+      setAiAdviceResult(result);
+    } catch (err: any) {
+      logDiagnostic('AI_REQUEST_FAILED', {
+        screen: 'plan',
+        error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
+      });
+      setAiAdviceResult({
+        success: false,
+        status: 'network_error',
+        source: 'gemini_ai',
+        disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
+        error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
+      });
+    } finally {
+      setIsLoadingAi(false);
+      logDiagnostic('AI_LOADING_FINISHED', { screen: 'plan' });
+    }
+  };
 
   if (data.exams.length === 0) {
     return (
@@ -151,6 +228,9 @@ export default function PlanScreen() {
                   setUserSelectedExamId(e.id);
                   setSelectedExamId(e.id);
                   setCustomWeekStart(null);
+                  setAiAdviceResult(null);
+                  setIsLoadingAi(false);
+                  setShowAiSection(false);
                 }}
                 style={[styles.examChip, isSelected && styles.examChipSelected]}
                 accessibilityRole="button"
@@ -166,6 +246,59 @@ export default function PlanScreen() {
             );
           })}
         </ScrollView>
+      ) : null}
+
+      {/* ───── AI 讀書建議區塊 ───── */}
+      {selectedExam ? (
+        <View style={styles.aiSectionContainer}>
+          {showAiSection ? (
+            <AiAdviceCard
+              advice={aiAdviceResult?.advice}
+              source={aiAdviceResult?.source ?? 'gemini_ai'}
+              status={aiAdviceResult?.status}
+              isLoading={isLoadingAi}
+              error={aiAdviceResult?.error}
+              errorCode={aiAdviceResult?.errorCode}
+              examName={selectedExam.name}
+              disclaimer={aiAdviceResult?.disclaimer}
+              quotaStatus={aiAdviceResult?.quotaStatus}
+              note={aiAdviceResult?.note}
+              onRefresh={handleFetchAiAdvice}
+              onRetry={handleFetchAiAdvice}
+              onDismiss={() => setShowAiSection(false)}
+            />
+          ) : (
+            <Pressable
+              onPress={handleFetchAiAdvice}
+              disabled={isLoadingAi}
+              style={({ pressed }) => [styles.aiBannerPill, pressed && { opacity: 0.8 }]}
+              accessibilityRole="button"
+              accessibilityLabel={`取得${selectedExam.name}的 AI 讀書建議`}
+            >
+              <View style={styles.aiBannerLeft}>
+                <View style={styles.aiSparkleIconWrap}>
+                  <Ionicons name="sparkles" size={16} color={colors.primary} />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                    <AppText variant="subhead" style={{ fontWeight: '600' }}>
+                      AI 讀書教練建議
+                    </AppText>
+                    <View style={styles.aiTagBadge}>
+                      <AppText variant="caption" color={colors.primary} style={{ fontWeight: '700' }}>
+                        ✦ Gemini
+                      </AppText>
+                    </View>
+                  </View>
+                  <AppText variant="footnote" secondary style={{ marginTop: 2 }}>
+                    結合各科掌握度、{relevantTasks.length} 項任務與考期倒數，生成衝刺策略
+                  </AppText>
+                </View>
+              </View>
+              <Ionicons name="chevron-forward" size={18} color={colors.primary} />
+            </Pressable>
+          )}
+        </View>
       ) : null}
 
       {/* 檢視模式切換：週檢視 vs 全部日程 */}
@@ -422,6 +555,41 @@ const styles = StyleSheet.create({
     backgroundColor: colors.primarySoft,
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.xs + 2,
+    borderRadius: radius.pill,
+  },
+  aiSectionContainer: {
+    marginBottom: spacing.md,
+  },
+  aiBannerPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: colors.surface,
+    borderRadius: radius.md,
+    padding: spacing.md,
+    borderWidth: 1,
+    borderColor: colors.primarySoft,
+    ...shadow.sm,
+  },
+  aiBannerLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.md,
+    flex: 1,
+    paddingRight: spacing.sm,
+  },
+  aiSparkleIconWrap: {
+    width: 38,
+    height: 38,
+    borderRadius: radius.pill,
+    backgroundColor: colors.primarySoft,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  aiTagBadge: {
+    backgroundColor: colors.primarySoft,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 2,
     borderRadius: radius.pill,
   },
 });

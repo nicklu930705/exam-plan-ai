@@ -28,7 +28,7 @@ export function Section({ title, footer, children }: SectionProps) {
       ) : null}
       <View style={styles.group}>
         {items.map((child, i) => (
-          <View key={child.key ?? `item-${i}`}>
+          <View key={`item-${i}`}>
             {i > 0 ? <View style={styles.separator} /> : null}
             {child}
           </View>

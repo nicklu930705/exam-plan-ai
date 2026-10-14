@@ -1,7 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import { useMemo, useState } from 'react';
-import { Alert, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
 
 import { ActiveTimerBanner } from '../../components/ActiveTimerBanner';
 import { AiAdviceCard } from '../../components/AiAdviceCard';
@@ -18,7 +18,11 @@ import { useStudyTimer } from '../../hooks/useStudyTimer';
 import { useToday } from '../../hooks/useToday';
 import { prioritizeTasks, TaskPriorityResult } from '../../scheduler/priority';
 import { generateStudyRecommendations } from '../../scheduler/recommendations';
-import { requestAiStudyAdvice, type AiAdviceServiceResult } from '../../services/aiAdviceService';
+import {
+  logDiagnostic,
+  requestAiStudyAdvice,
+  type AiAdviceServiceResult,
+} from '../../services/aiAdviceService';
 import { useAppStore } from '../../store/AppStore';
 
 import {
@@ -131,72 +135,70 @@ export default function HomeScreen() {
   const isRestDay = data.preferences.restDays.includes(weekdayOf(today));
 
   const handleRequestAiAdvice = async () => {
-    if (!exam) return;
-
-    if (data.subscription?.plan === 'free') {
-      Alert.alert(
-        'Gemini AI 深度讀書建議',
-        '此功能為 Pro 與 Lifetime 會員專屬功能，能透過 Google Gemini 深度分析弱項科目、章節掌握度與考前衝刺方針。\n\n目前將為您顯示本機確定性排程演算法的學習建議。',
-        [
-          { text: '稍後再說', style: 'cancel' },
-          { text: '了解會員方案', onPress: () => router.push('/subscription') },
-          {
-            text: '查看本機建議',
-            onPress: async () => {
-              setIsLoadingAi(true);
-              const result = await requestAiStudyAdvice({
-                request: {
-                  examName: exam.name,
-                  examDate: exam.examDate,
-                  dailyAvailableMinutes: data.preferences.dailyMinutes,
-                  intensity: data.preferences.intensity,
-                  subjects: exam.subjects.map((s) => ({
-                    name: s.name,
-                    familiarity: s.familiarity,
-                    totalChapters: s.chapters.length,
-                  })),
-                  recentCompletionRate: Math.round(progress.ratio * 100),
-                  behindTasksCount: behind.length,
-                },
-                subscription: data.subscription,
-                aiUsage: data.aiUsage,
-              });
-              setAiAdviceResult(result);
-              setShowAiCard(true);
-              setIsLoadingAi(false);
-            },
-          },
-        ],
-      );
-      return;
-    }
+    logDiagnostic('AI_BUTTON_PRESSED', { examName: exam?.name, screen: 'index' });
+    if (!exam || isLoadingAi) return;
 
     setIsLoadingAi(true);
     setShowAiCard(true);
-    const result = await requestAiStudyAdvice({
-      request: {
-        examName: exam.name,
-        examDate: exam.examDate,
-        dailyAvailableMinutes: data.preferences.dailyMinutes,
-        intensity: data.preferences.intensity,
-        subjects: exam.subjects.map((s) => ({
+    setAiAdviceResult(null);
+    logDiagnostic('AI_LOADING_STARTED', { screen: 'index' });
+
+    try {
+      const examTasks = tasksForExam(data.tasks, exam.id);
+      const completedTasks = examTasks.filter((t) => t.status === 'done');
+      const completionRate =
+        examTasks.length > 0
+          ? Math.round((completedTasks.length / examTasks.length) * 100)
+          : 0;
+
+      const subjectsInput = exam.subjects.map((s) => {
+        const sTasks = examTasks.filter((t) => t.subjectId === s.id);
+        const completedChapIds = new Set(
+          sTasks.filter((t) => t.status === 'done' && t.chapterId).map((t) => t.chapterId),
+        );
+        return {
           name: s.name,
           familiarity: s.familiarity,
-          totalChapters: s.chapters.length,
-        })),
-        recentCompletionRate: Math.round(progress.ratio * 100),
-        behindTasksCount: behind.length,
-      },
-      subscription: data.subscription,
-      aiUsage: data.aiUsage,
-    });
+          totalChapters: s.chapters?.length ?? 0,
+          completedChapters: completedChapIds.size,
+        };
+      });
 
-    if (result.source === 'gemini_ai') {
-      recordAiUsage();
+      const result = await requestAiStudyAdvice({
+        request: {
+          examName: exam.name,
+          examDate: exam.examDate,
+          dailyAvailableMinutes: data.preferences.dailyMinutes,
+          intensity: data.preferences.intensity,
+          subjects: subjectsInput,
+          recentCompletionRate: completionRate,
+          behindTasksCount: behind.length,
+        },
+        forceAi: true,
+        strictError: true,
+      });
+
+      if (result.source === 'gemini_ai' && result.success) {
+        recordAiUsage();
+      }
+
+      setAiAdviceResult(result);
+    } catch (err: any) {
+      logDiagnostic('AI_REQUEST_FAILED', {
+        screen: 'index',
+        error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
+      });
+      setAiAdviceResult({
+        success: false,
+        status: 'network_error',
+        source: 'gemini_ai',
+        disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
+        error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
+      });
+    } finally {
+      setIsLoadingAi(false);
+      logDiagnostic('AI_LOADING_FINISHED', { screen: 'index' });
     }
-
-    setAiAdviceResult(result);
-    setIsLoadingAi(false);
   };
 
   const createButton = (
@@ -352,16 +354,21 @@ export default function HomeScreen() {
       </Pressable>
 
       {/* ───── 今日智慧讀書建議區塊 ───── */}
-      {showAiCard && aiAdviceResult ? (
+      {showAiCard ? (
         <View style={styles.recommendationSection}>
           <AiAdviceCard
-            advice={aiAdviceResult.advice}
-            source={aiAdviceResult.source}
-            disclaimer={aiAdviceResult.disclaimer}
-            note={aiAdviceResult.note}
-            quotaStatus={aiAdviceResult.quotaStatus}
+            advice={aiAdviceResult?.advice}
+            source={aiAdviceResult?.source}
+            disclaimer={aiAdviceResult?.disclaimer}
+            note={aiAdviceResult?.note}
+            status={aiAdviceResult?.status}
+            error={aiAdviceResult?.error}
+            errorCode={aiAdviceResult?.errorCode}
+            examName={exam?.name}
+            quotaStatus={aiAdviceResult?.quotaStatus}
             isLoading={isLoadingAi}
             onRefresh={handleRequestAiAdvice}
+            onRetry={handleRequestAiAdvice}
             onDismiss={() => setShowAiCard(false)}
           />
         </View>

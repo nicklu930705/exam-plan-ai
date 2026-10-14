@@ -1,7 +1,7 @@
 import { GoogleGenAI } from '@google/genai';
 import type { StructuredAdvice, StudyAdviceRequest } from './types';
 
-const DEFAULT_MODEL = 'gemini-2.5-flash';
+const DEFAULT_MODEL = 'gemini-3.5-flash';
 
 const SYSTEM_INSTRUCTION = `你是一位專業、親切且實事求是的繁體中文升學與證照考試備考教練。
 你的任務是根據考生提供的「考試名稱、考試日期、每日可讀書時間、科目清單、熟悉程度、完成率與落後任務數」，提供具有啟發性、可行性且具體明確的讀書建議。
@@ -53,17 +53,36 @@ ${subjectDetails}
 
 請根據以上資料，評估考生的備考策略，並依格式回傳繁體中文 JSON 建議。`;
 
-  const response = await ai.models.generateContent({
-    model: modelName,
-    contents: userPrompt,
-    config: {
-      systemInstruction: SYSTEM_INSTRUCTION,
-      responseMimeType: 'application/json',
-      temperature: 0.4,
-    },
-  });
+  let text = '';
+  const maxRetries = 2;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await ai.models.generateContent({
+        model: modelName,
+        contents: userPrompt,
+        config: {
+          systemInstruction: SYSTEM_INSTRUCTION,
+          responseMimeType: 'application/json',
+          temperature: 0.4,
+        },
+      });
+      text = response.text?.trim() || '';
+      if (text) {
+        break;
+      }
+    } catch (err: any) {
+      const errMsg = String(err?.message || err);
+      const is503 =
+        errMsg.includes('503') || errMsg.includes('high demand') || errMsg.includes('UNAVAILABLE');
+      if (is503 && attempt < maxRetries) {
+        console.warn(`[Gemini] 第 ${attempt} 次呼叫遭遇 503 高負載，等待 2 秒後進行自動重試...`);
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        continue;
+      }
+      throw err;
+    }
+  }
 
-  const text = response.text?.trim() || '';
   if (!text) {
     throw new Error('Gemini API 未回傳有效文字內容。');
   }

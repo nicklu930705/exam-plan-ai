@@ -1,7 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import { useMemo, useState } from 'react';
-import { Alert, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
 
 import { ActiveTimerBanner } from '../../components/ActiveTimerBanner';
 import { AiAdviceCard } from '../../components/AiAdviceCard';
@@ -18,7 +18,11 @@ import { FAMILIARITY_LABELS } from '../../constants/labels';
 import { useStudyTimer } from '../../hooks/useStudyTimer';
 import { useToday } from '../../hooks/useToday';
 import { generateStudyRecommendations } from '../../scheduler/recommendations';
-import { requestAiStudyAdvice, type AiAdviceServiceResult } from '../../services/aiAdviceService';
+import {
+  logDiagnostic,
+  requestAiStudyAdvice,
+  type AiAdviceServiceResult,
+} from '../../services/aiAdviceService';
 import { useAppStore } from '../../store/AppStore';
 
 import {
@@ -118,72 +122,70 @@ export default function ProgressScreen() {
 
   const handleRequestAiAdvice = async () => {
     const targetExam = activeExam ?? upcomingExam ?? data.exams[0];
-    if (!targetExam) return;
-
-    if (data.subscription?.plan === 'free') {
-      Alert.alert(
-        'Gemini AI 深度讀書建議',
-        '此功能為 Pro 與 Lifetime 會員專屬功能，能透過 Google Gemini 深度分析弱項科目、章節掌握度與考前衝刺方針。\n\n目前將為您顯示本機確定性排程演算法的學習建議。',
-        [
-          { text: '稍後再說', style: 'cancel' },
-          { text: '了解會員方案', onPress: () => router.push('/subscription') },
-          {
-            text: '查看本機建議',
-            onPress: async () => {
-              setIsLoadingAi(true);
-              const result = await requestAiStudyAdvice({
-                request: {
-                  examName: targetExam.name,
-                  examDate: targetExam.examDate,
-                  dailyAvailableMinutes: data.preferences.dailyMinutes,
-                  intensity: data.preferences.intensity,
-                  subjects: targetExam.subjects.map((s) => ({
-                    name: s.name,
-                    familiarity: s.familiarity,
-                    totalChapters: s.chapters.length,
-                  })),
-                  recentCompletionRate: dashboardStats.completionPercentage,
-                  behindTasksCount: behindTasks.length,
-                },
-                subscription: data.subscription,
-                aiUsage: data.aiUsage,
-              });
-              setAiAdviceResult(result);
-              setShowAiCard(true);
-              setIsLoadingAi(false);
-            },
-          },
-        ],
-      );
-      return;
-    }
+    logDiagnostic('AI_BUTTON_PRESSED', { examName: targetExam?.name, screen: 'progress' });
+    if (!targetExam || isLoadingAi) return;
 
     setIsLoadingAi(true);
     setShowAiCard(true);
-    const result = await requestAiStudyAdvice({
-      request: {
-        examName: targetExam.name,
-        examDate: targetExam.examDate,
-        dailyAvailableMinutes: data.preferences.dailyMinutes,
-        intensity: data.preferences.intensity,
-        subjects: targetExam.subjects.map((s) => ({
+    setAiAdviceResult(null);
+    logDiagnostic('AI_LOADING_STARTED', { screen: 'progress' });
+
+    try {
+      const targetTasks = tasksForExam(data.tasks, targetExam.id);
+      const completedTasks = targetTasks.filter((t) => t.status === 'done');
+      const completionRate =
+        targetTasks.length > 0
+          ? Math.round((completedTasks.length / targetTasks.length) * 100)
+          : 0;
+
+      const subjectsInput = targetExam.subjects.map((s) => {
+        const sTasks = targetTasks.filter((t) => t.subjectId === s.id);
+        const completedChapIds = new Set(
+          sTasks.filter((t) => t.status === 'done' && t.chapterId).map((t) => t.chapterId),
+        );
+        return {
           name: s.name,
           familiarity: s.familiarity,
-          totalChapters: s.chapters.length,
-        })),
-        recentCompletionRate: dashboardStats.completionPercentage,
-        behindTasksCount: behindTasks.length,
-      },
-      subscription: data.subscription,
-      aiUsage: data.aiUsage,
-    });
+          totalChapters: s.chapters?.length ?? 0,
+          completedChapters: completedChapIds.size,
+        };
+      });
 
-    if (result.source === 'gemini_ai') {
-      recordAiUsage();
+      const result = await requestAiStudyAdvice({
+        request: {
+          examName: targetExam.name,
+          examDate: targetExam.examDate,
+          dailyAvailableMinutes: data.preferences.dailyMinutes,
+          intensity: data.preferences.intensity,
+          subjects: subjectsInput,
+          recentCompletionRate: completionRate,
+          behindTasksCount: behindTasks.length,
+        },
+        forceAi: true,
+        strictError: true,
+      });
+
+      if (result.source === 'gemini_ai' && result.success) {
+        recordAiUsage();
+      }
+
+      setAiAdviceResult(result);
+    } catch (err: any) {
+      logDiagnostic('AI_REQUEST_FAILED', {
+        screen: 'progress',
+        error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
+      });
+      setAiAdviceResult({
+        success: false,
+        status: 'network_error',
+        source: 'gemini_ai',
+        disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
+        error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
+      });
+    } finally {
+      setIsLoadingAi(false);
+      logDiagnostic('AI_LOADING_FINISHED', { screen: 'progress' });
     }
-
-    setAiAdviceResult(result);
-    setIsLoadingAi(false);
   };
 
 
@@ -321,15 +323,20 @@ export default function ProgressScreen() {
       </View>
 
       {/* ───── 個人化智慧讀書建議 ───── */}
-      {showAiCard && aiAdviceResult ? (
+      {showAiCard ? (
         <AiAdviceCard
-          advice={aiAdviceResult.advice}
-          source={aiAdviceResult.source}
-          disclaimer={aiAdviceResult.disclaimer}
-          note={aiAdviceResult.note}
-          quotaStatus={aiAdviceResult.quotaStatus}
+          advice={aiAdviceResult?.advice}
+          source={aiAdviceResult?.source}
+          disclaimer={aiAdviceResult?.disclaimer}
+          note={aiAdviceResult?.note}
+          status={aiAdviceResult?.status}
+          error={aiAdviceResult?.error}
+          errorCode={aiAdviceResult?.errorCode}
+          examName={activeExam?.name ?? upcomingExam?.name}
+          quotaStatus={aiAdviceResult?.quotaStatus}
           isLoading={isLoadingAi}
           onRefresh={handleRequestAiAdvice}
+          onRetry={handleRequestAiAdvice}
           onDismiss={() => setShowAiCard(false)}
         />
       ) : recommendations.length > 0 ? (
@@ -662,7 +669,7 @@ export default function ProgressScreen() {
               const p = computeProgress(subTasks);
               const subActual = subTasks.reduce((s, t) => s + (t.actualMinutes ?? 0), 0);
               return (
-                <View key={sub.id} style={styles.subjectRow}>
+                <View key={`${ex.id}-${sub.id}`} style={styles.subjectRow}>
                   <View style={styles.subjectTop}>
                     <View style={{ flex: 1 }}>
                       <AppText style={{ fontWeight: '600' }}>

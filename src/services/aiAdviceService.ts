@@ -40,20 +40,42 @@ export interface StructuredAdvice {
 export interface StudyAdviceResponse {
   success: boolean;
   advice?: StructuredAdvice;
-  source: 'gemini_ai' | 'fallback_rule_engine';
+  source: 'openai_ai' | 'gemini_ai' | 'fallback_rule_engine';
   disclaimer: string;
   error?: string;
   code?: string;
 }
 
+export type AiAdviceStatus =
+  | 'idle'
+  | 'loading'
+  | 'success'
+  | 'quota_exceeded'
+  | 'network_error'
+  | 'timeout'
+  | 'error';
+
 export interface AiAdviceServiceResult {
   success: boolean;
-  advice: StructuredAdvice;
-  source: 'gemini_ai' | 'fallback_rule_engine';
-  quotaStatus: AiQuotaStatus;
+  status?: AiAdviceStatus;
+  advice?: StructuredAdvice;
+  source: 'openai_ai' | 'gemini_ai' | 'fallback_rule_engine';
+  quotaStatus?: AiQuotaStatus;
   disclaimer: string;
   note?: string;
   error?: string;
+  errorCode?: string;
+}
+
+export interface RequestAiStudyAdviceParams {
+  request: StudyAdviceRequest;
+  subscription?: UserSubscription;
+  aiUsage?: AiUsageRecord;
+  customBackendUrl?: string | null;
+  /** 是否強制連線呼叫後端 AI（用於使用者主動點擊時，避免因方案阻擋真實測試） */
+  forceAi?: boolean;
+  /** 當 API 失敗時，是否不使用假資料頂替而是真實回報錯誤（符合使用者原則 7） */
+  strictError?: boolean;
 }
 
 /**
@@ -121,56 +143,203 @@ export function generateLocalRuleAdvice(request: StudyAdviceRequest): Structured
   };
 }
 
+export function logDiagnostic(event: string, payload?: Record<string, unknown>) {
+  const ts = new Date().toISOString();
+  console.log(`[${ts}] [AI_DIAGNOSTIC] ${event}`, payload ? JSON.stringify(payload) : '');
+}
+
 /**
  * 對後端 Vercel Serverless Function 發送請求
  */
 export async function fetchFromBackendApi(
   request: StudyAdviceRequest,
   backendUrl: string,
-  timeoutMs = 12000,
+  timeoutMs = 30000,
 ): Promise<StudyAdviceResponse> {
-  const cleanBase = backendUrl.trim().replace(/\/+$/, '');
-  const targetUrl = cleanBase.endsWith('/api/study-advice')
-    ? cleanBase
-    : `${cleanBase}/api/study-advice`;
+  const startTime = Date.now();
+
+  // 規範化後端 URL，強制確保包含 https:// 協定，避免重複 /api 或遺漏
+  let cleanBase = backendUrl.trim().replace(/\/+$/, '');
+  if (!/^https?:\/\//i.test(cleanBase)) {
+    cleanBase = `https://${cleanBase}`;
+  }
+  if (cleanBase.endsWith('/api/study-advice')) {
+    // 已經包含完整路徑
+  } else if (cleanBase.endsWith('/api')) {
+    cleanBase = `${cleanBase}/study-advice`;
+  } else {
+    cleanBase = `${cleanBase}/api/study-advice`;
+  }
+  const targetUrl = cleanBase;
+
+  logDiagnostic('AI_REQUEST_STARTED', {
+    targetUrl,
+    examName: request.examName,
+    examDate: request.examDate,
+    timeoutMs,
+  });
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let timerId: ReturnType<typeof setTimeout> | null = null;
+
+  // 使用 Promise.race 建立強制超時保證，timeout 獨立 reject，不依賴 fetch 的 AbortController
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timerId = setTimeout(() => {
+      try {
+        controller.abort();
+      } catch {
+        // 忽略中斷例外
+      }
+      const timeoutError = new Error('TIMEOUT');
+      timeoutError.name = 'TimeoutError';
+      reject(timeoutError);
+    }, timeoutMs);
+  });
 
   try {
-    const res = await fetch(targetUrl, {
+    const fetchPromise = fetch(targetUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        Accept: 'application/json',
       },
       body: JSON.stringify(request),
       signal: controller.signal,
     });
 
-    clearTimeout(timer);
+    const res = await Promise.race([fetchPromise, timeoutPromise]);
+    if (timerId) clearTimeout(timerId);
 
-    const json = (await res.json()) as StudyAdviceResponse;
+    const elapsed = Date.now() - startTime;
+    logDiagnostic('AI_RESPONSE_RECEIVED', {
+      status: res.status,
+      statusText: res.statusText,
+      elapsedMs: elapsed,
+    });
+
+    let json: any = null;
+    try {
+      json = await res.json();
+    } catch {
+      json = null;
+    }
 
     if (!res.ok) {
+      const rawError = json?.error;
+      let code =
+        json?.code ||
+        (res.status === 429
+          ? 'QUOTA_EXCEEDED'
+          : res.status === 504
+            ? 'TIMEOUT'
+            : res.status === 503
+              ? 'SERVICE_UNAVAILABLE'
+              : res.status === 500
+                ? 'INTERNAL_ERROR'
+                : 'API_ERROR');
+
+      let errorMsg = rawError;
+      if (rawError && typeof rawError === 'string') {
+        if (
+          rawError.includes('high demand') ||
+          rawError.includes('UNAVAILABLE') ||
+          rawError.includes('"code":503')
+        ) {
+          code = 'SERVICE_UNAVAILABLE';
+          errorMsg = 'Google Gemini 模型目前處於高負載尖峰，為暫時性現象，請稍候片刻後點擊「重新嘗試」。';
+        } else if (rawError.includes('quota') || rawError.includes('RESOURCE_EXHAUSTED')) {
+          code = 'QUOTA_EXCEEDED';
+          errorMsg = 'Google Gemini API 呼叫額度暫時達上限，請稍候 30 秒再試。';
+        } else {
+          try {
+            const parsed = JSON.parse(rawError);
+            if (parsed?.error?.message) {
+              errorMsg = parsed.error.message;
+            }
+          } catch {
+            // rawError 不是 JSON 字串，維持原內容
+          }
+        }
+      }
+
+      if (!errorMsg) {
+        if (res.status === 429) {
+          errorMsg = 'AI 伺服器流量或 Google API 頻率已達上限，請稍候 30 秒再試。';
+        } else if (res.status === 504) {
+          errorMsg = 'AI 服務回應逾時 (超過 30 秒)，請稍後再試。';
+        } else if (res.status === 503) {
+          errorMsg = 'Google Gemini 模型伺服器暫時繁忙，請點擊下方重新嘗試。';
+        } else if (res.status === 500) {
+          errorMsg = 'AI 雲端服務內部發生錯誤，請稍後重試。';
+        } else {
+          errorMsg = `伺服器回應錯誤 (HTTP ${res.status})`;
+        }
+      }
+
+      logDiagnostic('AI_REQUEST_FAILED', {
+        status: res.status,
+        code,
+        error: errorMsg,
+        elapsedMs: elapsed,
+      });
+
       return {
         success: false,
         source: 'fallback_rule_engine',
-        disclaimer: 'AI 服務暫時無法連線，已為您切換為本機規則建議。',
-        error: json.error || `HTTP ${res.status}: ${res.statusText}`,
-        code: json.code || (res.status === 429 ? 'QUOTA_EXCEEDED' : 'API_ERROR'),
+        disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
+        error: errorMsg,
+        code,
       };
     }
 
-    return json;
+    // 當 HTTP 200 但後端業務邏輯宣告失敗時
+    if (json && json.success === false) {
+      logDiagnostic('AI_REQUEST_FAILED', {
+        code: json.code,
+        error: json.error,
+        elapsedMs: elapsed,
+      });
+      return {
+        success: false,
+        source: 'fallback_rule_engine',
+        disclaimer: json.disclaimer || 'AI 建議僅供學習策略參考。',
+        error: json.error || '後端回傳未成功，請稍後重試。',
+        code: json.code || 'API_ERROR',
+      };
+    }
+
+    logDiagnostic('AI_RESPONSE_PARSED', {
+      source: json?.source,
+      hasAdvice: !!json?.advice,
+      elapsedMs: elapsed,
+    });
+
+    return json as StudyAdviceResponse;
   } catch (err: any) {
-    clearTimeout(timer);
-    const isTimeout = err?.name === 'AbortError';
+    if (timerId) clearTimeout(timerId);
+    const elapsed = Date.now() - startTime;
+    const isTimeout =
+      err?.name === 'TimeoutError' || err?.name === 'AbortError' || err?.message === 'TIMEOUT';
+
+    const code = isTimeout ? 'TIMEOUT' : 'NETWORK_ERROR';
+    const errorMsg = isTimeout
+      ? '連線逾時（超過 30 秒），伺服器處理時間過長，請檢查網路或稍後重試。'
+      : '網路連線失敗，請檢查 iPhone 網路連線是否正常。';
+
+    logDiagnostic('AI_REQUEST_FAILED', {
+      isTimeout,
+      errorName: err?.name,
+      errorMessage: err?.message,
+      elapsedMs: elapsed,
+      code,
+    });
+
     return {
       success: false,
       source: 'fallback_rule_engine',
-      disclaimer: '網路連線逾時或後端未回應，已切換為本機排程演算法。',
-      error: isTimeout ? '連線逾時（超過 12 秒）' : (err?.message ?? '網路請求失敗'),
-      code: isTimeout ? 'TIMEOUT' : 'NETWORK_ERROR',
+      disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
+      error: errorMsg,
+      code,
     };
   }
 }
@@ -179,41 +348,63 @@ export async function fetchFromBackendApi(
  * 智慧讀書建議請求主函式
  * 完整整合會員等級檢查、用量額度防護、後端呼叫與本機無縫降級
  */
-export async function requestAiStudyAdvice(params: {
-  request: StudyAdviceRequest;
-  subscription?: UserSubscription;
-  aiUsage?: AiUsageRecord;
-  customBackendUrl?: string | null;
-}): Promise<AiAdviceServiceResult> {
-  const { request, subscription, aiUsage, customBackendUrl } = params;
+export async function requestAiStudyAdvice(
+  params: RequestAiStudyAdviceParams,
+): Promise<AiAdviceServiceResult> {
+  const { request, subscription, aiUsage, customBackendUrl, forceAi = false, strictError = false } = params;
 
   const quotaStatus = getAiQuotaStatus(aiUsage, subscription);
-  const accessCheck = checkAiAccess(aiUsage, subscription);
 
-  // 1. 會員等級與額度防護檢查（Free 免費版或已超額使用者）
-  if (!accessCheck.canUse) {
-    const localAdvice = generateLocalRuleAdvice(request);
-    return {
-      success: true,
-      advice: localAdvice,
-      source: 'fallback_rule_engine',
-      quotaStatus,
-      disclaimer: '此建議由本機排程演算法客觀計算生成。',
-      note: accessCheck.reason ?? '升級 Pro 會員即可解鎖 Gemini AI 深度個人化教練。',
-    };
+  // 1. 若非強制呼叫，執行會員等級與額度防護檢查（Free 免費版或已超額使用者）
+  if (!forceAi && subscription) {
+    const accessCheck = checkAiAccess(aiUsage, subscription);
+    if (!accessCheck.canUse) {
+      if (strictError) {
+        return {
+          success: false,
+          status: 'quota_exceeded',
+          source: 'fallback_rule_engine',
+          quotaStatus,
+          disclaimer: '此建議由本機排程演算法客觀計算生成。',
+          error: accessCheck.reason,
+        };
+      }
+      const localAdvice = generateLocalRuleAdvice(request);
+      return {
+        success: true,
+        status: 'success',
+        advice: localAdvice,
+        source: 'fallback_rule_engine',
+        quotaStatus,
+        disclaimer: '此建議由本機排程演算法客觀計算生成。',
+        note: accessCheck.reason ?? '升級 Pro 會員即可解鎖 Gemini AI 深度個人化教練。',
+      };
+    }
   }
 
   // 2. 解析後端伺服器端點
+  // 當明確傳入 customBackendUrl: null 時視為未設定端點
   const backendUrl =
-    (customBackendUrl && customBackendUrl.trim().length > 0)
-      ? customBackendUrl.trim()
+    customBackendUrl !== undefined
+      ? (customBackendUrl && customBackendUrl.trim().length > 0 ? customBackendUrl.trim() : null)
       : await getBackendUrlFromStorage();
 
-  // 若尚未設定後端 URL，提供明確友善的本機降級建議
+  // 若尚未設定後端 URL
   if (!backendUrl) {
+    if (strictError) {
+      return {
+        success: false,
+        status: 'error',
+        source: 'fallback_rule_engine',
+        quotaStatus,
+        disclaimer: '尚未設定 AI 雲端伺服器網址。',
+        error: '尚未設定 AI 雲端伺服器網址，請在「設定 > AI 雲端服務」確認。',
+      };
+    }
     const localAdvice = generateLocalRuleAdvice(request);
     return {
       success: true,
+      status: 'success',
       advice: localAdvice,
       source: 'fallback_rule_engine',
       quotaStatus,
@@ -228,14 +419,47 @@ export async function requestAiStudyAdvice(params: {
   if (backendRes.success && backendRes.advice) {
     return {
       success: true,
+      status: 'success',
       advice: backendRes.advice,
-      source: 'gemini_ai',
+      source: backendRes.source ?? 'openai_ai',
       quotaStatus,
       disclaimer: backendRes.disclaimer,
     };
   }
 
-  // 4. 後端失敗（429、500、連線逾時等）時，安全切換至本機演算法
+  // 4. 後端失敗（429、500、連線逾時、網路中斷等）處理
+  if (strictError) {
+    let status: AiAdviceStatus = 'error';
+    if (backendRes.code === 'QUOTA_EXCEEDED' || backendRes.code === 'RATE_LIMIT_EXCEEDED') {
+      status = 'quota_exceeded';
+    } else if (backendRes.code === 'TIMEOUT' || backendRes.code === 'GATEWAY_TIMEOUT') {
+      status = 'timeout';
+    } else if (backendRes.code === 'NETWORK_ERROR') {
+      status = 'network_error';
+    } else if (backendRes.code === 'SERVICE_UNAVAILABLE') {
+      status = 'error';
+    }
+
+    const finalResult: AiAdviceServiceResult = {
+      success: false,
+      status,
+      source: backendRes.source ?? 'openai_ai',
+      quotaStatus,
+      disclaimer: backendRes.disclaimer || 'AI 建議僅供學習策略與心理激勵參考。',
+      error: backendRes.error || 'AI 伺服器回應異常，請稍後再試。',
+      errorCode: backendRes.code,
+    };
+
+    console.log('[AI Service] AI 請求結束（嚴格錯誤模式）', {
+      status: finalResult.status,
+      errorCode: finalResult.errorCode,
+      error: finalResult.error,
+    });
+
+    return finalResult;
+  }
+
+  // 非嚴格模式下，安全切換至本機演算法（相容舊測試）
   const localAdvice = generateLocalRuleAdvice(request);
   const failureNote =
     backendRes.code === 'QUOTA_EXCEEDED'
@@ -244,6 +468,7 @@ export async function requestAiStudyAdvice(params: {
 
   return {
     success: true,
+    status: 'success',
     advice: localAdvice,
     source: 'fallback_rule_engine',
     quotaStatus,
