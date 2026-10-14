@@ -66,7 +66,7 @@ ${subjectDetails}
     ],
     response_format: { type: 'json_object' },
     temperature: 0.4,
-    max_tokens: 900,
+    max_completion_tokens: 900,
   });
 
   const durationMs = Date.now() - startTime;

@@ -201,7 +201,7 @@ test('5. 模擬 OpenAI 回傳成功時：驗證實際 POST 回應格式為繁體
     // 驗證模型預設為 gpt-5.6-luna
     assert.equal(capturedArgs.model, 'gpt-5.6-luna');
     assert.equal(capturedArgs.response_format?.type, 'json_object');
-    assert.equal(capturedArgs.max_tokens, 900);
+    assert.equal(capturedArgs.max_completion_tokens, 900);
 
     // 驗證最外層回應結構
     assert.equal(data.success, true);
