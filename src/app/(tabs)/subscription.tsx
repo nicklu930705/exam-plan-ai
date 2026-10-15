@@ -99,6 +99,15 @@ export default function SubscriptionScreen() {
 
   // 處理方案購買流程
   const handlePurchase = async () => {
+    // TestFlight 首次測試版安全防護：付費交易驗證尚未完成前，停用正式版付費入口
+    if (!__DEV__ && selectedProduct.tier !== 'free') {
+      Alert.alert(
+        '尚未開放付費購買',
+        '目前為 TestFlight 測試預覽版本，付費功能暫未開放。所有核心讀書計畫排程、計時器、進度追蹤與 AI 讀書建議皆可免費完整體驗！',
+      );
+      return;
+    }
+
     setIsLoading(true);
     try {
       const result = await storeKitService.purchase(selectedProductId);
@@ -124,6 +133,15 @@ export default function SubscriptionScreen() {
 
   // 處理恢復購買 (Restore Purchases)
   const handleRestore = async () => {
+    // TestFlight 首次測試版安全防護：付費功能尚未正式開放時提示使用者
+    if (!__DEV__) {
+      Alert.alert(
+        '尚未開放付費功能',
+        '目前 TestFlight 版本尚未開放付費購買，暫無可恢復的 App Store 訂閱紀錄。',
+      );
+      return;
+    }
+
     setIsRestoring(true);
     try {
       const result = await storeKitService.restorePurchases();
@@ -457,19 +475,46 @@ export default function SubscriptionScreen() {
         />
       </View>
 
+      {/* TestFlight 測試版安全說明卡片（僅非開發環境顯示） */}
+      {!__DEV__ && (
+        <View style={styles.testFlightNoticeCard}>
+          <View style={styles.testFlightNoticeHeader}>
+            <Ionicons
+              name="information-circle"
+              size={18}
+              color={colors.primary}
+              style={{ marginRight: 6 }}
+            />
+            <AppText style={styles.testFlightNoticeTitle}>
+              TestFlight 測試階段說明
+            </AppText>
+          </View>
+          <AppText secondary style={styles.testFlightNoticeText}>
+            目前為 TestFlight 測試預覽版本，付費方案暫未開放購買。所有核心讀書計畫排程、計時器、任務進度追蹤與 AI 讀書建議皆可免費完整體驗！
+          </AppText>
+        </View>
+      )}
+
       {/* 購買與管理操作按鈕 */}
       <View style={styles.actionContainer}>
         <Button
           title={
             isLoading
               ? '處理中...'
-              : isSelectedProductCurrent
-                ? '目前已是此方案'
-                : `以 ${selectedProduct.priceFormatted} 切換方案`
+              : !__DEV__ && selectedProduct.tier !== 'free'
+                ? 'TestFlight 測試階段・暫未開放購買'
+                : isSelectedProductCurrent
+                  ? '目前已是此方案'
+                  : `以 ${selectedProduct.priceFormatted} 切換方案`
           }
           loading={isLoading}
           onPress={handlePurchase}
-          disabled={isLoading || isRestoring || isSelectedProductCurrent}
+          disabled={
+            isLoading ||
+            isRestoring ||
+            isSelectedProductCurrent ||
+            (!__DEV__ && selectedProduct.tier !== 'free')
+          }
           style={styles.mainActionButton}
         />
 
@@ -656,6 +701,29 @@ const styles = StyleSheet.create({
   statusNoticeCardPreview: {
     backgroundColor: '#FAF5EA',
     borderColor: '#EBDCB9',
+  },
+  testFlightNoticeCard: {
+    backgroundColor: '#F3F8F4',
+    borderRadius: radius.md,
+    padding: spacing.md,
+    marginBottom: spacing.lg,
+    borderWidth: 1,
+    borderColor: '#CDE5D4',
+  },
+  testFlightNoticeHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  testFlightNoticeTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: colors.primary,
+  },
+  testFlightNoticeText: {
+    fontSize: 12,
+    lineHeight: 18,
+    color: colors.textSecondary,
   },
   statusNoticeHeader: {
     flexDirection: 'row',

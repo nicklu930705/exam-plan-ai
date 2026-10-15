@@ -42,6 +42,13 @@
           "imageWidth": 200
         }
       ]
-    ]
+    ],
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "5dd9540e-6d29-4c68-b6cb-0feb5381cbd1"
+      }
+    },
+    "owner": "nick930705s-team"
   }
 }
