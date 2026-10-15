@@ -443,9 +443,10 @@ export async function preFlightQuotaAndBudgetCheck(params: PreFlightCheckParams)
     const status = res[0];
 
     if (status === 'CACHED') {
+      const payloadStr = typeof res[1] === 'string' ? res[1] : JSON.stringify(res[1]);
       return {
         status: 'CACHED',
-        cachedResponse: res[1],
+        cachedResponse: payloadStr,
       };
     }
 

@@ -122,10 +122,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // 處理命中冪等快取 (避免網路重試重複呼叫 OpenAI 或重複扣額)
   if (preFlight.status === 'CACHED') {
     try {
-      const cachedPayload = JSON.parse(preFlight.cachedResponse);
+      const cachedPayload = typeof preFlight.cachedResponse === 'string'
+        ? JSON.parse(preFlight.cachedResponse)
+        : preFlight.cachedResponse;
       return res.status(200).json(cachedPayload);
     } catch {
-      // 若快取字串損毀則繼續正常請求
+      return res.status(200).json({ success: true, data: preFlight.cachedResponse });
     }
   }
 
