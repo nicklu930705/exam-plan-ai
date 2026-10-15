@@ -87,12 +87,26 @@ ${subjectDetails}
   const durationMs = Date.now() - startTime;
   const rawContent = completion.choices[0]?.message?.content?.trim() || '';
 
-  const promptTokens = completion.usage?.prompt_tokens ?? 0;
-  const completionTokens = completion.usage?.completion_tokens ?? 0;
-  const totalTokens = completion.usage?.total_tokens ?? 0;
+  let promptTokens = completion.usage?.prompt_tokens ?? 0;
+  let completionTokens = completion.usage?.completion_tokens ?? 0;
+  let totalTokens = completion.usage?.total_tokens ?? 0;
+  const hasExactUsage = Boolean(
+    completion.usage &&
+    completion.usage.total_tokens &&
+    completion.usage.total_tokens > 0,
+  );
+
+  if (!hasExactUsage) {
+    console.warn('[計費警示] OpenAI API 未回傳有效 usage Token 數據，採用保守預估 Token 結算以防預算超支。');
+    // 保守以輸入字數 * 2 + 系統提示 350 tokens，輸出以實際字數 * 2 或最小 300 tokens 估算
+    promptTokens = Math.max(promptTokens, Math.ceil(userPrompt.length * 2) + 350);
+    completionTokens = Math.max(completionTokens, Math.ceil(rawContent.length * 2), 300);
+    totalTokens = promptTokens + completionTokens;
+  }
 
   // 根據模型計算實際成本
   const costCalc = calculateTokenCostMicroUSD(modelName, promptTokens, completionTokens);
+  const isExactPricing = hasExactUsage && costCalc.isExactPricing;
 
   console.log('[OpenAI 請求成功]', {
     model: modelName,
@@ -101,6 +115,7 @@ ${subjectDetails}
     completionTokens,
     totalTokens,
     costUSD: costCalc.costUSD,
+    isExactPricing,
   });
 
   if (!rawContent) {
@@ -139,7 +154,7 @@ ${subjectDetails}
       },
       costMicroUSD: costCalc.costMicroUSD,
       costUSD: costCalc.costUSD,
-      isExactPricing: costCalc.isExactPricing,
+      isExactPricing,
     };
   } catch (parseErr) {
     console.error('[OpenAI] JSON 解析失敗，耗時：', durationMs, 'ms，原因：', parseErr);

@@ -657,3 +657,121 @@ test('17. 健康檢查端點 (GET /api/health)：正常回傳系統狀態且不�
   }
 });
 
+test('18. 多使用者並發預算保護：剩餘預算僅足夠 1 筆時，並發請求只有 1 筆通過，另一筆被 DAILY_BUDGET_EXCEEDED 拒絕', async () => {
+  process.env.MOCK_REDIS = 'true';
+  process.env.OPENAI_API_KEY = 'sk-mock-valid-key';
+  // 設定日預算為極小值，僅允許約 1 筆預扣成本通過
+  process.env.AI_DAILY_BUDGET_USD = '0.0015';
+  inMemoryRedisMockInstance.clear();
+
+  const dummy = new OpenAI({ apiKey: 'mock' });
+  const completionsProto = Object.getPrototypeOf(dummy.chat.completions);
+  const originalCreate = completionsProto.create;
+
+  // 延遲 100ms 模擬真實 API 呼叫期間
+  completionsProto.create = async function () {
+    await new Promise((r) => setTimeout(r, 100));
+    return {
+      choices: [{ message: { role: 'assistant', content: mockOpenAiResponse } }],
+      usage: { prompt_tokens: 300, completion_tokens: 200, total_tokens: 500 },
+    };
+  };
+
+  const ctx = await createServer();
+
+  try {
+    const reqA = fetch(`${ctx.url}/api/study-advice`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Client-Device-Id': 'dev_user_budget_race_A' },
+      body: JSON.stringify(samplePayload),
+    });
+
+    const reqB = fetch(`${ctx.url}/api/study-advice`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Client-Device-Id': 'dev_user_budget_race_B' },
+      body: JSON.stringify(samplePayload),
+    });
+
+    const [resA, resB] = await Promise.all([reqA, reqB]);
+    const statuses = [resA.status, resB.status];
+
+    assert.ok(statuses.includes(200), '應有 1 筆並發請求在預算內成功');
+    assert.ok(statuses.includes(429), '超額的另 1 筆並發請求必須被 429 阻擋');
+
+    const blocked = resA.status === 429 ? resA : resB;
+    const blockedData = await blocked.json();
+    assert.equal(blockedData.code, 'DAILY_BUDGET_EXCEEDED');
+  } finally {
+    delete process.env.AI_DAILY_BUDGET_USD;
+    completionsProto.create = originalCreate;
+    await ctx.close();
+  }
+});
+
+test('19. 跨月份預算隔離：上月累積支出達上限，不影響當月預算計算與正常呼叫', async () => {
+  process.env.MOCK_REDIS = 'true';
+  process.env.OPENAI_API_KEY = 'sk-mock-valid-key';
+  inMemoryRedisMockInstance.clear();
+
+  // 模擬上個月 (2026-09) 預算已經爆滿達 10,000,000 micro-USD ($10 USD)
+  const pastMonthKey = 'exam_ai:budget:month:2026-09';
+  inMemoryRedisMockInstance.store.set(pastMonthKey, { value: '10000000' });
+
+  const mock = setupMockOpenAiSuccess();
+  const ctx = await createServer();
+
+  try {
+    const res = await fetch(`${ctx.url}/api/study-advice`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Client-Device-Id': 'dev_user_cross_month' },
+      body: JSON.stringify(samplePayload),
+    });
+
+    assert.equal(res.status, 200, '當月在獨立 key 下運作，不受上月預算已耗盡影響');
+    const data = await res.json();
+    assert.equal(data.success, true);
+  } finally {
+    mock.restore();
+    await ctx.close();
+  }
+});
+
+test('20. 缺少 usage 資料之保守安全計費：OpenAI 回應未附帶 usage 時，系統仍能保守扣除預算且標記 isExactPricing=false', async () => {
+  process.env.MOCK_REDIS = 'true';
+  process.env.OPENAI_API_KEY = 'sk-mock-valid-key';
+  inMemoryRedisMockInstance.clear();
+
+  const dummy = new OpenAI({ apiKey: 'mock' });
+  const completionsProto = Object.getPrototypeOf(dummy.chat.completions);
+  const originalCreate = completionsProto.create;
+
+  // 模擬 OpenAI 未回傳 usage 欄位的情境
+  completionsProto.create = async function () {
+    return {
+      choices: [{ message: { role: 'assistant', content: mockOpenAiResponse } }],
+      // 故意不回傳 usage
+    };
+  };
+
+  const ctx = await createServer();
+
+  try {
+    const res = await fetch(`${ctx.url}/api/study-advice`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Client-Device-Id': 'dev_user_missing_usage' },
+      body: JSON.stringify(samplePayload),
+    });
+
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.equal(data.success, true);
+    assert.ok(data.costInfo, '必須回傳計費資訊');
+    assert.ok(data.costInfo.actualCostUSD > 0, '即便無 usage，仍須採用保守估算金額，不可計為 0 元');
+    assert.equal(data.costInfo.isExactPricing, false, '因無 usage 數據，必須明確標記為非精確定價');
+  } finally {
+    completionsProto.create = originalCreate;
+    await ctx.close();
+  }
+});
+
+
