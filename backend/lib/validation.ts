@@ -1,3 +1,4 @@
+import { getAiConfig } from './config';
 import type { StudyAdviceRequest, SubjectInput } from './types';
 
 export interface ValidationResult {
@@ -13,9 +14,19 @@ export function validateStudyAdviceRequest(body: unknown): ValidationResult {
     return { valid: false, message: '請求內文必須為 JSON 物件。' };
   }
 
+  // 1. 總輸入字數限制 (防止過長字串攻擊或消耗過量 Token)
+  const rawString = typeof body === 'string' ? body : JSON.stringify(body);
+  const maxInputChars = getAiConfig().MAX_INPUT_CHARS;
+  if (rawString.length > maxInputChars) {
+    return {
+      valid: false,
+      message: `請求內容總字數 (${rawString.length} 字) 超過 ${maxInputChars} 字限制。`,
+    };
+  }
+
   const req = body as Partial<StudyAdviceRequest>;
 
-  // 1. 考試名稱
+  // 2. 考試名稱
   if (!req.examName || typeof req.examName !== 'string' || req.examName.trim().length === 0) {
     return { valid: false, message: 'examName 必須為非空白字串。' };
   }
@@ -23,7 +34,7 @@ export function validateStudyAdviceRequest(body: unknown): ValidationResult {
     return { valid: false, message: 'examName 字數不得超過 80 字。' };
   }
 
-  // 2. 考試日期 (YYYY-MM-DD)
+  // 3. 考試日期 (YYYY-MM-DD)
   if (!req.examDate || typeof req.examDate !== 'string') {
     return { valid: false, message: 'examDate 必須為日期字串。' };
   }
@@ -36,7 +47,7 @@ export function validateStudyAdviceRequest(body: unknown): ValidationResult {
     return { valid: false, message: 'examDate 並非有效日期。' };
   }
 
-  // 3. 每日可用讀書分鐘數
+  // 4. 每日可用讀書分鐘數
   if (
     typeof req.dailyAvailableMinutes !== 'number' ||
     req.dailyAvailableMinutes < 10 ||
@@ -45,7 +56,7 @@ export function validateStudyAdviceRequest(body: unknown): ValidationResult {
     return { valid: false, message: 'dailyAvailableMinutes 必須介於 10 到 960 分鐘之間。' };
   }
 
-  // 4. 科目清單
+  // 5. 科目清單
   if (!Array.isArray(req.subjects) || req.subjects.length === 0) {
     return { valid: false, message: 'subjects 必須為至少包含 1 個科目的陣列。' };
   }
@@ -66,7 +77,7 @@ export function validateStudyAdviceRequest(body: unknown): ValidationResult {
     }
   }
 
-  // 5. 完成率與落後任務防呆
+  // 6. 完成率與落後任務防呆
   if (
     req.recentCompletionRate !== undefined &&
     (typeof req.recentCompletionRate !== 'number' ||

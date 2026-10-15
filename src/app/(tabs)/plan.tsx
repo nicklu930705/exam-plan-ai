@@ -262,6 +262,7 @@ export default function PlanScreen() {
               examName={selectedExam.name}
               disclaimer={aiAdviceResult?.disclaimer}
               quotaStatus={aiAdviceResult?.quotaStatus}
+              quota={aiAdviceResult?.quota}
               note={aiAdviceResult?.note}
               onRefresh={handleFetchAiAdvice}
               onRetry={handleFetchAiAdvice}

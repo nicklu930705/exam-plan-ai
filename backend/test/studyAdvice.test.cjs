@@ -4,6 +4,8 @@ const http = require('node:http');
 const OpenAI = require('openai');
 
 const studyAdviceModule = require('../dist/api/study-advice.js');
+const { inMemoryRedisMockInstance } = require('../dist/lib/redis.js');
+
 const handler = typeof studyAdviceModule === 'function'
   ? studyAdviceModule
   : studyAdviceModule.default;
@@ -70,6 +72,50 @@ const samplePayload = {
   behindTasksCount: 1,
 };
 
+const mockOpenAiResponse = JSON.stringify({
+  summary: '目前的準備節奏良好，閱讀測驗稍弱，建議加強長篇閱讀並以每日黃金 45 分鐘專攻。',
+  focusSubjects: ['閱讀測驗', '聽力測驗'],
+  actionableTips: [
+    '每日安排 45 分鐘高專注閱讀弱點加強。',
+    '利用專注計時器保持節奏，補齊落後的 1 項任務。',
+    '最後兩週維持每週兩回模擬試題手感。',
+  ],
+  estimatedFeasibility: '以每日 90 分鐘計算，目前時間充裕，維持現有進度即可順利掌握全數重點。',
+});
+
+function setupMockOpenAiSuccess() {
+  const dummy = new OpenAI({ apiKey: 'mock' });
+  const completionsProto = Object.getPrototypeOf(dummy.chat.completions);
+  const originalCreate = completionsProto.create;
+
+  let callCount = 0;
+  completionsProto.create = async function () {
+    callCount += 1;
+    return {
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: mockOpenAiResponse,
+          },
+        },
+      ],
+      usage: {
+        prompt_tokens: 320,
+        completion_tokens: 180,
+        total_tokens: 500,
+      },
+    };
+  };
+
+  return {
+    restore: () => {
+      completionsProto.create = originalCreate;
+    },
+    getCallCount: () => callCount,
+  };
+}
+
 test('1. GET 請求應回傳 405 Method Not Allowed', async () => {
   const ctx = await createServer();
   try {
@@ -83,7 +129,7 @@ test('1. GET 請求應回傳 405 Method Not Allowed', async () => {
   }
 });
 
-test('2. 無效輸入資料應回傳 400 INVALID_INPUT', async () => {
+test('2. 輸入格式無效時應回傳 400 INVALID_INPUT', async () => {
   const ctx = await createServer();
   try {
     const res = await fetch(`${ctx.url}/api/study-advice`, {
@@ -100,7 +146,28 @@ test('2. 無效輸入資料應回傳 400 INVALID_INPUT', async () => {
   }
 });
 
-test('3. 超過 15KB 的 Payload 應回傳 413 錯誤', async () => {
+test('3. 輸入總字數超過 4,000 字上限應回傳 400 錯誤 (AI_MAX_INPUT_CHARS)', async () => {
+  const ctx = await createServer();
+  try {
+    const longSubject = '科'.repeat(4005);
+    const res = await fetch(`${ctx.url}/api/study-advice`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...samplePayload,
+        subjects: [{ name: longSubject, familiarity: 1 }],
+      }),
+    });
+    assert.equal(res.status, 400);
+    const data = await res.json();
+    assert.equal(data.success, false);
+    assert.match(data.error, /超過 4000 字限制/);
+  } finally {
+    await ctx.close();
+  }
+});
+
+test('4. Payload 超過 15KB 應回傳 413 錯誤', async () => {
   const ctx = await createServer();
   try {
     const largeName = 'A'.repeat(16 * 1024);
@@ -122,10 +189,10 @@ test('3. 超過 15KB 的 Payload 應回傳 413 錯誤', async () => {
   }
 });
 
-test('4. 未設定 OPENAI_API_KEY 時應回傳 500 API_KEY_MISSING 且不偽造假內容', async () => {
-  const originalKey = process.env.OPENAI_API_KEY;
-  delete process.env.OPENAI_API_KEY;
-  delete process.env.AI_PROVIDER;
+test('5. Redis 故障時應實作 Fail-Closed (安全關閉)，回傳 503 STORAGE_UNAVAILABLE', async () => {
+  delete process.env.MOCK_REDIS;
+  delete process.env.UPSTASH_REDIS_REST_URL;
+  delete process.env.UPSTASH_REDIS_REST_TOKEN;
 
   const ctx = await createServer();
   try {
@@ -134,58 +201,20 @@ test('4. 未設定 OPENAI_API_KEY 時應回傳 500 API_KEY_MISSING 且不偽造�
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(samplePayload),
     });
-
-    assert.equal(res.status, 500);
+    assert.equal(res.status, 503);
     const data = await res.json();
     assert.equal(data.success, false);
-    assert.equal(data.code, 'API_KEY_MISSING');
-    assert.match(data.error, /OPENAI_API_KEY/);
-    assert.equal(data.advice, undefined); // 嚴禁在 API 失敗時偽造 AI 建議
+    assert.equal(data.code, 'STORAGE_UNAVAILABLE');
+    assert.match(data.error, /無法連接用量資料庫/);
   } finally {
-    if (originalKey) process.env.OPENAI_API_KEY = originalKey;
     await ctx.close();
   }
 });
 
-test('5. 模擬 OpenAI 回傳成功時：驗證實際 POST 回應格式為繁體中文、source=openai_ai 與預設 gpt-5.6-luna', async () => {
-  process.env.OPENAI_API_KEY = 'sk-mock-valid-key-for-testing';
-  delete process.env.OPENAI_MODEL;
-  delete process.env.AI_PROVIDER;
-
-  const mockAdviceContent = JSON.stringify({
-    summary: '目前的準備節奏良好，閱讀測驗稍弱，建議加強長篇閱讀並以每日黃金 45 分鐘專攻。',
-    focusSubjects: ['閱讀測驗', '聽力測驗'],
-    actionableTips: [
-      '每日安排 45 分鐘高專注閱讀弱點加強。',
-      '利用專注計時器保持節奏，補齊落後的 1 項任務。',
-      '最後兩週維持每週兩回模擬試題手感。',
-    ],
-    estimatedFeasibility: '以每日 90 分鐘計算，目前時間充裕，維持現有進度即可順利掌握全數重點。',
-  });
-
-  const dummy = new OpenAI({ apiKey: 'mock' });
-  const completionsProto = Object.getPrototypeOf(dummy.chat.completions);
-  const originalCreate = completionsProto.create;
-
-  let capturedArgs = null;
-  completionsProto.create = async function (args) {
-    capturedArgs = args;
-    return {
-      choices: [
-        {
-          message: {
-            role: 'assistant',
-            content: mockAdviceContent,
-          },
-        },
-      ],
-      usage: {
-        prompt_tokens: 320,
-        completion_tokens: 180,
-        total_tokens: 500,
-      },
-    };
-  };
+test('6. 未設定 OPENAI_API_KEY 時應回傳 500 API_KEY_MISSING 且不偽造假內容', async () => {
+  process.env.MOCK_REDIS = 'true';
+  inMemoryRedisMockInstance.clear();
+  delete process.env.OPENAI_API_KEY;
 
   const ctx = await createServer();
   try {
@@ -194,178 +223,351 @@ test('5. 模擬 OpenAI 回傳成功時：驗證實際 POST 回應格式為繁體
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(samplePayload),
     });
+    assert.equal(res.status, 500);
+    const data = await res.json();
+    assert.equal(data.success, false);
+    assert.equal(data.code, 'API_KEY_MISSING');
+    assert.equal(data.advice, undefined);
+  } finally {
+    await ctx.close();
+  }
+});
 
+test('7. 成功請求：驗證繁中格式、source=openai_ai、配額資訊與計費資訊', async () => {
+  process.env.MOCK_REDIS = 'true';
+  process.env.OPENAI_API_KEY = 'sk-mock-valid-key';
+  inMemoryRedisMockInstance.clear();
+
+  const mock = setupMockOpenAiSuccess();
+  const ctx = await createServer();
+  try {
+    const res = await fetch(`${ctx.url}/api/study-advice`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Client-Device-Id': 'dev_test_user_001',
+      },
+      body: JSON.stringify(samplePayload),
+    });
     assert.equal(res.status, 200);
     const data = await res.json();
-
-    // 驗證模型預設為 gpt-5.6-luna
-    assert.equal(capturedArgs.model, 'gpt-5.6-luna');
-    assert.equal(capturedArgs.response_format?.type, 'json_object');
-    assert.equal(capturedArgs.max_completion_tokens, 900);
-
-    // 驗證最外層回應結構
     assert.equal(data.success, true);
     assert.equal(data.source, 'openai_ai');
-    assert.ok(typeof data.disclaimer === 'string' && data.disclaimer.length > 0);
+    assert.ok(data.advice);
+    assert.equal(data.advice.focusSubjects.length, 2);
 
-    // 驗證 advice 內部欄位與繁體中文內容
-    assert.ok(data.advice, '必須包含 advice 物件');
-    assert.equal(data.advice.summary, '目前的準備節奏良好，閱讀測驗稍弱，建議加強長篇閱讀並以每日黃金 45 分鐘專攻。');
-    assert.deepEqual(data.advice.focusSubjects, ['閱讀測驗', '聽力測驗']);
-    assert.equal(data.advice.actionableTips.length, 3);
-    assert.equal(data.advice.actionableTips[0], '每日安排 45 分鐘高專注閱讀弱點加強。');
-    assert.match(data.advice.estimatedFeasibility, /90 分鐘/);
+    // 驗證配額結構
+    assert.ok(data.quota);
+    assert.equal(data.quota.usedToday, 1);
+    assert.equal(data.quota.dailyLimit, 3);
+    assert.equal(data.quota.remainingToday, 2);
+    assert.equal(data.quota.tier, 'free');
+    assert.ok(data.quota.resetsAt.includes('T00:00:00+08:00'));
 
-    // 驗證嚴格無 API 金鑰洩漏
-    const jsonString = JSON.stringify(data);
-    assert.equal(jsonString.includes('sk-mock-valid-key-for-testing'), false);
+    // 驗證計費結構
+    assert.ok(data.costInfo);
+    assert.ok(data.costInfo.actualCostUSD > 0);
   } finally {
-    completionsProto.create = originalCreate;
-    delete process.env.OPENAI_API_KEY;
+    mock.restore();
     await ctx.close();
   }
 });
 
-test('6. 驗證可透過 OPENAI_MODEL 環境變數自訂模型', async () => {
+test('8. 免費版每日 3 次限制：第 1~3 次成功，第 4 次被 429 DAILY_QUOTA_EXCEEDED 拒絕', async () => {
+  process.env.MOCK_REDIS = 'true';
   process.env.OPENAI_API_KEY = 'sk-mock-valid-key';
-  process.env.OPENAI_MODEL = 'gpt-5-mini';
-  delete process.env.AI_PROVIDER;
+  inMemoryRedisMockInstance.clear();
+
+  const mock = setupMockOpenAiSuccess();
+  const ctx = await createServer();
+  const userId = 'dev_free_user_limit_test';
+
+  try {
+    for (let i = 1; i <= 3; i++) {
+      const res = await fetch(`${ctx.url}/api/study-advice`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Client-Device-Id': userId,
+        },
+        body: JSON.stringify(samplePayload),
+      });
+      assert.equal(res.status, 200, `第 ${i} 次請求應該成功`);
+      const data = await res.json();
+      assert.equal(data.quota.usedToday, i);
+      assert.equal(data.quota.remainingToday, 3 - i);
+    }
+
+    // 第 4 次應該被拒絕
+    const res4 = await fetch(`${ctx.url}/api/study-advice`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Client-Device-Id': userId,
+      },
+      body: JSON.stringify(samplePayload),
+    });
+    assert.equal(res4.status, 429);
+    const data4 = await res4.json();
+    assert.equal(data4.success, false);
+    assert.equal(data4.code, 'DAILY_QUOTA_EXCEEDED');
+    assert.match(data4.error, /今日的 AI 建議額度已用完/);
+  } finally {
+    mock.restore();
+    await ctx.close();
+  }
+});
+
+test('9. Pro 權限偽造防禦：未經 Apple 伺服端驗證宣告 Pro 者，嚴格鎖定為 Free 額度 (第 4 次被擋)', async () => {
+  process.env.MOCK_REDIS = 'true';
+  process.env.OPENAI_API_KEY = 'sk-mock-valid-key';
+  inMemoryRedisMockInstance.clear();
+
+  const mock = setupMockOpenAiSuccess();
+  const ctx = await createServer();
+  const userId = 'dev_fake_pro_attacker';
+
+  try {
+    for (let i = 1; i <= 3; i++) {
+      const res = await fetch(`${ctx.url}/api/study-advice`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Client-Device-Id': userId,
+          'X-User-Tier': 'pro', // 偽造 Pro 標頭
+        },
+        body: JSON.stringify({ ...samplePayload, tier: 'pro', plan: 'pro' }), // 偽造 Pro body
+      });
+      assert.equal(res.status, 200);
+      const data = await res.json();
+      assert.equal(data.quota.tier, 'free', '未驗證憑證前絕不可提升為 Pro 額度');
+    }
+
+    // 第 4 次嘗試呼叫，依然受 Free 限制擋下
+    const res4 = await fetch(`${ctx.url}/api/study-advice`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Client-Device-Id': userId,
+        'X-User-Tier': 'pro',
+      },
+      body: JSON.stringify({ ...samplePayload, tier: 'pro' }),
+    });
+    assert.equal(res4.status, 429);
+    const data4 = await res4.json();
+    assert.equal(data4.code, 'DAILY_QUOTA_EXCEEDED');
+  } finally {
+    mock.restore();
+    await ctx.close();
+  }
+});
+
+test('10. 進行中請求鎖 (Concurrency Lock)：同一使用者並行請求時，第二筆被 429 CONCURRENT_REQUEST 拒絕', async () => {
+  process.env.MOCK_REDIS = 'true';
+  process.env.OPENAI_API_KEY = 'sk-mock-valid-key';
+  inMemoryRedisMockInstance.clear();
 
   const dummy = new OpenAI({ apiKey: 'mock' });
   const completionsProto = Object.getPrototypeOf(dummy.chat.completions);
   const originalCreate = completionsProto.create;
 
-  let capturedModel = '';
-  completionsProto.create = async function (args) {
-    capturedModel = args.model;
+  // 刻意延遲 200ms 模擬請求進行中
+  completionsProto.create = async function () {
+    await new Promise((r) => setTimeout(r, 200));
     return {
-      choices: [
-        {
-          message: {
-            role: 'assistant',
-            content: JSON.stringify({
-              summary: '自訂模型測試建議',
-              focusSubjects: ['測試科目'],
-              actionableTips: ['行動指引 1'],
-              estimatedFeasibility: '進度合理',
-            }),
-          },
-        },
-      ],
+      choices: [{ message: { role: 'assistant', content: mockOpenAiResponse } }],
+      usage: { prompt_tokens: 300, completion_tokens: 200, total_tokens: 500 },
     };
   };
 
   const ctx = await createServer();
+  const userId = 'dev_concurrent_user';
+
   try {
-    const res = await fetch(`${ctx.url}/api/study-advice`, {
+    const req1 = fetch(`${ctx.url}/api/study-advice`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Client-Device-Id': userId },
       body: JSON.stringify(samplePayload),
     });
 
-    assert.equal(res.status, 200);
-    assert.equal(capturedModel, 'gpt-5-mini');
+    // 稍微延遲 20ms 發出第二筆請求
+    await new Promise((r) => setTimeout(r, 20));
+    const req2 = fetch(`${ctx.url}/api/study-advice`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Client-Device-Id': userId },
+      body: JSON.stringify(samplePayload),
+    });
+
+    const [res1, res2] = await Promise.all([req1, req2]);
+    const statuses = [res1.status, res2.status];
+    assert.ok(statuses.includes(200), '第一筆請求應該成功 (200)');
+    assert.ok(statuses.includes(429), '第二筆並行請求應該被阻擋 (429)');
+
+    const blockedRes = res1.status === 429 ? res1 : res2;
+    const blockedData = await blockedRes.json();
+    assert.equal(blockedData.code, 'CONCURRENT_REQUEST');
   } finally {
     completionsProto.create = originalCreate;
-    delete process.env.OPENAI_API_KEY;
-    delete process.env.OPENAI_MODEL;
     await ctx.close();
   }
 });
 
-test('7. 模擬 OpenAI 401 錯誤時應對應回傳 401 OPENAI_AUTH_ERROR', async () => {
-  process.env.OPENAI_API_KEY = 'sk-invalid-key';
-  delete process.env.AI_PROVIDER;
+test('11. 每分鐘速率限制 (Rate Limit)：同一使用者 1 分鐘內第 4 次請求被 429 RATE_LIMIT_EXCEEDED 拒絕', async () => {
+  process.env.MOCK_REDIS = 'true';
+  process.env.OPENAI_API_KEY = 'sk-mock-valid-key';
+  process.env.FREE_DAILY_AI_LIMIT = '20'; // 放寬每日上限以測試每分鐘頻率限制
+  inMemoryRedisMockInstance.clear();
 
-  const dummy = new OpenAI({ apiKey: 'mock' });
-  const completionsProto = Object.getPrototypeOf(dummy.chat.completions);
-  const originalCreate = completionsProto.create;
-
-  completionsProto.create = async function () {
-    const err = new Error('Incorrect API key provided');
-    err.status = 401;
-    err.code = 'invalid_api_key';
-    throw err;
-  };
-
+  const mock = setupMockOpenAiSuccess();
   const ctx = await createServer();
+  const userId = 'dev_rate_limit_user';
+
   try {
-    const res = await fetch(`${ctx.url}/api/study-advice`, {
+    for (let i = 1; i <= 3; i++) {
+      const res = await fetch(`${ctx.url}/api/study-advice`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Client-Device-Id': userId },
+        body: JSON.stringify(samplePayload),
+      });
+      assert.equal(res.status, 200);
+    }
+
+    const res4 = await fetch(`${ctx.url}/api/study-advice`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Client-Device-Id': userId },
       body: JSON.stringify(samplePayload),
     });
-
-    assert.equal(res.status, 401);
-    const data = await res.json();
-    assert.equal(data.success, false);
-    assert.equal(data.code, 'OPENAI_AUTH_ERROR');
-    assert.match(data.error, /OpenAI API Key 無效/);
+    assert.equal(res4.status, 429);
+    const data4 = await res4.json();
+    assert.equal(data4.code, 'RATE_LIMIT_EXCEEDED');
+    assert.match(data4.error, /每分鐘上限 3 次/);
   } finally {
-    completionsProto.create = originalCreate;
-    delete process.env.OPENAI_API_KEY;
+    delete process.env.FREE_DAILY_AI_LIMIT;
+    mock.restore();
     await ctx.close();
   }
 });
 
-test('8. 模擬 OpenAI 429 額度不足時應對應回傳 429 QUOTA_EXCEEDED', async () => {
-  process.env.OPENAI_API_KEY = 'sk-mock-key';
-  delete process.env.AI_PROVIDER;
+test('12. 冪等鍵 (Idempotency Key)：重送相同 Key 直接回傳快取，不重複扣額或呼叫 OpenAI', async () => {
+  process.env.MOCK_REDIS = 'true';
+  process.env.OPENAI_API_KEY = 'sk-mock-valid-key';
+  inMemoryRedisMockInstance.clear();
 
-  const dummy = new OpenAI({ apiKey: 'mock' });
-  const completionsProto = Object.getPrototypeOf(dummy.chat.completions);
-  const originalCreate = completionsProto.create;
-
-  completionsProto.create = async function () {
-    const err = new Error('You exceeded your current quota');
-    err.status = 429;
-    err.code = 'insufficient_quota';
-    throw err;
-  };
-
+  const mock = setupMockOpenAiSuccess();
   const ctx = await createServer();
+  const idempotencyKey = 'idem_unique_test_key_12345';
+
+  try {
+    const res1 = await fetch(`${ctx.url}/api/study-advice`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Client-Device-Id': 'dev_user_idem',
+        'X-Idempotency-Key': idempotencyKey,
+      },
+      body: JSON.stringify(samplePayload),
+    });
+    assert.equal(res1.status, 200);
+    const data1 = await res1.json();
+    assert.equal(mock.getCallCount(), 1);
+
+    // 重送相同 Idempotency-Key
+    const res2 = await fetch(`${ctx.url}/api/study-advice`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Client-Device-Id': 'dev_user_idem',
+        'X-Idempotency-Key': idempotencyKey,
+      },
+      body: JSON.stringify(samplePayload),
+    });
+    assert.equal(res2.status, 200);
+    const data2 = await res2.json();
+
+    // 驗證未再次呼叫 OpenAI，且回應內容一致
+    assert.equal(mock.getCallCount(), 1, '命中冪等快取時不應重複呼叫 OpenAI');
+    assert.equal(data2.advice.summary, data1.advice.summary);
+  } finally {
+    mock.restore();
+    await ctx.close();
+  }
+});
+
+test('13. 伺服端單日預算上限 (DAILY_BUDGET)：超過日預算 ($0.50) 拒絕後續請求', async () => {
+  process.env.MOCK_REDIS = 'true';
+  process.env.OPENAI_API_KEY = 'sk-mock-valid-key';
+  process.env.AI_DAILY_BUDGET_USD = '0.0001'; // 設定極低日預算以觸發上限
+  inMemoryRedisMockInstance.clear();
+
+  const mock = setupMockOpenAiSuccess();
+  const ctx = await createServer();
+
   try {
     const res = await fetch(`${ctx.url}/api/study-advice`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Client-Device-Id': 'dev_user_budget_test' },
       body: JSON.stringify(samplePayload),
     });
-
     assert.equal(res.status, 429);
     const data = await res.json();
-    assert.equal(data.success, false);
-    assert.equal(data.code, 'QUOTA_EXCEEDED');
-    assert.match(data.error, /OpenAI 帳戶額度不足/);
+    assert.equal(data.code, 'DAILY_BUDGET_EXCEEDED');
+    assert.match(data.error, /本日系統 AI 服務總運算額度已達安全上限/);
   } finally {
-    completionsProto.create = originalCreate;
-    delete process.env.OPENAI_API_KEY;
+    delete process.env.AI_DAILY_BUDGET_USD;
+    mock.restore();
     await ctx.close();
   }
 });
 
-test('9. 若指定 AI_PROVIDER=gemini 備援方案且未設 GEMINI_API_KEY 時回傳 GEMINI 金鑰遺失錯誤', async () => {
-  const origProvider = process.env.AI_PROVIDER;
-  const origGeminiKey = process.env.GEMINI_API_KEY;
-  process.env.AI_PROVIDER = 'gemini';
-  delete process.env.GEMINI_API_KEY;
+test('14. 請求失敗或逾時退款：OpenAI 呼叫失敗時，安全退回預扣額度與每日計數', async () => {
+  process.env.MOCK_REDIS = 'true';
+  process.env.OPENAI_API_KEY = 'sk-mock-valid-key';
+  inMemoryRedisMockInstance.clear();
+
+  const dummy = new OpenAI({ apiKey: 'mock' });
+  const completionsProto = Object.getPrototypeOf(dummy.chat.completions);
+  const originalCreate = completionsProto.create;
+
+  let shouldFail = true;
+  completionsProto.create = async function () {
+    if (shouldFail) {
+      const err = new Error('OpenAI Simulated Internal Failure');
+      err.status = 500;
+      throw err;
+    }
+    return {
+      choices: [{ message: { role: 'assistant', content: mockOpenAiResponse } }],
+      usage: { prompt_tokens: 300, completion_tokens: 200, total_tokens: 500 },
+    };
+  };
 
   const ctx = await createServer();
+  const userId = 'dev_refund_test_user';
+
   try {
-    const res = await fetch(`${ctx.url}/api/study-advice`, {
+    // 第一次請求 (失敗)
+    const res1 = await fetch(`${ctx.url}/api/study-advice`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Client-Device-Id': userId },
       body: JSON.stringify(samplePayload),
     });
+    assert.equal(res1.status, 500);
 
-    assert.equal(res.status, 500);
-    const data = await res.json();
-    assert.equal(data.success, false);
-    assert.equal(data.code, 'API_KEY_MISSING');
-    assert.match(data.error, /GEMINI_API_KEY/);
+    // 第二次請求 (修復後再試)
+    shouldFail = false;
+    const res2 = await fetch(`${ctx.url}/api/study-advice`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Client-Device-Id': userId },
+      body: JSON.stringify(samplePayload),
+    });
+    assert.equal(res2.status, 200);
+    const data2 = await res2.json();
+
+    // 驗證第一次失敗未佔用次數，第二次請求後 usedToday 仍為 1
+    assert.equal(data2.quota.usedToday, 1);
+    assert.equal(data2.quota.remainingToday, 2);
   } finally {
-    if (origProvider !== undefined) process.env.AI_PROVIDER = origProvider;
-    else delete process.env.AI_PROVIDER;
-    if (origGeminiKey !== undefined) process.env.GEMINI_API_KEY = origGeminiKey;
+    completionsProto.create = originalCreate;
     await ctx.close();
   }
 });

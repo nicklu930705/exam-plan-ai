@@ -17,6 +17,12 @@ export interface StudyAdviceRequest {
   subjects: SubjectInput[];
   recentCompletionRate?: number; // 0-100
   behindTasksCount?: number;
+
+  // 選填客戶端識別與防重複提交參數
+  deviceId?: string;
+  userId?: string;
+  idempotencyKey?: string;
+  appleTransactionId?: string;
 }
 
 export interface StructuredAdvice {
@@ -26,6 +32,14 @@ export interface StructuredAdvice {
   estimatedFeasibility: string;
 }
 
+export interface QuotaInfo {
+  usedToday: number;
+  dailyLimit: number;
+  remainingToday: number;
+  resetsAt: string; // 台北時區 ISO 字串
+  tier: 'free' | 'pro';
+}
+
 export interface StudyAdviceResponse {
   success: boolean;
   advice?: StructuredAdvice;
@@ -33,4 +47,9 @@ export interface StudyAdviceResponse {
   disclaimer: string;
   error?: string;
   code?: string;
+  quota?: QuotaInfo;
+  costInfo?: {
+    actualCostUSD?: number;
+    isExactPricing?: boolean;
+  };
 }

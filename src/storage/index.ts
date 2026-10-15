@@ -83,11 +83,25 @@ export async function saveBackendUrlToStorage(url: string | null): Promise<void>
     const normalized = normalizeBackendUrl(url);
     if (!normalized) {
       await AsyncStorage.removeItem(BACKEND_URL_KEY);
-    } else {
-      await AsyncStorage.setItem(BACKEND_URL_KEY, normalized);
     }
   } catch (error) {
     console.error('儲存後端伺服器網址失敗：', error);
+  }
+}
+
+const DEVICE_ID_KEY = '@exam_plan_ai:client_device_id';
+
+export async function getOrCreateClientDeviceId(): Promise<string> {
+  try {
+    const existing = await AsyncStorage.getItem(DEVICE_ID_KEY);
+    if (existing && existing.trim().length >= 8) {
+      return existing.trim();
+    }
+    const newId = `dev_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
+    await AsyncStorage.setItem(DEVICE_ID_KEY, newId);
+    return newId;
+  } catch {
+    return `dev_fallback_${Date.now().toString(36)}`;
   }
 }
 

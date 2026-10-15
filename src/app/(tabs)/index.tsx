@@ -366,6 +366,7 @@ export default function HomeScreen() {
             errorCode={aiAdviceResult?.errorCode}
             examName={exam?.name}
             quotaStatus={aiAdviceResult?.quotaStatus}
+            quota={aiAdviceResult?.quota}
             isLoading={isLoadingAi}
             onRefresh={handleRequestAiAdvice}
             onRetry={handleRequestAiAdvice}

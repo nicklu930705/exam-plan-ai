@@ -2,7 +2,7 @@ import { Ionicons } from '@expo/vector-icons';
 import React from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, View } from 'react-native';
 
-import type { AiAdviceStatus, StructuredAdvice } from '../services/aiAdviceService';
+import type { AiAdviceStatus, QuotaInfo, StructuredAdvice } from '../services/aiAdviceService';
 import type { AiQuotaStatus } from '../subscription/types';
 import { colors, radius, shadow, spacing } from '../theme';
 import { AppText } from './AppText';
@@ -13,6 +13,7 @@ interface Props {
   disclaimer?: string;
   note?: string;
   quotaStatus?: AiQuotaStatus;
+  quota?: QuotaInfo;
   status?: AiAdviceStatus;
   isLoading?: boolean;
   error?: string | null;
@@ -29,6 +30,7 @@ export const AiAdviceCard: React.FC<Props> = ({
   disclaimer,
   note,
   quotaStatus,
+  quota,
   status,
   isLoading = false,
   error,
@@ -95,18 +97,40 @@ export const AiAdviceCard: React.FC<Props> = ({
       errorBadgeText = '網路連線異常';
       errorIcon = 'cloud-offline-outline';
       errorTitle = '無法連線至 AI 伺服器';
-    } else if (status === 'quota_exceeded' || errorCode === 'QUOTA_EXCEEDED' || errorCode === 'RATE_LIMIT_EXCEEDED') {
-      errorBadgeText = '請求頻率上限';
-      errorIcon = 'speedometer-outline';
-      errorTitle = 'API 呼叫過於頻繁';
+    } else if (
+      status === 'quota_exceeded' ||
+      errorCode === 'QUOTA_EXCEEDED' ||
+      errorCode === 'DAILY_QUOTA_EXCEEDED' ||
+      errorCode === 'RATE_LIMIT_EXCEEDED' ||
+      errorCode === 'CONCURRENT_REQUEST' ||
+      errorCode === 'DAILY_BUDGET_EXCEEDED' ||
+      errorCode === 'MONTHLY_BUDGET_EXCEEDED'
+    ) {
+      if (errorCode === 'CONCURRENT_REQUEST') {
+        errorBadgeText = '處理中請稍候';
+        errorIcon = 'sync-outline';
+        errorTitle = '已有進行中的請求';
+      } else if (errorCode === 'RATE_LIMIT_EXCEEDED') {
+        errorBadgeText = '頻率限制 (每分3次)';
+        errorIcon = 'speedometer-outline';
+        errorTitle = '呼叫過於頻繁';
+      } else if (errorCode === 'DAILY_BUDGET_EXCEEDED' || errorCode === 'MONTHLY_BUDGET_EXCEEDED') {
+        errorBadgeText = '系統額度已滿';
+        errorIcon = 'alert-circle-outline';
+        errorTitle = '伺服端總預算上限';
+      } else {
+        errorBadgeText = '今日額度已達上限';
+        errorIcon = 'calendar-outline';
+        errorTitle = '今日 AI 次數已用完';
+      }
     } else if (status === 'timeout' || errorCode === 'TIMEOUT' || errorCode === 'GATEWAY_TIMEOUT') {
       errorBadgeText = '連線回應逾時';
       errorIcon = 'time-outline';
       errorTitle = 'AI 伺服器處理逾時';
-    } else if (errorCode === 'SERVICE_UNAVAILABLE') {
-      errorBadgeText = '伺服器繁忙';
+    } else if (errorCode === 'SERVICE_UNAVAILABLE' || errorCode === 'STORAGE_UNAVAILABLE') {
+      errorBadgeText = '服務暫時維護中';
       errorIcon = 'cloud-offline-outline';
-      errorTitle = 'AI 模型忙碌中';
+      errorTitle = '資料庫或服務暫停';
     }
 
     return (
@@ -308,7 +332,14 @@ export const AiAdviceCard: React.FC<Props> = ({
 
       {/* 配額與免責說明 */}
       <View style={styles.footer}>
-        {quotaStatus && quotaStatus.limit > 0 ? (
+        {quota ? (
+          <View style={styles.quotaRow}>
+            <Ionicons name="sparkles" size={12} color={colors.primary} />
+            <AppText variant="caption" color={colors.primary} style={styles.quotaHighlightText}>
+              {quota.tier === 'pro' ? '✦ Pro 會員' : '免費版'}今日已用 {quota.usedToday}/{quota.dailyLimit} 次（剩餘 {quota.remainingToday} 次 · 每日 00:00 重設）
+            </AppText>
+          </View>
+        ) : quotaStatus && quotaStatus.limit > 0 ? (
           <AppText variant="caption" secondary style={styles.quotaText}>
             本月 AI 額度：剩餘 {quotaStatus.remaining} / {quotaStatus.limit} 次
           </AppText>
@@ -492,6 +523,16 @@ const styles = StyleSheet.create({
   quotaText: {
     color: colors.primary,
     fontWeight: '500',
+  },
+  quotaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    marginBottom: 2,
+  },
+  quotaHighlightText: {
+    fontWeight: '600',
+    fontSize: 12,
   },
   disclaimerText: {
     fontSize: 11,

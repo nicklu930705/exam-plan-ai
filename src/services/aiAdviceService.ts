@@ -8,10 +8,18 @@
  * 4. 職責分離：AI 只提供學習輔導建議與策略分析，絕不直接篡改本機確定性排程資料。
  */
 
-import { getBackendUrlFromStorage } from '../storage';
+import { getBackendUrlFromStorage, getOrCreateClientDeviceId } from '../storage';
 import { checkAiAccess, getAiQuotaStatus } from '../subscription/entitlements';
 import type { AiQuotaStatus, AiUsageRecord, UserSubscription } from '../subscription/types';
 import { diffDays } from '../utils/date';
+
+export interface QuotaInfo {
+  usedToday: number;
+  dailyLimit: number;
+  remainingToday: number;
+  resetsAt: string;
+  tier: 'free' | 'pro';
+}
 
 export interface SubjectInput {
   name: string;
@@ -44,6 +52,7 @@ export interface StudyAdviceResponse {
   disclaimer: string;
   error?: string;
   code?: string;
+  quota?: QuotaInfo;
 }
 
 export type AiAdviceStatus =
@@ -61,6 +70,7 @@ export interface AiAdviceServiceResult {
   advice?: StructuredAdvice;
   source: 'openai_ai' | 'gemini_ai' | 'fallback_rule_engine';
   quotaStatus?: AiQuotaStatus;
+  quota?: QuotaInfo;
   disclaimer: string;
   note?: string;
   error?: string;
@@ -197,11 +207,16 @@ export async function fetchFromBackendApi(
   });
 
   try {
+    const deviceId = await getOrCreateClientDeviceId();
+    const idempotencyKey = `idem_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+
     const fetchPromise = fetch(targetUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',
+        'X-Client-Device-Id': deviceId,
+        'X-Idempotency-Key': idempotencyKey,
       },
       body: JSON.stringify(request),
       signal: controller.signal,
@@ -423,6 +438,7 @@ export async function requestAiStudyAdvice(
       advice: backendRes.advice,
       source: backendRes.source ?? 'openai_ai',
       quotaStatus,
+      quota: backendRes.quota,
       disclaimer: backendRes.disclaimer,
     };
   }
@@ -430,13 +446,20 @@ export async function requestAiStudyAdvice(
   // 4. 後端失敗（429、500、連線逾時、網路中斷等）處理
   if (strictError) {
     let status: AiAdviceStatus = 'error';
-    if (backendRes.code === 'QUOTA_EXCEEDED' || backendRes.code === 'RATE_LIMIT_EXCEEDED') {
+    if (
+      backendRes.code === 'QUOTA_EXCEEDED' ||
+      backendRes.code === 'DAILY_QUOTA_EXCEEDED' ||
+      backendRes.code === 'RATE_LIMIT_EXCEEDED' ||
+      backendRes.code === 'CONCURRENT_REQUEST' ||
+      backendRes.code === 'DAILY_BUDGET_EXCEEDED' ||
+      backendRes.code === 'MONTHLY_BUDGET_EXCEEDED'
+    ) {
       status = 'quota_exceeded';
     } else if (backendRes.code === 'TIMEOUT' || backendRes.code === 'GATEWAY_TIMEOUT') {
       status = 'timeout';
     } else if (backendRes.code === 'NETWORK_ERROR') {
       status = 'network_error';
-    } else if (backendRes.code === 'SERVICE_UNAVAILABLE') {
+    } else if (backendRes.code === 'SERVICE_UNAVAILABLE' || backendRes.code === 'STORAGE_UNAVAILABLE') {
       status = 'error';
     }
 
@@ -445,6 +468,7 @@ export async function requestAiStudyAdvice(
       status,
       source: backendRes.source ?? 'openai_ai',
       quotaStatus,
+      quota: backendRes.quota,
       disclaimer: backendRes.disclaimer || 'AI 建議僅供學習策略與心理激勵參考。',
       error: backendRes.error || 'AI 伺服器回應異常，請稍後再試。',
       errorCode: backendRes.code,

@@ -1,4 +1,6 @@
 import OpenAI from 'openai';
+import { getAiConfig } from './config';
+import { calculateTokenCostMicroUSD } from './pricing';
 import type { StructuredAdvice, StudyAdviceRequest } from './types';
 
 export const DEFAULT_OPENAI_MODEL = 'gpt-5.6-luna';
@@ -21,6 +23,18 @@ const SYSTEM_INSTRUCTION = `你是一位專業、親切且實事求是的繁體�
   "estimatedFeasibility": "對目前每日可用讀書時間是否足以負荷考試目標的客觀評估 (例如：每日 90 分鐘時間充裕，維持規律即可順利完成全部範圍)"
 }`;
 
+export interface OpenAiAdviceResult {
+  advice: StructuredAdvice;
+  usage?: {
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
+  };
+  costMicroUSD: number;
+  costUSD: number;
+  isExactPricing: boolean;
+}
+
 /**
  * 呼叫 OpenAI 官方 API 產生結構化讀書建議
  */
@@ -28,12 +42,14 @@ export async function generateOpenAiAdvice(
   req: StudyAdviceRequest,
   apiKey: string,
   modelName: string = DEFAULT_OPENAI_MODEL,
-): Promise<{ advice: StructuredAdvice; usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number } }> {
+): Promise<OpenAiAdviceResult> {
+  const config = getAiConfig();
   const startTime = Date.now();
+
   const client = new OpenAI({
     apiKey,
-    timeout: 15 * 1000, // 15 秒內部超時
-    maxRetries: 1, // 最多自動重試 1 次
+    timeout: Math.min(config.REQUEST_TIMEOUT_MS, 18000), // 內部超時，保留 2 秒緩衝給 Vercel
+    maxRetries: config.MAX_RETRIES, // 最多自動重試 1 次
   });
 
   const subjectDetails = req.subjects
@@ -65,24 +81,26 @@ ${subjectDetails}
       { role: 'user', content: userPrompt },
     ],
     response_format: { type: 'json_object' },
-    max_completion_tokens: 900,
+    max_completion_tokens: config.MAX_OUTPUT_TOKENS, // 嚴格遵守 AI_MAX_OUTPUT_TOKENS (600 tokens)
   });
 
   const durationMs = Date.now() - startTime;
   const rawContent = completion.choices[0]?.message?.content?.trim() || '';
 
-  // 基本用量日誌（僅記錄 token 數量與耗時，嚴禁記錄金鑰或個人機敏資料）
-  const usage = {
-    promptTokens: completion.usage?.prompt_tokens,
-    completionTokens: completion.usage?.completion_tokens,
-    totalTokens: completion.usage?.total_tokens,
-  };
+  const promptTokens = completion.usage?.prompt_tokens ?? 0;
+  const completionTokens = completion.usage?.completion_tokens ?? 0;
+  const totalTokens = completion.usage?.total_tokens ?? 0;
+
+  // 根據模型計算實際成本
+  const costCalc = calculateTokenCostMicroUSD(modelName, promptTokens, completionTokens);
+
   console.log('[OpenAI 請求成功]', {
     model: modelName,
     durationMs,
-    promptTokens: usage.promptTokens,
-    completionTokens: usage.completionTokens,
-    totalTokens: usage.totalTokens,
+    promptTokens,
+    completionTokens,
+    totalTokens,
+    costUSD: costCalc.costUSD,
   });
 
   if (!rawContent) {
@@ -112,7 +130,17 @@ ${subjectDetails}
         `目前每天 ${req.dailyAvailableMinutes} 分鐘讀書時間，只要持之以恆，進度完全在掌握之中。`,
     };
 
-    return { advice, usage };
+    return {
+      advice,
+      usage: {
+        promptTokens,
+        completionTokens,
+        totalTokens,
+      },
+      costMicroUSD: costCalc.costMicroUSD,
+      costUSD: costCalc.costUSD,
+      isExactPricing: costCalc.isExactPricing,
+    };
   } catch (parseErr) {
     console.error('[OpenAI] JSON 解析失敗，耗時：', durationMs, 'ms，原因：', parseErr);
     throw new Error('無法解析 OpenAI 回傳的結構化資料。');

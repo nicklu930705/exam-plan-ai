@@ -1,132 +1,166 @@
-# 考試計畫 AI - 後端 API (OpenAI / Google Gemini 雙引擎服務)
+# 考試計畫 AI - 後端 API (OpenAI / Google Gemini 雙引擎 + Upstash Redis 用量與預算控制)
 
-本專案為「考試計畫 AI」iPhone App 的獨立後端 API，支援 OpenAI API（預設使用 `gpt-5.6-luna`）與 Google Gemini API 雙引擎架構，為考生提供量身訂做的繁體中文讀書建議與備考策略。
-
----
-
-## 核心設計理念（安全與零洩漏原則）
-
-1. **零金鑰原則（Zero-Key Principle）**：
-   * `OPENAI_API_KEY` 與 `GEMINI_API_KEY` 嚴格僅保存在本後端的 Vercel 環境變數中。
-   * **絕對禁止**將金鑰放置於 Expo App、前端程式碼、`EXPO_PUBLIC_` 變數或 Git 倉庫中。
-2. **AI 只提供建議，不覆蓋排程**：
-   * 所有每日讀書日程、倒數計時與時間上限，100% 由前端的 TypeScript 確定性排程引擎計算。
-   * AI 僅扮演「學習策略教練」角色，提供暖心鼓勵、弱科突破要訣與負荷可行性分析。
-3. **健全的保護機制**：
-   * **請求大小限制**：限制 15 KB 以下，防止大封包攻擊。
-   * **來源 IP 限流（Rate Limit）**：每 IP 每分鐘上限 10 次，防止濫刷。
-   * **20 秒安全逾時保護**：避免網路遲緩造成無止境等待。
-   * **優雅降級**：當 API 發生異常或網路中斷時，App 自動無縫切換為本機規則建議，絕不崩潰。
+本專案為「考試計畫 AI」iPhone App 的獨立後端 API，部署於 Vercel Serverless。支援 OpenAI API（預設使用 `gpt-5.6-luna`）與 Google Gemini API 雙引擎架構，並透過 **Upstash Redis REST API** 實作原子級用量限制、防並行濫用、每分鐘限流與伺服端每日/每月成本預算控制。
 
 ---
 
-## 目錄結構
+## 核心架構與安全設計
 
-```text
-backend/
-├── api/
-│   └── study-advice.ts       # 主要 API 端點: POST /api/study-advice
-├── lib/
-│   ├── openai.ts             # 封裝 OpenAI 官方 SDK 呼叫 (預設 gpt-5.6-luna)
-│   ├── gemini.ts             # 封裝 Google @google/genai SDK 呼叫 (備援方案)
-│   ├── rateLimit.ts          # 來源 IP 簡易防刷機制
-│   ├── types.ts              # 請求與回應型別定義
-│   └── validation.ts         # 嚴格的輸入資料欄位防呆檢查
-├── .env.example              # 環境變數範本
-├── .gitignore                # 忽略 node_modules 與 .env
-├── package.json              # 依賴設定
-├── tsconfig.json             # TypeScript 編譯設定
-├── vercel.json               # Vercel 部署與 CORS 跨域設定
-└── README.md                 # 說明文件
-```
+### 1. 零金鑰與安全原則（Zero-Key Principle）
+* `OPENAI_API_KEY`、`GEMINI_API_KEY` 與 `UPSTASH_REDIS_REST_TOKEN` 嚴格僅保存在 Vercel 後端環境變數。
+* **絕對禁止**將金鑰放入 Expo App、前端程式碼、`EXPO_PUBLIC_` 變數或 Git 倉庫。
+* 日誌僅記錄匿名化 User ID 與摘要 Token 數，嚴格禁止記錄敏感學習筆記與金鑰。
+
+### 2. Upstash Redis 原子預扣與結算引擎 (Lua Scripts)
+為了解決 Serverless 無狀態執行個體之間的並行競爭（Race Condition），採用 Redis Lua 腳本進行三階段控制：
+1. **呼叫前原子檢查與預扣 (`PRE_FLIGHT_LUA`)**：
+   - **冪等性快取 (`exam_ai:idempotency:<key>`)**：若命中 10 分鐘內的重送鍵，直接回傳快取回應，不重複扣額與呼叫 OpenAI。
+   - **進行中並行鎖 (`exam_ai:lock:<userId>`)**：單一使用者同時間僅允許 1 筆進行中的請求（TTL 30s）。
+   - **當日配額檢查 (`exam_ai:usage:day:<date>:<userId>`)**：免費版每日 3 次、Pro 每日 15 次（優先判斷，避免額度用完卻誤報頻率限制）。
+   - **每日總預算檢查 (`exam_ai:budget:day:<date>`)**：預設上限 US$0.50。
+   - **每月總預算檢查 (`exam_ai:budget:month:<month>`)**：預設上限 US$5.00。
+   - **每分鐘頻率檢查 (`exam_ai:ratelimit:min:<userId>:<min>`)**：每分鐘最多 3 次。
+   - **原子預扣**：同時通過後，原子增加當日計數與預扣預估費用（以該模型最大輸出 Token 估算），防止並行請求超支。
+2. **呼叫成功結算 (`SETTLE_SUCCESS_LUA`)**：
+   - 根據 OpenAI 回傳的實際 Token 數量計算精準費用（依據模型費率表）。
+   - 補正預留金額與實際金額的差額（多退少補），儲存冪等快取，並釋放並行鎖。
+3. **呼叫失敗/逾時釋放 (`SETTLE_FAILURE_LUA`)**：
+   - 若呼叫 OpenAI 逾時（20 秒）或 API 發生 500 錯誤，立即原子扣回已預扣的次數與預算，並釋放並行鎖，不浪費使用者額度。
+4. **安全關閉策略（Fail-Closed）**：
+   - 若正式環境無法連線至 Upstash Redis 或缺少憑證，直接回傳 `503 STORAGE_UNAVAILABLE`，絕不退回不可靠的伺服器記憶體計數。
+
+### 3. 台北時區每日重置機制
+* 所有每日配額與單日預算均以 **`Asia/Taipei` (UTC+8)** 時區判定。
+* 每日於台北時間 00:00:00 自動重設，TTL 計算精準對齊台北時間午夜。
+
+### 4. 匿名身分方案與防濫用限制
+* **現有方案**：App 於本機首次啟動時產生持久化 UUID (`X-Client-Device-Id`) 儲存於 AsyncStorage。若未提供則退回客戶端 IP SHA-256 雜湊。
+* **防濫用能力說明**：
+  - 此方案能有效限制正常使用者的每日次數與防手震重複提交。
+  - **限制**：若使用者手動解除安裝 App 並重新下載，本機 UUID 會被重設。在尚未導入 Apple ID 登入或帳號系統前，單靠裝置 ID 無法 100% 杜絕重裝刷額度的惡意攻擊。
+* **Pro 會員防偽造機制**：
+  - 前端傳來的 `tier='pro'` 或 `plan='pro'` 視為**未驗證資料**。
+  - 後端預設一律將其降為 Free（3 次/日），直到提供有效的 Apple App Store Server 憑證。
+
+### 5. Apple In-App Purchase (StoreKit) 伺服端驗證介面
+* 目前 iPhone App 採用本機 StoreKit 2 交易管理。
+* 後端已於 `backend/lib/identity.ts` 預留 `verifyAppleTransaction(token)` 驗證介面。
+* **後續待完成事項**：
+  - 於 App Store Connect 申請 App Store Server API 金鑰 (.p8)。
+  - 設定 `APPLE_ISSUER_ID`、`APPLE_KEY_ID`、`APPLE_PRIVATE_KEY` 與 `APPLE_BUNDLE_ID`。
+  - 於客戶端購妥後傳遞 JWS SignedTransaction 供後端驗證，驗證通過才升級為 Pro（15 次/日）。
 
 ---
 
-## 環境變數設定說明 (Vercel)
+## Redis 鍵值設計 (Key Architecture)
 
-在 Vercel 專案後台的 **Settings ➔ Environment Variables** 中設定：
+| Redis Key 格式 | 類型 | 說明 | 預設 TTL |
+| :--- | :--- | :--- | :--- |
+| `exam_ai:lock:<userId>` | String | 進行中並行鎖 (NX EX) | 30 秒 |
+| `exam_ai:ratelimit:min:<userId>:<YYYYMMDDHHmm>` | Integer | 每分鐘請求次數 (上限 3 次) | 60 秒 |
+| `exam_ai:usage:day:<YYYY-MM-DD>:<userId>` | Integer | 使用者當日已用次數 (Free: 3, Pro: 15) | 台北午夜 + 1小時 |
+| `exam_ai:budget:day:<YYYY-MM-DD>` | Integer | 當日全系統累計微美元 (Micro USD) | 台北午夜 + 1小時 |
+| `exam_ai:budget:month:<YYYY-MM>` | Integer | 當月全系統累計微美元 (Micro USD) | 台北月底 + 24小時 |
+| `exam_ai:idempotency:<idempotencyKey>` | String | 成功回應快取 JSON | 600 秒 (10分鐘) |
 
-### 1. OpenAI 設定 (主要方案 - 推薦)
+---
+
+## 環境變數清單 (Vercel 後端)
+
+在 Vercel 專案後台 **Settings ➔ Environment Variables** 設定（請加入 **Production** 與 **Preview** 環境）：
+
+### 1. AI 提供商金鑰
 | 變數名稱 | 必填 | 預設值 | 說明 |
 | :--- | :--- | :--- | :--- |
-| `OPENAI_API_KEY` | 是 (使用 OpenAI 時) | 無 | 您的 OpenAI API Key (格式為 `sk-proj-...` 或 `sk-...`) |
-| `OPENAI_MODEL` | 否 | `gpt-5.6-luna` | 指定的模型名稱 (例如：`gpt-5.6-luna`、`gpt-4o-mini`) |
+| `OPENAI_API_KEY` | 是 | 無 | OpenAI Platform API Key (格式為 `sk-proj-...` 或 `sk-...`) |
+| `OPENAI_MODEL` | 否 | `gpt-5.6-luna` | 指定的模型名稱 (支援 `gpt-5.6-luna`、`gpt-4o-mini` 等) |
+| `GEMINI_API_KEY` | 否 | 無 | Google AI Studio 金鑰 (備援方案) |
+| `GEMINI_MODEL` | 否 | `gemini-3.8-flash` | Gemini 模型名稱 |
+| `AI_PROVIDER` | 否 | `openai` | 強制指定使用 `openai` 或 `gemini` |
 
-### 2. Google Gemini 設定 (可切換備援方案)
-| 變數名稱 | 必填 | 預設值 | 說明 |
-| :--- | :--- | :--- | :--- |
-| `GEMINI_API_KEY` | 是 (使用 Gemini 時) | 無 | 您的 Google AI Studio API Key |
-| `GEMINI_MODEL` | 否 | `gemini-3.8-flash` | 指定的 Gemini 模型名稱 |
+### 2. Upstash Redis REST 連線
+| 變數名稱 | 必填 | 說明 |
+| :--- | :--- | :--- |
+| `UPSTASH_REDIS_REST_URL` | 是 (正式環境) | Upstash 控制台之 REST URL (例如 `https://xxx.upstash.io`) |
+| `UPSTASH_REDIS_REST_TOKEN` | 是 (正式環境) | Upstash 控制台之 REST Token |
 
-### 3. 提供商切換開關 (選填)
-| 變數名稱 | 必填 | 預設值 | 說明 |
-| :--- | :--- | :--- | :--- |
-| `AI_PROVIDER` | 否 | `openai` | 強制指定使用的提供商：可填 `openai` 或 `gemini`。若未設定，後端偵測到 `OPENAI_API_KEY` 時會自動優先使用 OpenAI。 |
+> **提示**：可直接在 Vercel 專案的 **Integrations ➔ Upstash** 一鍵安裝，Vercel 會自動注入上述兩項變數！
+
+### 3. 限額與預算控制變數 (選填，未填則自動採用安全預設值)
+| 變數名稱 | 預設值 | 說明 |
+| :--- | :--- | :--- |
+| `FREE_DAILY_AI_LIMIT` | `3` | 免費版每日請求上限 |
+| `PRO_DAILY_AI_LIMIT` | `15` | Pro 會員每日請求上限 |
+| `AI_RATE_LIMIT_PER_MINUTE` | `3` | 單一使用者每分鐘上限 |
+| `AI_DAILY_BUDGET_USD` | `0.5` | 每日伺服器總支出上限 (美元) |
+| `AI_MONTHLY_BUDGET_USD` | `5.0` | 每月伺服器總支出上限 (美元) |
+| `AI_BUDGET_WARNING_PERCENT` | `50` | 支出達預算 50% 時記錄警訊 |
+| `AI_MAX_INPUT_CHARS` | `4000` | 請求內文總字數上限 |
+| `AI_MAX_OUTPUT_TOKENS` | `600` | 模型生成輸出最大 Token 數 |
+| `AI_REQUEST_TIMEOUT_MS` | `20000` | API 請求逾時時間 (20 秒) |
+| `AI_MAX_RETRIES` | `1` | 遇非預期錯誤最大重試次數 |
 
 ---
 
 ## 部署到 Vercel 步驟
 
-1. 將本專案（或 `backend` 資料夾）提交並推送至您的 GitHub 儲存庫。
-2. 登入 [Vercel 控制台 (https://vercel.com/)](https://vercel.com/) ➔ 點進 `exam-plan-ai-backend-coral`。
-3. 點選 **Settings** ➔ **Environment Variables**：
-   - 新增 `OPENAI_API_KEY`，填入您的 OpenAI 金鑰。
-   - （選填）新增 `OPENAI_MODEL`，設定為 `gpt-5.6-luna`。
-4. 前往 **Deployments** 頁籤，在最上方最新部署右側點擊 `...` ➔ **Redeploy**。
-5. 等待約 20 秒，後端即自動更新啟用 OpenAI！
+1. 推送最新的程式碼至 GitHub `main` 分支。
+2. 開啟 [Upstash 控制台 (https://console.upstash.com/)](https://console.upstash.com/) 建立免費 Redis 資料庫（區域建議選擇靠近台灣的 `ap-southeast-1` 新加坡 或 `us-east-1`）。
+3. 取得 **REST API** 的 `UPSTASH_REDIS_REST_URL` 與 `UPSTASH_REDIS_REST_TOKEN`。
+4. 登入 [Vercel 專案後台](https://vercel.com/) ➔ **Settings** ➔ **Environment Variables**：
+   - 確保 `OPENAI_API_KEY` 在 **Production** 環境中。
+   - 新增 `UPSTASH_REDIS_REST_URL` 與 `UPSTASH_REDIS_REST_TOKEN`。
+5. 前往 **Deployments** 點選 **Redeploy**。
 
 ---
 
-## API 規格說明
+## 實際測試與驗證方式
 
-### `POST /api/study-advice`
-
-#### 請求標頭 (Request Headers)
-```http
-Content-Type: application/json
+### 1. 執行單元與並行測試
+在本地端執行測試（內建 Redis Mock 與 OpenAI Mock，14 項嚴格測試）：
+```bash
+cd backend
+npm test
 ```
+涵蓋：
+- 405 Method Not Allowed / 400 Invalid Input / 400 Max Chars / 413 Payload Size
+- 503 Storage Unavailable (Fail-Closed) / 500 Missing Key
+- 免費版第 4 次 429 DAILY_QUOTA_EXCEEDED 拒絕
+- Pro 偽造降級為 Free 防禦
+- 並行請求鎖 CONCURRENT_REQUEST (200ms 並行測試)
+- 每分鐘 3 次速率限制 RATE_LIMIT_EXCEEDED
+- 冪等性快取 X-Idempotency-Key
+- 單日預算上限 DAILY_BUDGET_EXCEEDED
+- 失敗安全退款與額度回復
 
-#### 請求範例 (Request Body)
-```json
-{
-  "examName": "多益英語測驗",
-  "examDate": "2026-11-12",
-  "dailyAvailableMinutes": 90,
-  "intensity": "normal",
-  "subjects": [
-    {
-      "name": "聽力",
-      "familiarity": 2,
-      "totalChapters": 4,
-      "completedChapters": 1
-    },
-    {
-      "name": "閱讀",
-      "familiarity": 1,
-      "totalChapters": 4,
-      "completedChapters": 0
-    }
-  ],
-  "recentCompletionRate": 25,
-  "behindTasksCount": 2
-}
-```
-
-#### 回應範例 (Response Body - 200 OK)
-```json
-{
-  "success": true,
-  "advice": {
-    "summary": "距離考試尚有一個月，閱讀部分進度稍有落後且熟悉度較低，建議本週集中火力在長篇填空與破題練習。",
-    "focusSubjects": ["閱讀", "聽力 Part 2"],
-    "actionableTips": [
-      "每天利用精神最佳的前 45 分鐘先做閱讀題目。",
-      "聽力熟悉度佳，可運用計時器於零碎時間進行維持題感。",
-      "週末利用排程中的緩衝時間補齊落後的 2 項任務，切勿熬夜打亂節奏。"
+### 2. 使用 curl 測試正式環境端點
+```bash
+# 測試第 1 次呼叫 (正常成功，回傳 quota 資訊)
+curl -X POST https://exam-plan-ai-backend-coral.vercel.app/api/study-advice \
+  -H "Content-Type: application/json" \
+  -H "X-Client-Device-Id: test_device_curl_001" \
+  -d '{
+    "examName": "多益英語測驗",
+    "examDate": "2026-11-15",
+    "dailyAvailableMinutes": 90,
+    "intensity": "normal",
+    "subjects": [
+      { "name": "閱讀", "familiarity": 1, "totalChapters": 10, "completedChapters": 2 },
+      { "name": "聽力", "familiarity": 2, "totalChapters": 10, "completedChapters": 4 }
     ],
-    "estimatedFeasibility": "目前每日 90 分鐘時間充裕，維持規律即可順利在考前完成全部範圍。"
-  },
-  "source": "openai_ai",
-  "disclaimer": "AI 建議僅供學習策略與心理激勵參考；每日讀書日程與時間限制仍由排程引擎安全計算。"
+    "recentCompletionRate": 80,
+    "behindTasksCount": 1
+  }'
+```
+回應中的 `quota` 欄位將顯示：
+```json
+"quota": {
+  "usedToday": 1,
+  "dailyLimit": 3,
+  "remainingToday": 2,
+  "tier": "free",
+  "resetsAt": "2026-10-16T00:00:00+08:00"
 }
 ```
+連續發送 4 次即可親自驗證被 `429 DAILY_QUOTA_EXCEEDED` 安全阻擋！
+
