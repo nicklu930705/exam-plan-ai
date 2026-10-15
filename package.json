@@ -12,6 +12,7 @@
     "expo-iap": "^6.0.1",
     "expo-linking": "~57.0.12",
     "expo-router": "~57.0.25",
+    "expo-splash-screen": "~57.0.10",
     "expo-status-bar": "~57.0.1",
     "react": "19.2.3",
     "react-dom": "19.2.3",

@@ -151,12 +151,15 @@ export default function SubscriptionScreen() {
     await storeKitService.manageSubscriptions();
   };
 
-  // 開發者測試用：一鍵切換方案狀態
+  // 開發者測試用：一鍵切換方案狀態（僅在開發環境有效）
   const handleQuickSwitch = (
     tier: PlanTier,
     cycle: 'monthly' | 'annual' | 'none' | 'lifetime',
     expired = false,
   ) => {
+    if (!__DEV__) {
+      return;
+    }
     let sub: UserSubscription;
     const now = new Date();
     if (expired) {
@@ -225,35 +228,37 @@ export default function SubscriptionScreen() {
         subtitle="升級 Pro 或永久買斷，掌握高效備考節奏"
       />
 
-      {/* StoreKit 連線與環境狀態說明卡片 */}
-      <View
-        style={[
-          styles.statusNoticeCard,
-          storeStatus.isNativeAvailable
-            ? styles.statusNoticeCardActive
-            : styles.statusNoticeCardPreview,
-        ]}
-      >
-        <View style={styles.statusNoticeHeader}>
-          <View
-            style={[
-              styles.statusNoticeBadge,
-              storeStatus.isNativeAvailable
-                ? styles.statusNoticeBadgeActive
-                : styles.statusNoticeBadgePreview,
-            ]}
-          >
-            <AppText style={styles.statusNoticeBadgeText}>
-              {storeStatus.isNativeAvailable
-                ? 'Apple StoreKit 2 就緒'
-                : '開發預覽 / Expo Go 模式'}
-            </AppText>
+      {/* StoreKit 連線與環境狀態說明卡片（僅開發環境顯示） */}
+      {__DEV__ && (
+        <View
+          style={[
+            styles.statusNoticeCard,
+            storeStatus.isNativeAvailable
+              ? styles.statusNoticeCardActive
+              : styles.statusNoticeCardPreview,
+          ]}
+        >
+          <View style={styles.statusNoticeHeader}>
+            <View
+              style={[
+                styles.statusNoticeBadge,
+                storeStatus.isNativeAvailable
+                  ? styles.statusNoticeBadgeActive
+                  : styles.statusNoticeBadgePreview,
+              ]}
+            >
+              <AppText style={styles.statusNoticeBadgeText}>
+                {storeStatus.isNativeAvailable
+                  ? 'Apple StoreKit 2 就緒'
+                  : '開發預覽 / Expo Go 模式'}
+              </AppText>
+            </View>
           </View>
+          <AppText secondary style={styles.statusNoticeText}>
+            {storeStatus.notice}
+          </AppText>
         </View>
-        <AppText secondary style={styles.statusNoticeText}>
-          {storeStatus.notice}
-        </AppText>
-      </View>
+      )}
 
       {/* 當前會員狀態卡片 */}
       <View style={styles.currentCard}>
@@ -500,47 +505,49 @@ export default function SubscriptionScreen() {
         </View>
       </View>
 
-      {/* 開發者即時方案切換控制台（供即時驗證各方案下的 App 行為） */}
-      <View style={styles.devToolSection}>
-        <AppText style={styles.devToolTitle}>開發者測試控制台</AppText>
-        <AppText secondary style={styles.devToolDesc}>
-          點擊可立即模擬切換會員狀態，驗證多考試限制、排程開關與過期降級防護：
-        </AppText>
-        <View style={styles.devButtonGrid}>
-          <Pressable
-            style={styles.devBtn}
-            onPress={() => handleQuickSwitch('free', 'none')}
-          >
-            <AppText style={styles.devBtnText}>免費版 (Free)</AppText>
-          </Pressable>
-          <Pressable
-            style={styles.devBtn}
-            onPress={() => handleQuickSwitch('pro', 'monthly')}
-          >
-            <AppText style={styles.devBtnText}>Pro 月繳</AppText>
-          </Pressable>
-          <Pressable
-            style={styles.devBtn}
-            onPress={() => handleQuickSwitch('pro', 'annual')}
-          >
-            <AppText style={styles.devBtnText}>Pro 年繳</AppText>
-          </Pressable>
-          <Pressable
-            style={styles.devBtn}
-            onPress={() => handleQuickSwitch('lifetime', 'lifetime')}
-          >
-            <AppText style={styles.devBtnText}>終身版 (Lifetime)</AppText>
-          </Pressable>
-          <Pressable
-            style={[styles.devBtn, styles.devBtnWarn]}
-            onPress={() => handleQuickSwitch('pro', 'monthly', true)}
-          >
-            <AppText style={[styles.devBtnText, styles.devBtnWarnText]}>
-              模擬過期 (降級)
-            </AppText>
-          </Pressable>
+      {/* 開發者即時方案切換控制台（僅在 __DEV__ 開發環境顯示，正式發行版隱藏） */}
+      {__DEV__ && (
+        <View style={styles.devToolSection}>
+          <AppText style={styles.devToolTitle}>開發者測試控制台</AppText>
+          <AppText secondary style={styles.devToolDesc}>
+            點擊可立即模擬切換會員狀態，驗證多考試限制、排程開關與過期降級防護：
+          </AppText>
+          <View style={styles.devButtonGrid}>
+            <Pressable
+              style={styles.devBtn}
+              onPress={() => handleQuickSwitch('free', 'none')}
+            >
+              <AppText style={styles.devBtnText}>免費版 (Free)</AppText>
+            </Pressable>
+            <Pressable
+              style={styles.devBtn}
+              onPress={() => handleQuickSwitch('pro', 'monthly')}
+            >
+              <AppText style={styles.devBtnText}>Pro 月繳</AppText>
+            </Pressable>
+            <Pressable
+              style={styles.devBtn}
+              onPress={() => handleQuickSwitch('pro', 'annual')}
+            >
+              <AppText style={styles.devBtnText}>Pro 年繳</AppText>
+            </Pressable>
+            <Pressable
+              style={styles.devBtn}
+              onPress={() => handleQuickSwitch('lifetime', 'lifetime')}
+            >
+              <AppText style={styles.devBtnText}>終身版 (Lifetime)</AppText>
+            </Pressable>
+            <Pressable
+              style={[styles.devBtn, styles.devBtnWarn]}
+              onPress={() => handleQuickSwitch('pro', 'monthly', true)}
+            >
+              <AppText style={[styles.devBtnText, styles.devBtnWarnText]}>
+                模擬過期 (降級)
+              </AppText>
+            </Pressable>
+          </View>
         </View>
-      </View>
+      )}
 
       {/* 條款與宣告 */}
       <View style={styles.legalSection}>

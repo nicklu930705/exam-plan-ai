@@ -236,6 +236,19 @@ describe('StoreKit 2 與 Apple 內購系統核心邏輯', () => {
       expect(buyLife.subscription?.plan).toBe('lifetime');
       expect(buyLife.subscription?.expiresAt).toBeUndefined();
     });
+
+    test('非開發環境 (!__DEV__) 下，Mock 服務嚴禁通過付費方案購買', async () => {
+      const originalDev = (global as any).__DEV__;
+      try {
+        (global as any).__DEV__ = false;
+        const buyResult = await devService.purchase('exampro_monthly');
+        expect(buyResult.success).toBe(false);
+        expect(buyResult.status).toBe('failed');
+        expect(buyResult.subscription).toBeUndefined();
+      } finally {
+        (global as any).__DEV__ = originalDev;
+      }
+    });
   });
 
   describe('5. ProductionStoreKitService 測試預覽模式與狀態回報', () => {
@@ -247,6 +260,21 @@ describe('StoreKit 2 與 Apple 內購系統核心邏輯', () => {
       const status = prodService.getStoreStatus();
       expect(status.environment).toBe('dev_preview');
       expect(status.notice).toContain('開發測試模式');
+    });
+
+    test('非開發環境 (!__DEV__) 下，ProductionStoreKitService 回退時嚴禁通過付費購買', async () => {
+      const originalDev = (global as any).__DEV__;
+      try {
+        (global as any).__DEV__ = false;
+        const prod = new ProductionStoreKitService();
+        prod.setDevPreviewMode(true);
+        const res = await prod.purchase('exampro_yearly');
+        expect(res.success).toBe(false);
+        expect(res.status).toBe('failed');
+        expect(res.subscription).toBeUndefined();
+      } finally {
+        (global as any).__DEV__ = originalDev;
+      }
     });
   });
 });

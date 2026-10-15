@@ -10,8 +10,10 @@
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.examplanai.app",
+      "buildNumber": "1",
       "infoPlist": {
-        "CFBundleDevelopmentRegion": "zh_TW"
+        "CFBundleDevelopmentRegion": "zh_TW",
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
@@ -31,7 +33,15 @@
       "expo-router",
       "@react-native-community/datetimepicker",
       "expo-font",
-      "expo-iap"
+      "expo-iap",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#F7F6F1",
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 200
+        }
+      ]
     ]
   }
 }

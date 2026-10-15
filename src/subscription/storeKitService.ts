@@ -235,6 +235,15 @@ export class DevStoreKitService implements IStoreKitService {
       };
     }
 
+    // 安全防護：非開發環境嚴禁透過 Mock 購買服務直接解鎖付費會員 (Pro / Lifetime)
+    if (!__DEV__) {
+      return {
+        success: false,
+        status: 'failed',
+        message: '目前尚未連接 Apple In-App Purchase 服務，請確認您的 Apple ID 登入狀態與網路連線後再試。',
+      };
+    }
+
     const now = new Date();
     let expiresAt: string | undefined;
     if (product.period === 'monthly') {
@@ -316,11 +325,13 @@ export class ProductionStoreKitService implements IStoreKitService {
   }
 
   setDevPreviewMode(enabled: boolean): void {
-    this.devModeForced = enabled;
+    if (__DEV__) {
+      this.devModeForced = enabled;
+    }
   }
 
   isDevPreviewMode(): boolean {
-    if (this.devModeForced) return true;
+    if (__DEV__ && this.devModeForced) return true;
     return !isStoreKitNativeAvailable();
   }
 
@@ -386,6 +397,13 @@ export class ProductionStoreKitService implements IStoreKitService {
 
   async purchase(productId: string): Promise<PurchaseResult> {
     if (this.isDevPreviewMode()) {
+      if (!__DEV__) {
+        return {
+          success: false,
+          status: 'failed',
+          message: '目前尚未連接 Apple In-App Purchase 服務，請確認您的 Apple ID 登入狀態與網路連線後再試。',
+        };
+      }
       return this.devService.purchase(productId);
     }
 
