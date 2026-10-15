@@ -50,6 +50,7 @@ export type PreFlightResult =
 
 export interface PostCallSettleSuccessParams {
   userId: string;
+  requestId?: string;
   reservedCostMicroUSD: number;
   actualCostMicroUSD: number;
   idempotencyKey?: string;
@@ -58,6 +59,7 @@ export interface PostCallSettleSuccessParams {
 
 export interface PostCallSettleFailureParams {
   userId: string;
+  requestId?: string;
   reservedCostMicroUSD: number;
 }
 
@@ -158,6 +160,7 @@ local idempotencyVal = ARGV[2]
 local idempotencyTtl = tonumber(ARGV[3])
 local dayTtl = tonumber(ARGV[4])
 local monthTtl = tonumber(ARGV[5])
+local requestId = ARGV[6]
 
 -- 調整預算差額 (實際成本 - 預扣成本)
 if diffCost ~= 0 then
@@ -172,8 +175,15 @@ if idempotencyVal ~= '' then
   redis.call('SET', idempotencyKey, idempotencyVal, 'EX', idempotencyTtl)
 end
 
--- 釋放並行鎖
-redis.call('DEL', lockKey)
+-- 釋放並行鎖 (僅在鎖的擁有者仍為當前 requestId 時釋放，避免因逾時過期後誤刪他人新取得的鎖)
+if requestId and requestId ~= '' then
+  local currentLock = redis.call('GET', lockKey)
+  if currentLock == requestId then
+    redis.call('DEL', lockKey)
+  end
+else
+  redis.call('DEL', lockKey)
+end
 return 'OK'
 `;
 
@@ -185,6 +195,7 @@ local dailyBudgetKey = KEYS[3]
 local monthlyBudgetKey = KEYS[4]
 
 local reservedCost = tonumber(ARGV[1])
+local requestId = ARGV[2]
 
 -- 退回當日呼叫次數
 local currentCount = tonumber(redis.call('GET', dailyQuotaKey) or '0')
@@ -198,8 +209,15 @@ local newMonthly = redis.call('DECRBY', monthlyBudgetKey, reservedCost)
 if newDaily < 0 then redis.call('SET', dailyBudgetKey, 0) end
 if newMonthly < 0 then redis.call('SET', monthlyBudgetKey, 0) end
 
--- 釋放並行鎖
-redis.call('DEL', lockKey)
+-- 釋放並行鎖 (僅在鎖的擁有者仍為當前 requestId 時釋放，避免因逾時過期後誤刪他人新取得的鎖)
+if requestId and requestId ~= '' then
+  local currentLock = redis.call('GET', lockKey)
+  if currentLock == requestId then
+    redis.call('DEL', lockKey)
+  end
+else
+  redis.call('DEL', lockKey)
+end
 return 'OK'
 `;
 
@@ -301,7 +319,7 @@ class InMemoryRedisMock {
 
     if (script === SETTLE_SUCCESS_LUA) {
       const [lockKey, dailyBudgetKey, monthlyBudgetKey, idempotencyKey] = keys;
-      const [diffCost, idempotencyVal, idempotencyTtl] = args;
+      const [diffCost, idempotencyVal, idempotencyTtl, _dayTtl, _monthTtl, requestId] = args;
 
       if (Number(diffCost) !== 0) {
         const d = parseInt(this.getCleanKey(dailyBudgetKey) || '0', 10) + Number(diffCost);
@@ -317,13 +335,19 @@ class InMemoryRedisMock {
         });
       }
 
-      this.store.delete(lockKey);
+      if (requestId && String(requestId) !== '') {
+        if (this.getCleanKey(lockKey) === String(requestId)) {
+          this.store.delete(lockKey);
+        }
+      } else {
+        this.store.delete(lockKey);
+      }
       return 'OK';
     }
 
     if (script === SETTLE_FAILURE_LUA) {
       const [lockKey, dailyQuotaKey, dailyBudgetKey, monthlyBudgetKey] = keys;
-      const [reservedCost] = args;
+      const [reservedCost, requestId] = args;
 
       const c = parseInt(this.getCleanKey(dailyQuotaKey) || '0', 10);
       if (c > 0) {
@@ -335,7 +359,13 @@ class InMemoryRedisMock {
       this.store.set(dailyBudgetKey, { value: String(Math.max(0, d)) });
       this.store.set(monthlyBudgetKey, { value: String(Math.max(0, m)) });
 
-      this.store.delete(lockKey);
+      if (requestId && String(requestId) !== '') {
+        if (this.getCleanKey(lockKey) === String(requestId)) {
+          this.store.delete(lockKey);
+        }
+      } else {
+        this.store.delete(lockKey);
+      }
       return 'OK';
     }
 
@@ -492,6 +522,7 @@ export async function postCallSettleSuccess(params: PostCallSettleSuccessParams)
     config.IDEMPOTENCY_TTL_SECONDS,
     dayTtl,
     monthTtl,
+    params.requestId || '',
   ];
 
   try {
@@ -514,7 +545,7 @@ export async function postCallSettleFailure(params: PostCallSettleFailureParams)
   const monthlyBudgetKey = `exam_ai:budget:month:${monthKey}`;
 
   const keys = [lockKey, dailyQuotaKey, dailyBudgetKey, monthlyBudgetKey];
-  const args = [params.reservedCostMicroUSD];
+  const args = [params.reservedCostMicroUSD, params.requestId || ''];
 
   try {
     await client.eval(SETTLE_FAILURE_LUA, keys, args);

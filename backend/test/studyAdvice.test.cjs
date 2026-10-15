@@ -4,11 +4,16 @@ const http = require('node:http');
 const OpenAI = require('openai');
 
 const studyAdviceModule = require('../dist/api/study-advice.js');
-const { inMemoryRedisMockInstance } = require('../dist/lib/redis.js');
+const healthModule = require('../dist/api/health.js');
+const { inMemoryRedisMockInstance, postCallSettleSuccess } = require('../dist/lib/redis.js');
 
 const handler = typeof studyAdviceModule === 'function'
   ? studyAdviceModule
   : studyAdviceModule.default;
+
+const healthHandler = typeof healthModule === 'function'
+  ? healthModule
+  : healthModule.default;
 
 function createServer() {
   const server = http.createServer(async (req, res) => {
@@ -38,7 +43,11 @@ function createServer() {
     };
 
     try {
-      await handler(req, res);
+      if (req.url && req.url.startsWith('/api/health')) {
+        await healthHandler(req, res);
+      } else {
+        await handler(req, res);
+      }
     } catch (err) {
       if (!res.headersSent) {
         res.statusCode = 500;
@@ -571,3 +580,80 @@ test('14. 請求失敗或逾時退款：OpenAI 呼叫失敗時，安全退回預
     await ctx.close();
   }
 });
+
+test('15. 伺服端每月預算上限 (MONTHLY_BUDGET)：超過月預算 ($5.00) 拒絕後續請求', async () => {
+  process.env.MOCK_REDIS = 'true';
+  process.env.OPENAI_API_KEY = 'sk-mock-valid-key';
+  process.env.AI_MONTHLY_BUDGET_USD = '0.0001'; // 設定極低月預算以觸發上限
+  inMemoryRedisMockInstance.clear();
+
+  const mock = setupMockOpenAiSuccess();
+  const ctx = await createServer();
+
+  try {
+    const res = await fetch(`${ctx.url}/api/study-advice`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Client-Device-Id': 'dev_user_monthly_budget_test' },
+      body: JSON.stringify(samplePayload),
+    });
+    assert.equal(res.status, 429);
+    const data = await res.json();
+    assert.equal(data.code, 'MONTHLY_BUDGET_EXCEEDED');
+    assert.match(data.error, /本月系統 AI 服務總運算額度已達安全預算上限/);
+  } finally {
+    delete process.env.AI_MONTHLY_BUDGET_USD;
+    mock.restore();
+    await ctx.close();
+  }
+});
+
+test('16. 安全鎖釋放 (Safe Lock Release)：舊請求完成結算時，若鎖已被新請求取得，絕不誤刪新請求的鎖', async () => {
+  process.env.MOCK_REDIS = 'true';
+  inMemoryRedisMockInstance.clear();
+
+  const userId = 'dev_lock_safety_user';
+  const lockKey = `exam_ai:lock:${userId}`;
+
+  // 模擬新請求 (req_new) 已經取得鎖
+  inMemoryRedisMockInstance.store.set(lockKey, { value: 'req_new', expireAt: Date.now() + 30000 });
+
+  // 模擬舊請求 (req_old) 此時才執行完成結算
+  await postCallSettleSuccess({
+    userId,
+    requestId: 'req_old',
+    reservedCostMicroUSD: 1000,
+    actualCostMicroUSD: 500,
+  });
+
+  // 驗證新請求的鎖仍然完好存在，未被 req_old 刪除
+  const currentLock = inMemoryRedisMockInstance.store.get(lockKey);
+  assert.ok(currentLock, '新請求的鎖必須仍然存在');
+  assert.equal(currentLock.value, 'req_new', '鎖的擁有者必須仍為 req_new');
+});
+
+test('17. 健康檢查端點 (GET /api/health)：正常回傳系統狀態且不洩漏任何機密資訊', async () => {
+  process.env.MOCK_REDIS = 'true';
+  process.env.OPENAI_API_KEY = 'sk-mock-valid-key';
+  process.env.OPENAI_MODEL = 'gpt-5.6-luna';
+
+  const ctx = await createServer();
+  try {
+    const res = await fetch(`${ctx.url}/api/health`, { method: 'GET' });
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.equal(data.status, 'healthy');
+    assert.equal(data.redis.status, 'connected');
+    assert.equal(data.ai.model, 'gpt-5.6-luna');
+    assert.equal(data.ai.openaiConfigured, true);
+    assert.equal(data.quotaRules.freeDailyLimit, 3);
+    assert.equal(data.quotaRules.proDailyLimit, 15);
+
+    // 驗證絕不洩漏 API Key 或 Token
+    const rawText = JSON.stringify(data);
+    assert.ok(!rawText.includes('sk-mock-valid-key'));
+    assert.ok(!rawText.includes('token'));
+  } finally {
+    await ctx.close();
+  }
+});
+

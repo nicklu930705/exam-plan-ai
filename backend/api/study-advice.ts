@@ -180,7 +180,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (!openaiApiKey || openaiApiKey.trim().length === 0) {
       console.error('[後端設定錯誤] 尚未在環境變數中設定 OPENAI_API_KEY。');
       // 失敗時退回預扣額度
-      await postCallSettleFailure({ userId: identity.userId, reservedCostMicroUSD });
+      await postCallSettleFailure({ userId: identity.userId, requestId, reservedCostMicroUSD });
       return res.status(500).json({
         success: false,
         code: 'API_KEY_MISSING',
@@ -223,6 +223,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // 結算實際成本、寫入冪等快取並釋放並行鎖
       await postCallSettleSuccess({
         userId: identity.userId,
+        requestId,
         reservedCostMicroUSD,
         actualCostMicroUSD: openAiResult.costMicroUSD,
         idempotencyKey,
@@ -232,7 +233,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json(responsePayload);
     } catch (error: any) {
       // 發生錯誤或逾時，退回預扣預算與次數
-      await postCallSettleFailure({ userId: identity.userId, reservedCostMicroUSD });
+      await postCallSettleFailure({ userId: identity.userId, requestId, reservedCostMicroUSD });
 
       const elapsed = Date.now() - requestStartTime;
       console.error('[OpenAI 處理失敗]', {
@@ -288,7 +289,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // ───── 分支 B: Google Gemini API (備援方案) ─────
   const geminiApiKey = process.env.GEMINI_API_KEY;
   if (!geminiApiKey || geminiApiKey.trim().length === 0) {
-    await postCallSettleFailure({ userId: identity.userId, reservedCostMicroUSD });
+    await postCallSettleFailure({ userId: identity.userId, requestId, reservedCostMicroUSD });
     return res.status(500).json({
       success: false,
       code: 'API_KEY_MISSING',
@@ -319,6 +320,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     await postCallSettleSuccess({
       userId: identity.userId,
+      requestId,
       reservedCostMicroUSD,
       actualCostMicroUSD: reservedCostMicroUSD,
       idempotencyKey,
@@ -327,7 +329,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     return res.status(200).json(responsePayload);
   } catch (error: any) {
-    await postCallSettleFailure({ userId: identity.userId, reservedCostMicroUSD });
+    await postCallSettleFailure({ userId: identity.userId, requestId, reservedCostMicroUSD });
 
     if (error?.message === 'TIMEOUT') {
       return res.status(504).json({
