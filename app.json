@@ -10,7 +10,7 @@
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.examplanai.app",
-      "buildNumber": "2",
+      "buildNumber": "3",
       "infoPlist": {
         "CFBundleDevelopmentRegion": "zh_TW",
         "ITSAppUsesNonExemptEncryption": false
@@ -41,7 +41,9 @@
           "image": "./assets/splash-icon.png",
           "imageWidth": 200
         }
-      ]
+      ],
+      "expo-sharing",
+      "expo-notifications"
     ],
     "extra": {
       "router": {},

@@ -1,7 +1,8 @@
-import React, { createContext, useContext, useEffect, useMemo, useReducer, useState, type ReactNode } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from 'react';
 
 import { createDemoData } from '../data/demo';
-import { clearAppDataFromStorage, loadAppDataFromStorage, saveAppDataToStorage } from '../storage';
+import { clearAppDataFromStorage, loadAppDataFromStorage, safeRestoreAppDataToStorage, saveAppDataToStorage } from '../storage';
+import type { BackupStudyData } from '../types/backup';
 import type { AiUsageRecord, UserSubscription } from '../subscription/types';
 import type { AppData, Exam, ISODate, StudyPreferences, StudyTask, TaskStatus } from '../types/models';
 
@@ -30,6 +31,7 @@ export type Action =
   | { type: 'updatePreferences'; patch: Partial<StudyPreferences> }
   | { type: 'setSubscription'; subscription: UserSubscription }
   | { type: 'recordAiUsage'; increment?: number }
+  | { type: 'restoreStudyData'; payload: BackupStudyData }
   | { type: 'loadDemo' }
   | { type: 'clearAll' };
 
@@ -357,6 +359,58 @@ export function reducer(state: AppData, action: Action): AppData {
     case 'updatePreferences':
       return { ...state, preferences: { ...state.preferences, ...action.patch } };
 
+    case 'restoreStudyData': {
+      const { exams, tasks, preferences, selectedExamId } = action.payload;
+      const validSelectedId = exams.some((e) => e.id === selectedExamId)
+        ? selectedExamId
+        : exams[0]?.id;
+
+      return {
+        ...state,
+        exams: exams.map((e) => ({
+          id: e.id,
+          name: e.name,
+          examDate: e.examDate,
+          subjects: (e.subjects || []).map((s) => ({
+            id: s.id,
+            name: s.name,
+            familiarity: s.familiarity,
+            chapters: (s.chapters || []).map((c) => ({
+              id: c.id,
+              title: c.title,
+            })),
+          })),
+          createdAt: e.createdAt,
+          archived: Boolean(e.archived),
+        })),
+        tasks: tasks.map((t) => ({
+          id: t.id,
+          examId: t.examId,
+          subjectId: t.subjectId,
+          subjectName: t.subjectName,
+          chapterId: t.chapterId,
+          title: t.title,
+          kind: t.kind,
+          date: t.date,
+          estimatedMinutes: t.estimatedMinutes,
+          actualMinutes: t.actualMinutes ?? 0,
+          timerMinutes: t.timerMinutes ?? 0,
+          status: t.status,
+          completedAt: t.completedAt,
+        })),
+        preferences: {
+          dailyMinutes: preferences.dailyMinutes,
+          restDays: [...preferences.restDays],
+          intensity: preferences.intensity,
+        },
+        selectedExamId: validSelectedId,
+        isDemo: false,
+        activeTimer: null, // 嚴格不恢復進行中的計時器
+        subscription: state.subscription, // 嚴格保留原會員狀態，防偽造
+        aiUsage: state.aiUsage, // 嚴格保留原 AI 額度與用量
+      };
+    }
+
     case 'loadDemo':
       return createDemoData();
 
@@ -399,6 +453,9 @@ interface AppStore {
   updatePreferences: (patch: Partial<StudyPreferences>) => void;
   setSubscription: (subscription: UserSubscription) => void;
   recordAiUsage: (increment?: number) => void;
+  restoreStudyData: (
+    backupStudyData: BackupStudyData,
+  ) => Promise<{ success: boolean; error?: string }>;
   loadDemo: () => void;
   clearAll: () => void;
 }
@@ -414,6 +471,12 @@ export function AppStoreProvider({
 }) {
   const [data, dispatch] = useReducer(reducer, initialData ?? INITIAL_EMPTY_DATA);
   const [isLoaded, setIsLoaded] = useState<boolean>(!!initialData);
+  const dataRef = useRef<AppData>(data);
+  const isRestoringRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    dataRef.current = data;
+  }, [data]);
 
   // 1. 初始化時從 AsyncStorage 載入
   useEffect(() => {
@@ -470,9 +533,9 @@ export function AppStoreProvider({
     };
   }, [initialData]);
 
-  // 2. 狀態變更時自動同步寫入本機儲存
+  // 2. 狀態變更時自動同步寫入本機儲存（還原作業進行中時暫停 auto-save 以防競態）
   useEffect(() => {
-    if (isLoaded) {
+    if (isLoaded && !isRestoringRef.current) {
       saveAppDataToStorage(data);
     }
   }, [data, isLoaded]);
@@ -521,6 +584,32 @@ export function AppStoreProvider({
       updatePreferences: (patch) => dispatch({ type: 'updatePreferences', patch }),
       setSubscription: (subscription) => dispatch({ type: 'setSubscription', subscription }),
       recordAiUsage: (increment) => dispatch({ type: 'recordAiUsage', increment }),
+      restoreStudyData: async (backupStudyData: BackupStudyData) => {
+        if (isRestoringRef.current) {
+          return { success: false, error: '正在進行還原作業，請稍候。' };
+        }
+        isRestoringRef.current = true;
+        try {
+          const currentState = dataRef.current;
+          const nextState = reducer(currentState, {
+            type: 'restoreStudyData',
+            payload: backupStudyData,
+          });
+          const result = await safeRestoreAppDataToStorage(nextState);
+          if (!result.success) {
+            return {
+              success: false,
+              error: result.error ?? '本機儲存寫入失敗，已保留原有資料。',
+            };
+          }
+          dispatch({ type: 'restoreStudyData', payload: backupStudyData });
+          return { success: true };
+        } finally {
+          setTimeout(() => {
+            isRestoringRef.current = false;
+          }, 100);
+        }
+      },
       loadDemo: () => {
         dispatch({ type: 'loadDemo' });
       },

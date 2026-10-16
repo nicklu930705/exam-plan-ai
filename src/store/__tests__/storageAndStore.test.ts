@@ -2,7 +2,13 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   clearAppDataFromStorage,
   loadAppDataFromStorage,
+  safeRestoreAppDataToStorage,
   saveAppDataToStorage,
+  DEFAULT_BACKEND_URL,
+  getBackendUrlFromStorage,
+  saveBackendUrlToStorage,
+  ROLLBACK_SNAPSHOT_KEY,
+  STORAGE_KEY,
 } from '../../storage';
 import {
   DEFAULT_PREFERENCES,
@@ -22,6 +28,10 @@ describe('本機資料儲存與資料保存 (AsyncStorage Persistence)', () => {
   beforeEach(async () => {
     await AsyncStorage.clear();
     jest.clearAllMocks();
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
   });
 
   const mockExam: Exam = {
@@ -118,6 +128,169 @@ describe('本機資料儲存與資料保存 (AsyncStorage Persistence)', () => {
 
     await clearAppDataFromStorage();
     expect(await loadAppDataFromStorage()).toBeNull();
+  });
+
+  describe('安全還原、寫入失敗回復與崩潰自我修復 (Safe Restore & Disaster Recovery)', () => {
+    test('安全還原成功流程：寫入快照、寫入主儲存區、通過讀回校驗並清除快照', async () => {
+      // 步驟 1：初始資料存入本機
+      await saveAppDataToStorage(mockAppData);
+
+      // 步驟 2：準備欲還原的新資料
+      const restoredAppData: AppData = {
+        exams: [
+          {
+            ...mockExam,
+            id: 'exam-restored',
+            name: '學測衝刺',
+          },
+        ],
+        tasks: [
+          {
+            ...mockTask,
+            id: 'task-restored',
+            examId: 'exam-restored',
+            title: '學測國文歷屆試題',
+          },
+        ],
+        preferences: {
+          dailyMinutes: 150,
+          restDays: [0, 6],
+          intensity: 'intense',
+        },
+        isDemo: false,
+      };
+
+      const result = await safeRestoreAppDataToStorage(restoredAppData);
+      expect(result.success).toBe(true);
+
+      // 驗證主儲存區內容為還原後之資料
+      const loaded = await loadAppDataFromStorage();
+      expect(loaded?.exams[0].id).toBe('exam-restored');
+      expect(loaded?.tasks[0].id).toBe('task-restored');
+      expect(loaded?.preferences.dailyMinutes).toBe(150);
+
+      // 驗證救援快照已乾淨移除
+      const snapshot = await AsyncStorage.getItem(ROLLBACK_SNAPSHOT_KEY);
+      expect(snapshot).toBeNull();
+    });
+
+    test('寫入主儲存區失敗時：自動觸發 Rollback，將原始資料回復至主儲存區', async () => {
+      // 步驟 1：寫入原本的有效資料
+      await saveAppDataToStorage(mockAppData);
+
+      const restoredAppData: AppData = {
+        exams: [{ ...mockExam, id: 'exam-fail' }],
+        tasks: [{ ...mockTask, id: 'task-fail', examId: 'exam-fail' }],
+        preferences: DEFAULT_PREFERENCES,
+        isDemo: false,
+      };
+
+      // 模擬在寫入主儲存區 (STORAGE_KEY) 時發生磁碟 I/O 錯誤
+      const originalMultiSet = (AsyncStorage as any).multiSet;
+      try {
+        (AsyncStorage as any).multiSet = jest.fn(async (keyValuePairs, callback) => {
+          const hasExamFail = keyValuePairs.some(
+            ([k, v]: [string, string]) => k === STORAGE_KEY && v.includes('exam-fail'),
+          );
+          if (hasExamFail) {
+            throw new Error('磁碟寫入失敗 (Disk Full)');
+          }
+          return originalMultiSet(keyValuePairs, callback);
+        });
+
+        const result = await safeRestoreAppDataToStorage(restoredAppData);
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('磁碟寫入失敗');
+
+        // 驗證已成功 Rollback：主儲存區依然保留原本的資料
+        const loaded = await loadAppDataFromStorage();
+        expect(loaded?.exams[0].id).toBe('exam-1');
+        expect(loaded?.exams[0].name).toBe('多益英語測驗');
+      } finally {
+        (AsyncStorage as any).multiSet = originalMultiSet;
+      }
+    });
+
+    test('讀回校驗失敗（寫入後筆數不符）時：拒絕還原並自動 Rollback 回復原資料', async () => {
+      await saveAppDataToStorage(mockAppData);
+
+      const restoredAppData: AppData = {
+        exams: [{ ...mockExam, id: 'exam-corrupt' }],
+        tasks: [{ ...mockTask, id: 'task-corrupt', examId: 'exam-corrupt' }],
+        preferences: DEFAULT_PREFERENCES,
+        isDemo: false,
+      };
+
+      const originalMultiGet = (AsyncStorage as any).multiGet;
+      let getCallCount = 0;
+      try {
+        (AsyncStorage as any).multiGet = jest.fn(async (keys, callback) => {
+          if (keys.includes(STORAGE_KEY)) {
+            getCallCount++;
+            // 第 2 次讀取為 safeRestoreAppDataToStorage 內部的讀回校驗步驟
+            if (getCallCount === 2) {
+              const values = [
+                [
+                  STORAGE_KEY,
+                  JSON.stringify({ exams: [], tasks: [], preferences: DEFAULT_PREFERENCES }),
+                ],
+              ];
+              callback && callback(null, values);
+              return values;
+            }
+          }
+          return originalMultiGet(keys, callback);
+        });
+
+        const result = await safeRestoreAppDataToStorage(restoredAppData);
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('讀回校驗失敗');
+      } finally {
+        (AsyncStorage as any).multiGet = originalMultiGet;
+      }
+    });
+
+    test('中斷自癒：若 App 在還原寫入途中被關閉導致主儲存區損毀，下次啟動自動自救援快照修復', async () => {
+      // 模擬先前的有效舊資料被暫存於救援快照
+      const validOldDataJson = JSON.stringify(mockAppData);
+      await AsyncStorage.setItem(ROLLBACK_SNAPSHOT_KEY, validOldDataJson);
+
+      // 模擬主儲存區在寫入中途遭強制終止，殘留不完整/損毀之 JSON 字串
+      await AsyncStorage.setItem(STORAGE_KEY, '{"exams": [{"id": "exam-broken", "nam');
+
+      // 重新開啟 App 呼叫 loadAppDataFromStorage
+      const recovered = await loadAppDataFromStorage();
+      expect(recovered).not.toBeNull();
+      expect(recovered?.exams[0].name).toBe('多益英語測驗');
+      expect(recovered?.tasks[0].id).toBe('task-1');
+
+      // 驗證主儲存區已成功自救援快照修復為完整 JSON
+      const repairedRaw = await AsyncStorage.getItem(STORAGE_KEY);
+      expect(repairedRaw).not.toBeNull();
+      const parsedRepaired = JSON.parse(repairedRaw!);
+      expect(parsedRepaired.exams[0].name).toBe('多益英語測驗');
+
+      // 驗證救援快照已被清理
+      const snapshotAfter = await AsyncStorage.getItem(ROLLBACK_SNAPSHOT_KEY);
+      expect(snapshotAfter).toBeNull();
+    });
+
+    test('FIFO 佇列寫入保證：連續快速寫入依序執行，不發生競態順序錯亂', async () => {
+      const data1: AppData = { ...mockAppData, preferences: { ...mockPreferences, dailyMinutes: 60 } };
+      const data2: AppData = { ...mockAppData, preferences: { ...mockPreferences, dailyMinutes: 120 } };
+
+      // 連續呼叫兩次儲存
+      const p1 = saveAppDataToStorage(data1);
+      const p2 = saveAppDataToStorage(data2);
+      const [res1, res2] = await Promise.all([p1, p2]);
+
+      expect(res1).toBe(true);
+      expect(res2).toBe(true);
+
+      // 最終資料必定為最後排入佇列的 data2 (120 分鐘)
+      const finalData = await loadAppDataFromStorage();
+      expect(finalData?.preferences.dailyMinutes).toBe(120);
+    });
   });
 });
 
@@ -344,5 +517,34 @@ describe('狀態管理模組 (AppStore Reducer Actions)', () => {
     expect(id1.startsWith('task-')).toBe(true);
     expect(id2.startsWith('task-')).toBe(true);
     expect(id1).not.toBe(id2);
+  });
+
+  describe('後端伺服器端點固定與舊版自訂網址清理', () => {
+    test('預設後端端點為正式生產 Vercel 網址', async () => {
+      expect(DEFAULT_BACKEND_URL).toBe('https://exam-plan-ai-backend-coral.vercel.app');
+      const url = await getBackendUrlFromStorage();
+      expect(url).toBe('https://exam-plan-ai-backend-coral.vercel.app');
+    });
+
+    test('舊版儲存之自訂網址被自動忽略並清理，絕不連線至未知伺服器', async () => {
+      // 模擬舊版儲存了惡意或過期的自訂端點
+      await AsyncStorage.setItem('@exam_plan_ai:backend_url', 'https://attacker-fake-server.com');
+
+      // 讀取後端端點
+      const url = await getBackendUrlFromStorage();
+      expect(url).toBe(DEFAULT_BACKEND_URL);
+
+      // 檢查 AsyncStorage 中的舊鍵已被清理
+      const remaining = await AsyncStorage.getItem('@exam_plan_ai:backend_url');
+      expect(remaining).toBeNull();
+    });
+
+    test('saveBackendUrlToStorage 自動清理任何舊有自訂端點', async () => {
+      await AsyncStorage.setItem('@exam_plan_ai:backend_url', 'https://custom-domain.com');
+      await saveBackendUrlToStorage('https://ignored.com');
+
+      const remaining = await AsyncStorage.getItem('@exam_plan_ai:backend_url');
+      expect(remaining).toBeNull();
+    });
   });
 });
