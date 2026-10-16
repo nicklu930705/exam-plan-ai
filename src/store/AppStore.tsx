@@ -2,6 +2,7 @@ import React, { createContext, useContext, useEffect, useMemo, useReducer, useRe
 
 import { createDemoData } from '../data/demo';
 import { clearAppDataFromStorage, loadAppDataFromStorage, safeRestoreAppDataToStorage, saveAppDataToStorage } from '../storage';
+import { getEffectiveTier, getPlanEntitlements } from '../subscription/entitlements';
 import type { BackupStudyData } from '../types/backup';
 import type { AiUsageRecord, UserSubscription } from '../subscription/types';
 import type { AppData, Exam, ISODate, StudyPreferences, StudyTask, TaskStatus } from '../types/models';
@@ -301,12 +302,55 @@ export function reducer(state: AppData, action: Action): AppData {
     }
 
     case 'toggleArchiveExam': {
+      const targetExam = state.exams.find((e) => e.id === action.examId);
+      if (!targetExam) return state;
+      const willBeArchived = !targetExam.archived;
+
+      // 資料層安全防護：Free 會員不得同時存在兩場以上進行中考試
+      if (!willBeArchived) {
+        const tier = getEffectiveTier(state.subscription);
+        const entitlements = getPlanEntitlements(tier);
+        const isOnlyDemo =
+          state.isDemo || (state.exams.length === 1 && state.exams[0].id === 'demo-toeic');
+        const realExams = isOnlyDemo ? [] : state.exams;
+        const currentActiveCount = realExams.filter(
+          (e) => !e.archived && e.id !== action.examId,
+        ).length;
+        if (currentActiveCount >= entitlements.maxActiveExams) {
+          console.warn('[資料層安全防護] 解除封存被拒絕：已達會員方案進行中考試上限。');
+          return state;
+        }
+      }
+
       const exams = state.exams.map((e) =>
-        e.id === action.examId ? { ...e, archived: !e.archived } : e,
+        e.id === action.examId ? { ...e, archived: willBeArchived } : e,
       );
+      const activeExams = exams.filter((e) => !e.archived);
+
+      let selectedExamId = state.selectedExamId;
+      if (willBeArchived) {
+        // 封存此考試：若目前選取的正是此考試，自動切換至第一場其他進行中考試
+        if (state.selectedExamId === action.examId) {
+          selectedExamId = activeExams[0]?.id ?? undefined;
+        }
+      } else {
+        // 解除封存：若目前沒有有效選取之進行中考試，自動選取剛解除封存的考試
+        if (!selectedExamId || !activeExams.some((e) => e.id === selectedExamId)) {
+          selectedExamId = action.examId;
+        }
+      }
+
+      // 若正在進行計時且該計時屬於被封存的考試，安全清除計時
+      const activeTimer =
+        willBeArchived && state.activeTimer && state.activeTimer.examId === action.examId
+          ? null
+          : state.activeTimer;
+
       return {
         ...state,
         exams,
+        selectedExamId,
+        activeTimer,
       };
     }
 
@@ -322,8 +366,9 @@ export function reducer(state: AppData, action: Action): AppData {
     case 'deleteExam': {
       const exams = state.exams.filter((e) => e.id !== action.examId);
       const tasks = state.tasks.filter((t) => t.examId !== action.examId);
+      const activeExams = exams.filter((e) => !e.archived);
       const selectedExamId =
-        state.selectedExamId === action.examId ? (exams[0]?.id ?? undefined) : state.selectedExamId;
+        state.selectedExamId === action.examId ? (activeExams[0]?.id ?? undefined) : state.selectedExamId;
       const activeTimer =
         state.activeTimer && state.activeTimer.examId === action.examId ? null : state.activeTimer;
       return {
@@ -361,28 +406,65 @@ export function reducer(state: AppData, action: Action): AppData {
 
     case 'restoreStudyData': {
       const { exams, tasks, preferences, selectedExamId } = action.payload;
-      const validSelectedId = exams.some((e) => e.id === selectedExamId)
+      const tier = getEffectiveTier(state.subscription);
+      const entitlements = getPlanEntitlements(tier);
+
+      // 1. 處理備份中的考試清單（支援舊版備份缺少 archived 屬性之向下相容）
+      const incomingRawExams = exams.map((e) => ({
+        id: e.id,
+        name: e.name,
+        examDate: e.examDate,
+        subjects: (e.subjects || []).map((s) => ({
+          id: s.id,
+          name: s.name,
+          familiarity: s.familiarity,
+          chapters: (s.chapters || []).map((c) => ({
+            id: c.id,
+            title: c.title,
+          })),
+        })),
+        createdAt: e.createdAt,
+        archived: Boolean(e.archived),
+      }));
+
+      // 2. 決定保留為進行中的首選考試（若備份中有指定且為進行中，或第一場進行中考試）
+      let primaryActiveExamId: string | undefined = incomingRawExams.find(
+        (e) => !e.archived && e.id === selectedExamId,
+      )?.id;
+      if (!primaryActiveExamId) {
+        primaryActiveExamId = incomingRawExams.find((e) => !e.archived)?.id;
+      }
+
+      let activeAllowedCount = 0;
+      const normalizedExams = incomingRawExams.map((e) => {
+        if (e.archived) {
+          return e;
+        }
+        // 若符合進行中考試配額：
+        // 優先讓首選考試保持進行中
+        if (e.id === primaryActiveExamId && activeAllowedCount < entitlements.maxActiveExams) {
+          activeAllowedCount++;
+          return e;
+        }
+        if (activeAllowedCount < entitlements.maxActiveExams) {
+          activeAllowedCount++;
+          return e;
+        }
+        // 若超過目前會員方案上限（例如 Free 會員只允許 1 場進行中）：
+        // 自動轉為「已封存」，完整保留所有科目、章節、任務與進度，絕不刪除資料！
+        return {
+          ...e,
+          archived: true,
+        };
+      });
+
+      const validSelectedId = normalizedExams.some((e) => e.id === selectedExamId && !e.archived)
         ? selectedExamId
-        : exams[0]?.id;
+        : normalizedExams.find((e) => !e.archived)?.id ?? normalizedExams[0]?.id;
 
       return {
         ...state,
-        exams: exams.map((e) => ({
-          id: e.id,
-          name: e.name,
-          examDate: e.examDate,
-          subjects: (e.subjects || []).map((s) => ({
-            id: s.id,
-            name: s.name,
-            familiarity: s.familiarity,
-            chapters: (s.chapters || []).map((c) => ({
-              id: c.id,
-              title: c.title,
-            })),
-          })),
-          createdAt: e.createdAt,
-          archived: Boolean(e.archived),
-        })),
+        exams: normalizedExams,
         tasks: tasks.map((t) => ({
           id: t.id,
           examId: t.examId,
@@ -447,7 +529,7 @@ interface AppStore {
     updatedTasks?: StudyTask[],
     preferencesPatch?: Partial<StudyPreferences>,
   ) => Promise<void>;
-  toggleArchiveExam: (examId: string) => void;
+  toggleArchiveExam: (examId: string) => boolean;
   applyRescheduledTasks: (examId: string, updatedTasks: StudyTask[]) => void;
   deleteExam: (examId: string) => void;
   updatePreferences: (patch: Partial<StudyPreferences>) => void;
@@ -455,7 +537,7 @@ interface AppStore {
   recordAiUsage: (increment?: number) => void;
   restoreStudyData: (
     backupStudyData: BackupStudyData,
-  ) => Promise<{ success: boolean; error?: string }>;
+  ) => Promise<{ success: boolean; error?: string; autoArchivedCount?: number }>;
   loadDemo: () => void;
   clearAll: () => void;
 }
@@ -577,7 +659,25 @@ export function AppStoreProvider({
         dispatch({ type: 'updateExam', exam, updatedTasks, preferencesPatch });
         await saveAppDataToStorage(nextState);
       },
-      toggleArchiveExam: (examId: string) => dispatch({ type: 'toggleArchiveExam', examId }),
+      toggleArchiveExam: (examId: string) => {
+        const target = dataRef.current.exams.find((e) => e.id === examId);
+        if (target && target.archived) {
+          const tier = getEffectiveTier(dataRef.current.subscription);
+          const entitlements = getPlanEntitlements(tier);
+          const isOnlyDemo =
+            dataRef.current.isDemo ||
+            (dataRef.current.exams.length === 1 && dataRef.current.exams[0].id === 'demo-toeic');
+          const realExams = isOnlyDemo ? [] : dataRef.current.exams;
+          const currentActiveCount = realExams.filter(
+            (e) => !e.archived && e.id !== examId,
+          ).length;
+          if (currentActiveCount >= entitlements.maxActiveExams) {
+            return false;
+          }
+        }
+        dispatch({ type: 'toggleArchiveExam', examId });
+        return true;
+      },
       applyRescheduledTasks: (examId, updatedTasks) =>
         dispatch({ type: 'applyRescheduledTasks', examId, updatedTasks }),
       deleteExam: (examId) => dispatch({ type: 'deleteExam', examId }),
@@ -591,6 +691,11 @@ export function AppStoreProvider({
         isRestoringRef.current = true;
         try {
           const currentState = dataRef.current;
+          const tier = getEffectiveTier(currentState.subscription);
+          const entitlements = getPlanEntitlements(tier);
+          const incomingActiveCount = backupStudyData.exams.filter((e) => !e.archived).length;
+          const autoArchivedCount = Math.max(0, incomingActiveCount - entitlements.maxActiveExams);
+
           const nextState = reducer(currentState, {
             type: 'restoreStudyData',
             payload: backupStudyData,
@@ -603,7 +708,7 @@ export function AppStoreProvider({
             };
           }
           dispatch({ type: 'restoreStudyData', payload: backupStudyData });
-          return { success: true };
+          return { success: true, autoArchivedCount };
         } finally {
           setTimeout(() => {
             isRestoringRef.current = false;

@@ -11,8 +11,8 @@ import { useToday } from '../hooks/useToday';
 import { calculateReschedulePlan } from '../scheduler/reschedule';
 import { useAppStore } from '../store/AppStore';
 import {
+  getActiveExamById,
   getBehindTasks,
-  getExamById,
   getSubject,
   getUpcomingExam,
   tasksForExam,
@@ -31,16 +31,19 @@ export default function RescheduleScreen() {
   // 重新排程起始點選項：false 為今日起，true 為明日起
   const [startFromTomorrow, setStartFromTomorrow] = useState<boolean>(false);
 
-  const examWithTasks = data.exams.find((e) => tasksForExam(data.tasks, e.id).length > 0);
-  const activeExamId =
-    localExamId ??
-    params.examId ??
-    data.selectedExamId ??
+  const activeExams = useMemo(() => data.exams.filter((e) => !e.archived), [data.exams]);
+  const activeExamIds = useMemo(() => new Set(activeExams.map((e) => e.id)), [activeExams]);
+
+  const examWithTasks = activeExams.find((e) => tasksForExam(data.tasks, e.id).length > 0);
+  const fallbackExamId =
+    getActiveExamById(data, data.selectedExamId)?.id ??
     examWithTasks?.id ??
     getUpcomingExam(data, today)?.id ??
-    data.exams[0]?.id;
+    activeExams[0]?.id;
 
-  const exam = getExamById(data, activeExamId) ?? examWithTasks ?? data.exams[0];
+  const candidateId = localExamId ?? params.examId;
+  const activeExamId = candidateId && activeExamIds.has(candidateId) ? candidateId : fallbackExamId;
+  const exam = getActiveExamById(data, activeExamId) ?? examWithTasks ?? activeExams[0];
 
   const examTasks = useMemo(() => {
     if (!exam) return [];
@@ -59,9 +62,9 @@ export default function RescheduleScreen() {
     return calculateReschedulePlan(examTasks, exam.examDate, data.preferences, today, {
       startFromTomorrow,
       exam,
-      allExams: data.exams,
+      allExams: activeExams,
     });
-  }, [examTasks, exam, data.preferences, today, startFromTomorrow, data.exams]);
+  }, [examTasks, exam, data.preferences, today, startFromTomorrow, activeExams]);
 
   if (!exam || !plan) {
     return (
@@ -137,14 +140,14 @@ export default function RescheduleScreen() {
         />
       }
     >
-      {/* 考試切換 Tabs（若有多場考試） */}
-      {data.exams.length > 1 ? (
+      {/* 考試切換 Tabs（若有多場進行中考試） */}
+      {activeExams.length > 1 ? (
         <ScrollView
           horizontal
           showsHorizontalScrollIndicator={false}
           contentContainerStyle={styles.examTabs}
         >
-          {data.exams.map((e) => {
+          {activeExams.map((e) => {
             const isSelected = e.id === exam.id;
             return (
               <Pressable

@@ -27,6 +27,7 @@ import { useAppStore } from '../../store/AppStore';
 
 import {
   computeProgress,
+  getActiveExamById,
   getBehindTasks,
   getExamById,
   getSubject,
@@ -59,26 +60,34 @@ export default function HomeScreen() {
   const [isLoadingAi, setIsLoadingAi] = useState<boolean>(false);
   const [showAiCard, setShowAiCard] = useState<boolean>(false);
 
-  const examWithTasks = data.exams.find((e) => tasksForExam(data.tasks, e.id).length > 0);
+  const activeExams = useMemo(() => data.exams.filter((e) => !e.archived), [data.exams]);
+  const activeExamIds = useMemo(() => new Set(activeExams.map((e) => e.id)), [activeExams]);
+  const hasArchivedExams = useMemo(() => data.exams.some((e) => e.archived), [data.exams]);
+
+  const examWithTasks = activeExams.find((e) => tasksForExam(data.tasks, e.id).length > 0);
   const exam =
-    getExamById(data, data.selectedExamId) ??
+    getActiveExamById(data, data.selectedExamId) ??
     examWithTasks ??
     getUpcomingExam(data, today) ??
-    data.exams[0];
+    activeExams[0];
 
-  // 依選取的考試過濾（若選擇 'all' 則包含今日所有考試的任務）
+  // 依選取的考試過濾（僅計算進行中考試的任務，嚴格排除已封存考試）
   const relevantTasks = useMemo(() => {
-    if (filterExamId === 'all') return data.tasks;
-    return tasksForExam(data.tasks, filterExamId);
-  }, [data.tasks, filterExamId]);
+    const unarchivedTasks = data.tasks.filter((t) => activeExamIds.has(t.examId));
+    if (filterExamId === 'all') return unarchivedTasks;
+    if (activeExamIds.has(filterExamId)) {
+      return tasksForExam(unarchivedTasks, filterExamId);
+    }
+    return unarchivedTasks;
+  }, [data.tasks, filterExamId, activeExamIds]);
 
   const todayTasks = useMemo(() => tasksForDate(relevantTasks, today), [relevantTasks, today]);
   const progress = useMemo(() => computeProgress(todayTasks), [todayTasks]);
 
-  // 個人化任務優先度計算
+  // 個人化任務優先度計算（僅針對進行中考試）
   const priorities = useMemo(
-    () => prioritizeTasks(relevantTasks, data.exams, data.preferences, today),
-    [relevantTasks, data.exams, data.preferences, today],
+    () => prioritizeTasks(relevantTasks, activeExams, data.preferences, today),
+    [relevantTasks, activeExams, data.preferences, today],
   );
 
   const priorityMap = useMemo(() => {
@@ -103,17 +112,17 @@ export default function HomeScreen() {
     });
   }, [todayTasks, sortByPriority, priorityMap]);
 
-  // 個人化讀書建議計算
+  // 個人化讀書建議計算（僅針對進行中考試與其任務）
   const allRecommendations = useMemo(
     () =>
       generateStudyRecommendations({
-        exams: data.exams,
-        tasks: data.tasks,
+        exams: activeExams,
+        tasks: data.tasks.filter((t) => activeExamIds.has(t.examId)),
         preferences: data.preferences,
         today,
         selectedExamId: exam?.id,
       }),
-    [data.exams, data.tasks, data.preferences, today, exam?.id],
+    [activeExams, data.tasks, activeExamIds, data.preferences, today, exam?.id],
   );
 
   const activeRecommendations = useMemo(
@@ -221,8 +230,29 @@ export default function HomeScreen() {
     </Pressable>
   );
 
-  // ───── 沒有任何考試：空白狀態 ─────
+  // ───── 沒有任何進行中的考試：空白狀態 ─────
   if (!exam) {
+    if (hasArchivedExams) {
+      return (
+        <Screen topInset>
+          <ScreenHeader title="今天" subtitle={formatFullDate(today)} />
+          <EmptyState
+            title="所有考試皆已封存"
+            message="目前沒有進行中的考試計畫。你可以建立新考試，或至「管理考試」解除封存舊目標。"
+            actionTitle="建立新考試"
+            onAction={() => router.push('/exam/new')}
+          />
+          <View style={{ alignItems: 'center', marginTop: spacing.md }}>
+            <Button
+              title="前往管理已封存考試"
+              variant="plain"
+              onPress={() => router.push('/exams')}
+            />
+          </View>
+        </Screen>
+      );
+    }
+
     return (
       <Screen topInset>
         <ScreenHeader title="今天" subtitle={formatFullDate(today)} />
@@ -275,8 +305,8 @@ export default function HomeScreen() {
         </AppText>
       ) : null}
 
-      {/* 考試快速切換標籤列（若有多場考試） */}
-      {data.exams.length > 1 ? (
+      {/* 考試快速切換標籤列（若有多場進行中考試） */}
+      {activeExams.length > 1 ? (
         <ScrollView
           horizontal
           showsHorizontalScrollIndicator={false}
@@ -296,7 +326,7 @@ export default function HomeScreen() {
             </AppText>
           </Pressable>
 
-          {data.exams.map((e) => {
+          {activeExams.map((e) => {
             const isSelected = e.id === filterExamId || (filterExamId !== 'all' && e.id === exam.id);
             return (
               <Pressable

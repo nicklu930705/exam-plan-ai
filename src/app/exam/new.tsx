@@ -80,7 +80,7 @@ export default function NewExamScreen() {
   const examCheck = canCreateExam(data);
   if (!examCheck.allowed) {
     return (
-      <Screen topInset bottomInset>
+      <Screen bottomInset>
         <Stack.Screen options={{ title: '達到方案上限' }} />
         <EmptyState
           title="已達免費版考試計畫上限"

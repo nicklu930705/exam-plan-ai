@@ -79,6 +79,39 @@ export function canCreateExam(data: AppData): ExamCreationCheckResult {
 }
 
 /**
+ * 檢查是否可以解除封存指定考試
+ * 規則：
+ * 1. 免費版進行中考試最多 1 場。
+ * 2. 若當前進行中考試已達方案上限，不可解除封存，需提示先封存目前考試或升級 Pro。
+ */
+export function canUnarchiveExam(data: AppData): ExamCreationCheckResult {
+  const tier = getEffectiveTier(data.subscription);
+  const entitlements = getPlanEntitlements(tier);
+
+  const isOnlyDemo =
+    data.isDemo || (data.exams.length === 1 && data.exams[0].id === 'demo-toeic');
+  const realExams = isOnlyDemo ? [] : data.exams;
+
+  const activeExams = realExams.filter((e) => !e.archived);
+  const currentActiveCount = activeExams.length;
+
+  if (currentActiveCount >= entitlements.maxActiveExams) {
+    return {
+      allowed: false,
+      maxAllowed: entitlements.maxActiveExams,
+      currentActiveCount,
+      reason: `免費版支援最多 ${entitlements.maxActiveExams} 場進行中的考試計畫。請先將現有進行中的考試「封存」，或升級至 Pro 方案解鎖無限場考試。`,
+    };
+  }
+
+  return {
+    allowed: true,
+    maxAllowed: entitlements.maxActiveExams,
+    currentActiveCount,
+  };
+}
+
+/**
  * 檢查是否可使用「智慧重新排程」功能
  */
 export function canUseSmartReschedule(sub?: UserSubscription): {

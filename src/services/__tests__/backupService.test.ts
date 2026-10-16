@@ -789,4 +789,99 @@ describe('讀書資料備份與還原服務 (Backup & Restore Service)', () => {
     expect(restoredState.preferences.restDays).toEqual([0, 6]);
     expect(restoredState.preferences.intensity).toBe('intense');
   });
+
+  // 22. 封存狀態完整匯出與還原
+  test('22. 封存狀態完整匯出與還原：已封存考試匯出後包含 archived: true，還原後維持封存狀態', () => {
+    const archivedExam: Exam = {
+      ...sampleExam,
+      id: 'exam-archived-1',
+      name: '已封存多益',
+      archived: true,
+    };
+    const payload = createBackupPayload({
+      exams: [archivedExam],
+      tasks: [{ ...sampleTask, examId: 'exam-archived-1' }],
+      preferences: DEFAULT_PREFERENCES,
+      isDemo: false,
+    });
+
+    expect(payload.studyData.exams[0].archived).toBe(true);
+
+    const validation = validateBackupJson(JSON.stringify(payload));
+    expect(validation.isValid).toBe(true);
+    if (!validation.isValid) return;
+
+    const restoredState = reducer(INITIAL_EMPTY_DATA, {
+      type: 'restoreStudyData',
+      payload: validation.payload.studyData,
+    });
+
+    expect(restoredState.exams[0].archived).toBe(true);
+  });
+
+  // 23. 封存欄位型別驗證與舊版向後相容
+  test('23. 封存欄位驗證：非布林值之 archived 被拒絕，省略 archived 的舊版備份合法通過', () => {
+    const rawPayload: any = createBackupPayload({
+      exams: [sampleExam],
+      tasks: [sampleTask],
+      preferences: DEFAULT_PREFERENCES,
+      isDemo: false,
+    });
+
+    // 非布林值
+    rawPayload.studyData.exams[0].archived = 'true';
+    const invalidRes = validateBackupJson(JSON.stringify(rawPayload));
+    expect(invalidRes.isValid).toBe(false);
+    if (!invalidRes.isValid) {
+      expect(invalidRes.error).toContain('封存狀態格式不正確');
+    }
+
+    // 省略 archived（舊版備份）
+    delete rawPayload.studyData.exams[0].archived;
+    const legacyRes = validateBackupJson(JSON.stringify(rawPayload));
+    expect(legacyRes.isValid).toBe(true);
+
+    if (legacyRes.isValid) {
+      const restored = reducer(INITIAL_EMPTY_DATA, {
+        type: 'restoreStudyData',
+        payload: legacyRes.payload.studyData,
+      });
+      expect(restored.exams[0].archived).toBe(false);
+    }
+  });
+
+  // 24. Free 會員匯入多場進行中考試時的安全處理：不刪除任何紀錄，超額者安全轉為封存
+  test('24. Free 會員匯入多場進行中考試：完整保留全部考試與任務，超過方案上限者安全轉為封存', () => {
+    const exam1: Exam = { ...sampleExam, id: 'exam-1', name: '考試一', archived: false };
+    const exam2: Exam = { ...sampleExam, id: 'exam-2', name: '考試二', archived: false };
+    const task1: StudyTask = { ...sampleTask, id: 'task-1', examId: 'exam-1' };
+    const task2: StudyTask = { ...sampleTask, id: 'task-2', examId: 'exam-2' };
+
+    const freeUserState: AppData = {
+      ...INITIAL_EMPTY_DATA,
+      subscription: { plan: 'free', billingCycle: 'none', status: 'none' },
+    };
+
+    const restored = reducer(freeUserState, {
+      type: 'restoreStudyData',
+      payload: {
+        exams: [exam1, exam2],
+        tasks: [task1, task2],
+        preferences: DEFAULT_PREFERENCES,
+        selectedExamId: 'exam-1',
+      },
+    });
+
+    // 驗證 100% 考試與任務全部保留
+    expect(restored.exams.length).toBe(2);
+    expect(restored.tasks.length).toBe(2);
+    // 第一場為進行中
+    expect(restored.exams[0].id).toBe('exam-1');
+    expect(restored.exams[0].archived).toBe(false);
+    // 第二場自動安全轉為已封存（不靜默突破上限，也不刪除資料）
+    expect(restored.exams[1].id).toBe('exam-2');
+    expect(restored.exams[1].archived).toBe(true);
+    // selectedExamId 鎖定在進行中的考試一
+    expect(restored.selectedExamId).toBe('exam-1');
+  });
 });

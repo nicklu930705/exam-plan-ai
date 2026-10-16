@@ -27,6 +27,7 @@ import {
   type ReminderSettings,
 } from '../../services/notificationService';
 import { useAppStore } from '../../store/AppStore';
+import { getEffectiveTier, getPlanEntitlements } from '../../subscription/entitlements';
 import { colors, spacing } from '../../theme';
 import type { Intensity, Weekday } from '../../types/models';
 import { formatMinutes } from '../../utils/date';
@@ -281,9 +282,19 @@ export default function SettingsScreen() {
         minute: '2-digit',
       });
 
+      const tier = getEffectiveTier(data.subscription);
+      const entitlements = getPlanEntitlements(tier);
+      const incomingActiveCount = exams.filter((e) => !e.archived).length;
+      const willAutoArchiveCount = Math.max(0, incomingActiveCount - entitlements.maxActiveExams);
+
+      const planNotice =
+        willAutoArchiveCount > 0
+          ? `\n\n💡 方案提醒：因目前為免費版（上限 1 場進行中考試），系統將完整保留全部 ${exams.length} 場考試與讀書進度，並在還原後自動將超額的 ${willAutoArchiveCount} 場轉為「已封存」，您可隨時至「管理考試」切換目標。`
+          : '';
+
       Alert.alert(
         '確認還原讀書資料？',
-        `備份時間：${exportDateStr}\n包含內容：${exams.length} 場考試、${tasks.length} 項任務\n\n⚠️ 警告：還原將以備份內容完整取代手機現有的考試與讀書進度，未備份的進度將被覆蓋且無法復原。是否確定還原？`,
+        `備份時間：${exportDateStr}\n包含內容：${exams.length} 場考試、${tasks.length} 項任務${planNotice}\n\n⚠️ 警告：還原將以備份內容完整取代手機現有的考試與讀書進度，未備份的進度將被覆蓋且無法復原。是否確定還原？`,
         [
           { text: '取消', style: 'cancel' },
           {
@@ -292,10 +303,17 @@ export default function SettingsScreen() {
             onPress: async () => {
               const res = await restoreStudyData(payload.studyData);
               if (res.success) {
-                Alert.alert(
-                  '還原成功',
-                  `已成功還原 ${exams.length} 場考試與 ${tasks.length} 項任務。`,
-                );
+                if (res.autoArchivedCount && res.autoArchivedCount > 0) {
+                  Alert.alert(
+                    '還原成功',
+                    `已成功還原全部 ${exams.length} 場考試與 ${tasks.length} 項任務！\n\n因目前為免費版（上限 1 場進行中考試），系統已將其中 ${res.autoArchivedCount} 場自動轉為「已封存」，所有讀書進度均完整保留。\n您可隨時至「管理考試」切換或解除封存目標！`,
+                  );
+                } else {
+                  Alert.alert(
+                    '還原成功',
+                    `已成功還原 ${exams.length} 場考試與 ${tasks.length} 項任務。`,
+                  );
+                }
               } else {
                 Alert.alert('還原失敗', res.error ?? '寫入本機資料庫失敗。');
               }

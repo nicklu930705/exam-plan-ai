@@ -12,7 +12,7 @@ import { Screen } from '../components/Screen';
 import { useToday } from '../hooks/useToday';
 import { useAppStore } from '../store/AppStore';
 import { computeProgress, tasksForExam } from '../store/selectors';
-import { canCreateExam } from '../subscription/entitlements';
+import { canCreateExam, canUnarchiveExam } from '../subscription/entitlements';
 import { colors, spacing } from '../theme';
 import type { Exam } from '../types/models';
 import { diffDays, formatYearMonthDay } from '../utils/date';
@@ -51,6 +51,27 @@ export default function ExamsScreen() {
     router.push({ pathname: '/exam/edit', params: { id: exam.id } });
   };
 
+  const handleToggleArchive = (exam: Exam) => {
+    if (exam.archived) {
+      const check = canUnarchiveExam(data);
+      if (!check.allowed) {
+        Alert.alert('已達方案上限', check.reason, [
+          { text: '稍後再說', style: 'cancel' },
+          { text: '查看會員方案', onPress: () => router.push('/subscription') },
+        ]);
+        return;
+      }
+      toggleArchiveExam(exam.id);
+      Alert.alert('已解除封存', `「${exam.name}」已成功恢復為進行中考試。`);
+    } else {
+      toggleArchiveExam(exam.id);
+      Alert.alert(
+        '已封存考試',
+        `「${exam.name}」已移至封存，歷史紀錄仍完整保留，但不會出現在今日讀書計畫中。`,
+      );
+    }
+  };
+
   const confirmDelete = (exam: Exam) => {
     const tasks = tasksForExam(data.tasks, exam.id);
     const completedTasks = tasks.filter((t) => t.status === 'done');
@@ -63,7 +84,7 @@ export default function ExamsScreen() {
         {
           text: exam.archived ? '解除封存' : '改為封存考試',
           onPress: () => {
-            toggleArchiveExam(exam.id);
+            handleToggleArchive(exam);
           },
         },
         {
@@ -120,7 +141,7 @@ export default function ExamsScreen() {
 
       <Section
         title={tab === 'active' ? `進行中考試 (${activeExams.length} 場)` : `已封存考試 (${archivedExams.length} 場)`}
-        footer="點選進入每日計畫；點選鉛筆圖示編輯考試；點選垃圾桶刪除或封存考試。"
+        footer="點選進入每日計畫；鉛筆編輯；資料夾封存／復原；垃圾桶刪除。"
       >
         {currentList.length === 0 ? (
           <View style={styles.emptyWrap}>
@@ -143,6 +164,20 @@ export default function ExamsScreen() {
                   accessibilityLabel={`編輯${exam.name}`}
                 >
                   <Ionicons name="create-outline" size={20} color={colors.primary} />
+                </Pressable>
+
+                <Pressable
+                  hitSlop={8}
+                  onPress={() => handleToggleArchive(exam)}
+                  style={({ pressed }) => [styles.iconBtn, pressed && { opacity: 0.6 }]}
+                  accessibilityRole="button"
+                  accessibilityLabel={exam.archived ? `解除封存${exam.name}` : `封存${exam.name}`}
+                >
+                  <Ionicons
+                    name={exam.archived ? 'arrow-undo-outline' : 'archive-outline'}
+                    size={20}
+                    color={exam.archived ? colors.primary : colors.textSecondary}
+                  />
                 </Pressable>
 
                 <Pressable

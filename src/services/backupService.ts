@@ -186,6 +186,12 @@ export function validateBackupJson(jsonString: string): ValidationResult {
         error: `考試「${exam.name}」的日期不正確或非有效公曆日期（須為 2000-2100 年間之 YYYY-MM-DD）。`,
       };
     }
+    if (exam.archived !== undefined && typeof exam.archived !== 'boolean') {
+      return {
+        isValid: false,
+        error: `考試「${exam.name}」的封存狀態格式不正確（必須為布林值）。`,
+      };
+    }
     if (!Array.isArray(exam.subjects)) {
       return { isValid: false, error: `考試「${exam.name}」的科目清單格式不正確。` };
     }

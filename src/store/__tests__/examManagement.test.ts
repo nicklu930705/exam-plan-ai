@@ -1,7 +1,16 @@
 import { calculateExamEditReschedule } from '../../scheduler/reschedule';
+import { canCreateExam, canUnarchiveExam } from '../../subscription/entitlements';
 import type { AppData, Exam, StudyPreferences, StudyTask } from '../../types/models';
 import { INITIAL_EMPTY_DATA, reducer } from '../AppStore';
-import { computeDashboardStats, getExamById, tasksForExam } from '../selectors';
+import {
+  computeDashboardStats,
+  getActiveExamById,
+  getActiveExams,
+  getArchivedExams,
+  getExamById,
+  getUpcomingExam,
+  tasksForExam,
+} from '../selectors';
 
 jest.mock('@react-native-async-storage/async-storage', () =>
   // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -102,6 +111,7 @@ describe('Exam Management (編輯、重新排程、保護歷史紀錄與刪除�
     tasks: [...sampleTasks1, ...sampleTasks2],
     selectedExamId: 'exam-1',
     preferences: samplePrefs,
+    subscription: { plan: 'pro', billingCycle: 'annual', status: 'active' },
   });
 
   // ───── 測試一：修改考試名稱並儲存（非排程變更） ─────
@@ -383,5 +393,285 @@ describe('Exam Management (編輯、重新排程、保護歷史紀錄與刪除�
     expect(statsBefore.doneCount).toBe(1);
     expect(statsBefore.totalCount).toBe(2);
     expect(statsBefore.completionPercentage).toBe(50);
+  });
+
+  // ───── 測試十一：封存考試自動重新評估 selectedExamId ─────
+  test('11. 封存當前選取的考試時，selectedExamId 自動切換至其他進行中考試；全封存時為 undefined', () => {
+    const state = buildInitialState(); // 包含 exam-1 (selected), exam-2
+    expect(state.selectedExamId).toBe('exam-1');
+
+    // 封存 exam-1
+    const state1 = reducer(state, {
+      type: 'toggleArchiveExam',
+      examId: 'exam-1',
+    });
+    // selectedExamId 應自動切換至剩餘的進行中考試 exam-2
+    expect(state1.selectedExamId).toBe('exam-2');
+
+    // 再封存 exam-2（此時所有考試皆已封存）
+    const state2 = reducer(state1, {
+      type: 'toggleArchiveExam',
+      examId: 'exam-2',
+    });
+    // 所有考試封存後，selectedExamId 應安全變為 undefined，不保留已封存考試
+    expect(state2.selectedExamId).toBeUndefined();
+
+    // 解除封存 exam-1（原本無選取考試）
+    const state3 = reducer(state2, {
+      type: 'toggleArchiveExam',
+      examId: 'exam-1',
+    });
+    // 解除封存後，自動重新選取該考試
+    expect(state3.selectedExamId).toBe('exam-1');
+  });
+
+  // ───── 測試十二：封存考試安全清理計時器但完整保留計時分鐘與歷史 ─────
+  test('12. 封存考試時正在計時的任務安全停止計時，任務累計之 actualMinutes 與 timerMinutes 完整保留', () => {
+    const state = buildInitialState();
+    const timingState: AppData = {
+      ...state,
+      activeTimer: {
+        taskId: 'task-1',
+        taskTitle: '極限與連續：觀念學習',
+        examId: 'exam-1',
+        startedAt: Date.now() - 30000,
+        accumulatedSeconds: 60,
+        isRunning: true,
+      },
+    };
+
+    const archivedState = reducer(timingState, {
+      type: 'toggleArchiveExam',
+      examId: 'exam-1',
+    });
+
+    // 計時器安全清除，不持續於背景運行
+    expect(archivedState.activeTimer).toBeNull();
+
+    // 歷史研讀時間與任務資料毫髮無傷
+    const task1 = archivedState.tasks.find((t) => t.id === 'task-1');
+    expect(task1?.actualMinutes).toBe(45);
+    expect(task1?.timerMinutes).toBe(35);
+    expect(task1?.status).toBe('done');
+  });
+
+  // ───── 測試十三：Free 會員配額限制（canCreateExam 與 canUnarchiveExam） ─────
+  test('13. Free 免費版嚴格限制 1 場進行中考試，封存不佔額度，解除封存受限額約束', () => {
+    // 建立 1 場進行中考試的 Free 狀態
+    const freeState: AppData = {
+      ...INITIAL_EMPTY_DATA,
+      exams: [sampleExam1],
+      tasks: sampleTasks1,
+      selectedExamId: 'exam-1',
+      subscription: { plan: 'free', billingCycle: 'none', status: 'active' },
+    };
+
+    // 1 場進行中：不允許建立新考試
+    const createCheck1 = canCreateExam(freeState);
+    expect(createCheck1.allowed).toBe(false);
+    expect(createCheck1.currentActiveCount).toBe(1);
+
+    // 封存該考試
+    const archivedFreeState = reducer(freeState, {
+      type: 'toggleArchiveExam',
+      examId: 'exam-1',
+    });
+    expect(archivedFreeState.exams[0].archived).toBe(true);
+
+    // 0 場進行中：允許建立新考試
+    const createCheck2 = canCreateExam(archivedFreeState);
+    expect(createCheck2.allowed).toBe(true);
+    expect(createCheck2.currentActiveCount).toBe(0);
+
+    // 0 場進行中：允許解除封存舊考試
+    const unarchiveCheck1 = canUnarchiveExam(archivedFreeState);
+    expect(unarchiveCheck1.allowed).toBe(true);
+
+    // 模擬已新建一場進行中考試（此時有 1 場進行中 + 1 場已封存）
+    const twoExamsFreeState: AppData = {
+      ...archivedFreeState,
+      exams: [sampleExam1, sampleExam2], // sampleExam1 已封存，sampleExam2 進行中
+    };
+    const unarchiveCheck2 = canUnarchiveExam(twoExamsFreeState);
+    // 已有 1 場進行中：解除封存被阻擋！
+    expect(unarchiveCheck2.allowed).toBe(false);
+    expect(unarchiveCheck2.reason).toContain('免費版');
+  });
+
+  // ───── 測試十四：selectors 嚴格排除已封存考試 ─────
+  test('14. getUpcomingExam、getActiveExams、getArchivedExams 與 getActiveExamById 排除已封存考試', () => {
+    const state = buildInitialState();
+    // 封存 exam-1（2026-11-01，原本是最早到來的考試）
+    const archivedState = reducer(state, {
+      type: 'toggleArchiveExam',
+      examId: 'exam-1',
+    });
+
+    // getUpcomingExam 絕不可回傳已封存的 exam-1，應回傳進行中的 exam-2 (2026-11-20)
+    const upcoming = getUpcomingExam(archivedState, today);
+    expect(upcoming?.id).toBe('exam-2');
+
+    // getActiveExams 僅回傳進行中考試
+    const active = getActiveExams(archivedState);
+    expect(active.length).toBe(1);
+    expect(active[0].id).toBe('exam-2');
+
+    // getArchivedExams 回傳封存考試
+    const archived = getArchivedExams(archivedState);
+    expect(archived.length).toBe(1);
+    expect(archived[0].id).toBe('exam-1');
+
+    // getActiveExamById 對已封存考試回傳 undefined
+    expect(getActiveExamById(archivedState, 'exam-1')).toBeUndefined();
+    expect(getActiveExamById(archivedState, 'exam-2')?.id).toBe('exam-2');
+  });
+
+  // ───── 測試十五：實機測試使用者完整復現情境 ─────
+  test('15. 實機情境驗證：封存「鬧鬧鬧」後新增「期末考」，進行中考試完全切換，絕不殘留舊目標', () => {
+    const naonaonaoExam: Exam = {
+      id: 'exam-naonaonao',
+      name: '鬧鬧鬧',
+      examDate: '2026-10-30',
+      createdAt: '2026-10-12T00:00:00.000Z',
+      subjects: [
+        {
+          id: 'sub-nao',
+          name: '國文',
+          familiarity: 2,
+          chapters: [{ id: 'ch-nao', title: '第一課' }],
+        },
+      ],
+    };
+
+    const naoTasks: StudyTask[] = [
+      {
+        id: 'task-nao',
+        examId: 'exam-naonaonao',
+        subjectId: 'sub-nao',
+        subjectName: '國文',
+        title: '第一課：複習',
+        kind: 'study',
+        date: today,
+        estimatedMinutes: 30,
+        actualMinutes: 20,
+        status: 'done',
+      },
+    ];
+
+    // 步驟 1: Free 使用者只有「鬧鬧鬧」
+    let userState: AppData = {
+      ...INITIAL_EMPTY_DATA,
+      exams: [naonaonaoExam],
+      tasks: naoTasks,
+      selectedExamId: 'exam-naonaonao',
+      subscription: { plan: 'free', billingCycle: 'none', status: 'active' },
+    };
+
+    // 步驟 2: 點選新增考試，達到上限
+    expect(canCreateExam(userState).allowed).toBe(false);
+
+    // 步驟 3 & 4: 封存「鬧鬧鬧」
+    userState = reducer(userState, {
+      type: 'toggleArchiveExam',
+      examId: 'exam-naonaonao',
+    });
+    expect(userState.exams[0].archived).toBe(true);
+    expect(userState.selectedExamId).toBeUndefined();
+
+    // 步驟 5: 封存後可順利建立新考試「期末考」
+    expect(canCreateExam(userState).allowed).toBe(true);
+
+    const finalExam: Exam = {
+      id: 'exam-final',
+      name: '期末考',
+      examDate: '2026-11-25',
+      createdAt: '2026-10-16T00:00:00.000Z',
+      subjects: [
+        {
+          id: 'sub-final',
+          name: '數學',
+          familiarity: 3,
+          chapters: [{ id: 'ch-final', title: '空間幾何' }],
+        },
+      ],
+    };
+
+    const finalTasks: StudyTask[] = [
+      {
+        id: 'task-final',
+        examId: 'exam-final',
+        subjectId: 'sub-final',
+        subjectName: '數學',
+        title: '空間幾何：概念研讀',
+        kind: 'study',
+        date: today,
+        estimatedMinutes: 45,
+        status: 'pending',
+      },
+    ];
+
+    userState = reducer(userState, {
+      type: 'createExamWithTasks',
+      exam: finalExam,
+      tasks: finalTasks,
+    });
+
+    // 步驟 6 驗證：
+    // - 總考試數為 2（鬧鬧鬧 1 + 期末考 1）
+    expect(userState.exams.length).toBe(2);
+    // - selectedExamId 自動成為剛建立的「期末考」
+    expect(userState.selectedExamId).toBe('exam-final');
+    // - 進行中的考試僅有「期末考」
+    const activeExams = getActiveExams(userState);
+    expect(activeExams.length).toBe(1);
+    expect(activeExams[0].name).toBe('期末考');
+    // - upcomingExam 為「期末考」
+    expect(getUpcomingExam(userState, today)?.name).toBe('期末考');
+    // - 今日進行中任務僅有「期末考」的任務
+    const activeIds = new Set(activeExams.map((e) => e.id));
+    const activeTodayTasks = userState.tasks.filter((t) => activeIds.has(t.examId));
+    expect(activeTodayTasks.length).toBe(1);
+    expect(activeTodayTasks[0].title).toBe('空間幾何：概念研讀');
+    // -「鬧鬧鬧」的歷史紀錄、完成任務完全健在
+    const archivedTasks = tasksForExam(userState.tasks, 'exam-naonaonao');
+    expect(archivedTasks.length).toBe(1);
+    expect(archivedTasks[0].actualMinutes).toBe(20);
+    expect(archivedTasks[0].status).toBe('done');
+  });
+
+  test('10. 資料層防護：Free 會員已有一場進行中考試時，reducer 直接拒絕解除封存第二場考試', () => {
+    const activeExam: Exam = {
+      id: 'exam-active',
+      name: '進行中考試',
+      examDate: '2026-11-01',
+      createdAt: '2026-10-01T00:00:00.000Z',
+      subjects: [],
+      archived: false,
+    };
+    const archivedExam: Exam = {
+      id: 'exam-archived',
+      name: '已封存考試',
+      examDate: '2026-12-01',
+      createdAt: '2026-10-01T00:00:00.000Z',
+      subjects: [],
+      archived: true,
+    };
+
+    const state: AppData = {
+      ...INITIAL_EMPTY_DATA,
+      exams: [activeExam, archivedExam],
+      subscription: { plan: 'free', billingCycle: 'none', status: 'none' },
+    };
+
+    // 嘗試在資料層解除封存已封存考試
+    const nextState = reducer(state, {
+      type: 'toggleArchiveExam',
+      examId: 'exam-archived',
+    });
+
+    // 驗證 reducer 拒絕變更，依然維持原狀
+    expect(nextState.exams.find((e) => e.id === 'exam-archived')?.archived).toBe(true);
+    expect(getActiveExams(nextState).length).toBe(1);
+    expect(getActiveExams(nextState)[0].id).toBe('exam-active');
   });
 });

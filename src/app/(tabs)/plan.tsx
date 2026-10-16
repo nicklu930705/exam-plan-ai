@@ -6,6 +6,7 @@ import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { ActiveTimerBanner } from '../../components/ActiveTimerBanner';
 import { AiAdviceCard } from '../../components/AiAdviceCard';
 import { AppText } from '../../components/AppText';
+import { Button } from '../../components/Button';
 import { EmptyState } from '../../components/EmptyState';
 import { Segmented } from '../../components/FormControls';
 import { Section } from '../../components/List';
@@ -22,8 +23,8 @@ import {
 import { useAppStore } from '../../store/AppStore';
 import {
   computeProgress,
+  getActiveExamById,
   getBehindTasks,
-  getExamById,
   getSubject,
   getUpcomingExam,
   groupByDate,
@@ -60,21 +61,26 @@ export default function PlanScreen() {
   const [isLoadingAi, setIsLoadingAi] = useState<boolean>(false);
   const [showAiSection, setShowAiSection] = useState<boolean>(false);
 
+  const activeExams = useMemo(() => data.exams.filter((e) => !e.archived), [data.exams]);
+  const activeExamIds = useMemo(() => new Set(activeExams.map((e) => e.id)), [activeExams]);
+  const hasArchivedExams = useMemo(() => data.exams.some((e) => e.archived), [data.exams]);
+
   // 優先選取邏輯：
-  // 1. 使用者手動在 Chips 選擇的考試 (userSelectedExamId)
-  // 2. 路由參數 params.examId (建立考試或連結跳轉)
-  // 3. 全域 store.selectedExamId (剛剛建立或切換的考試)
-  // 4. 真正有排程任務的考試 (避免預設落入無任務的舊考試)
-  // 5. 即將到來的考試 (getUpcomingExam)
-  // 6. 第一場考試 (data.exams[0])
-  const examWithTasks = data.exams.find((e) => tasksForExam(data.tasks, e.id).length > 0);
+  // 1. 使用者手動在 Chips 選擇的考試 (userSelectedExamId，須為進行中)
+  // 2. 路由參數 params.examId (建立考試或連結跳轉，須為進行中)
+  // 3. 全域 store.selectedExamId (剛建立或切換之考試，須為進行中)
+  // 4. 真正有排程任務的進行中考試
+  // 5. 即將到來的進行中考試 (getUpcomingExam)
+  // 6. 第一場進行中考試 (activeExams[0])
+  const examWithTasks = activeExams.find((e) => tasksForExam(data.tasks, e.id).length > 0);
   const fallbackExamId =
-    data.selectedExamId ??
+    getActiveExamById(data, data.selectedExamId)?.id ??
     examWithTasks?.id ??
     getUpcomingExam(data, today)?.id ??
-    data.exams[0]?.id;
-  const activeExamId = userSelectedExamId ?? params.examId ?? fallbackExamId;
-  const selectedExam = getExamById(data, activeExamId) ?? examWithTasks ?? data.exams[0];
+    activeExams[0]?.id;
+  const candidateId = userSelectedExamId ?? params.examId;
+  const activeExamId = candidateId && activeExamIds.has(candidateId) ? candidateId : fallbackExamId;
+  const selectedExam = getActiveExamById(data, activeExamId) ?? examWithTasks ?? activeExams[0];
   const relevantTasks = useMemo(
     () => (selectedExam ? tasksForExam(data.tasks, selectedExam.id) : []),
     [selectedExam, data.tasks],
@@ -165,7 +171,28 @@ export default function PlanScreen() {
     }
   };
 
-  if (data.exams.length === 0) {
+  if (activeExams.length === 0) {
+    if (hasArchivedExams) {
+      return (
+        <Screen topInset>
+          <ScreenHeader title="讀書計畫" />
+          <EmptyState
+            title="所有考試皆已封存"
+            message="目前沒有進行中的讀書計畫。你可以建立新考試，或至「管理考試」解除封存舊目標。"
+            actionTitle="建立新考試"
+            onAction={() => router.push('/exam/new')}
+          />
+          <View style={{ alignItems: 'center', marginTop: spacing.md }}>
+            <Button
+              title="前往管理已封存考試"
+              variant="plain"
+              onPress={() => router.push('/exams')}
+            />
+          </View>
+        </Screen>
+      );
+    }
+
     return (
       <Screen topInset>
         <ScreenHeader title="讀書計畫" />
@@ -199,6 +226,7 @@ export default function PlanScreen() {
       <ScreenHeader
         title="讀書計畫"
         subtitle={selectedExam ? `${selectedExam.name} (${formatYearMonthDay(selectedExam.examDate)})` : undefined}
+        subtitlePosition="below"
         right={
           selectedExam ? (
             <Pressable
@@ -221,14 +249,14 @@ export default function PlanScreen() {
 
       <ActiveTimerBanner />
 
-      {/* 考試選擇器（若有多場考試時顯示供快速切換） */}
-      {data.exams.length > 1 ? (
+      {/* 考試選擇器（若有多場進行中考試時顯示供快速切換） */}
+      {activeExams.length > 1 ? (
         <ScrollView
           horizontal
           showsHorizontalScrollIndicator={false}
           contentContainerStyle={styles.examTabs}
         >
-          {data.exams.map((e) => {
+          {activeExams.map((e) => {
             const isSelected = e.id === activeExamId;
             return (
               <Pressable
