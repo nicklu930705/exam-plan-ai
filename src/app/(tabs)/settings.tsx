@@ -11,7 +11,6 @@ import { ScreenHeader } from '../../components/ScreenHeader';
 import { INTENSITY_DESCRIPTIONS, INTENSITY_LABELS } from '../../constants/labels';
 import { getBackendUrlFromStorage, saveBackendUrlToStorage } from '../../storage';
 import { useAppStore } from '../../store/AppStore';
-import { getAiQuotaStatus } from '../../subscription/entitlements';
 import { spacing } from '../../theme';
 import type { Intensity, Weekday } from '../../types/models';
 import { formatMinutes } from '../../utils/date';
@@ -29,8 +28,6 @@ export default function SettingsScreen() {
   useEffect(() => {
     getBackendUrlFromStorage().then(setBackendUrl);
   }, []);
-
-  const quotaStatus = getAiQuotaStatus(data.aiUsage, data.subscription);
 
   const editBackendUrl = () => {
     Alert.prompt(
@@ -149,8 +146,8 @@ export default function SettingsScreen() {
       </Section>
 
       <Section
-        title="AI 雲端服務 (Google Gemini)"
-        footer="零金鑰原則：Gemini API Key 僅由 Vercel 後端環境變數安全保管，App 端無任何金鑰外洩風險。若未設定伺服端，將自動無縫使用高品質本機排程演算法。"
+        title="AI 雲端服務（讀書教練）"
+        footer="零金鑰原則：AI API 金鑰僅由 Vercel 後端環境變數安全保管，App 端無任何金鑰外洩風險。若未設定伺服端或連線中斷，將自動無縫使用高品質本機排程演算法。"
       >
         <Row
           title="後端伺服器端點"
@@ -159,11 +156,11 @@ export default function SettingsScreen() {
           onPress={editBackendUrl}
         />
         <Row
-          title="本月 AI 深度配額"
+          title="AI 建議每日額度"
           value={
             data.subscription?.plan === 'free'
-              ? '免費版（使用本機引擎）'
-              : `剩餘 ${quotaStatus.remaining} / ${quotaStatus.limit} 次`
+              ? '免費版（每日 3 次 · 午夜重設）'
+              : 'Pro 會員（每日 15 次 · 午夜重設）'
           }
           disabled
         />
@@ -173,7 +170,7 @@ export default function SettingsScreen() {
           onPress={() =>
             Alert.alert(
               '零金鑰安全設計',
-              '為了防止付費或免費 API 金鑰遭到逆向工程竊取，本 App 嚴格遵循零金鑰原則：\n\n1. 所有 Gemini API 請求皆由您的獨立後端（Vercel）轉發。\n2. 伺服端具備 12 秒連線逾時、15 KB 流量防禦與 IP 頻率防護。\n3. 若離線或額度耗盡，自動降級為本機演算法，不中斷讀書流程。',
+              '為了防止 API 金鑰遭到逆向工程竊取，本 App 嚴格遵循零金鑰原則：\n\n1. 所有 AI 讀書建議請求皆由您的獨立雲端後端（Vercel）安全代理轉發。\n2. 伺服端具備嚴格連線逾時、流量防禦、IP 頻率限制與日/月預算防護。\n3. 若離線或額度耗盡，自動降級為本機排程演算法，不中斷讀書流程。',
             )
           }
         />

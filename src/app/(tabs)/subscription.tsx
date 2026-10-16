@@ -13,7 +13,7 @@ import { Button } from '../../components/Button';
 import { Screen } from '../../components/Screen';
 import { ScreenHeader } from '../../components/ScreenHeader';
 import { useAppStore } from '../../store/AppStore';
-import { getAiQuotaStatus, getEffectiveTier, getPlanEntitlements } from '../../subscription/entitlements';
+import { getEffectiveTier, getPlanEntitlements } from '../../subscription/entitlements';
 import { SUBSCRIPTION_PRODUCTS } from '../../subscription/products';
 import { STOREKIT_PRODUCT_IDS } from '../../subscription/storeKitConfig';
 import { storeKitService, type StoreStatus } from '../../subscription/storeKitService';
@@ -25,7 +25,6 @@ export default function SubscriptionScreen() {
   const currentTier = getEffectiveTier(data.subscription);
   const currentSub = data.subscription;
   const currentEntitlements = getPlanEntitlements(currentTier);
-  const quota = getAiQuotaStatus(data.subscription, data.aiUsage);
 
   const [products, setProducts] = useState<ProductDefinition[]>(SUBSCRIPTION_PRODUCTS);
   const [storeStatus, setStoreStatus] = useState<StoreStatus>(storeKitService.getStoreStatus());
@@ -333,10 +332,10 @@ export default function SubscriptionScreen() {
           </View>
           <View style={styles.usageCol}>
             <AppText secondary style={styles.usageLabel}>
-              本月 AI 配額
+              AI 每日雲端額度
             </AppText>
             <AppText style={styles.usageValue}>
-              {quota.limit === 0 ? '不支援' : `${quota.used} / ${quota.limit} 次`}
+              {currentTier === 'free' ? '每日 3 次' : '每日 15 次'}
             </AppText>
           </View>
         </View>
@@ -449,10 +448,10 @@ export default function SubscriptionScreen() {
           lifetime="✓"
         />
         <MatrixRow
-          feature="AI 個人化讀書建議"
-          free="—"
-          pro="100 次/月"
-          lifetime="30 次/月"
+          feature="AI 讀書教練建議"
+          free="每日 3 次"
+          pro="每日 15 次"
+          lifetime="每日 15 次"
         />
         <MatrixRow
           feature="弱科深度衝刺規劃"

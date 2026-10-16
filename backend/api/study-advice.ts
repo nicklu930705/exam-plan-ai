@@ -125,9 +125,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const cachedPayload = typeof preFlight.cachedResponse === 'string'
         ? JSON.parse(preFlight.cachedResponse)
         : preFlight.cachedResponse;
-      return res.status(200).json(cachedPayload);
+      return res.status(200).json({ ...cachedPayload, cached: true });
     } catch {
-      return res.status(200).json({ success: true, data: preFlight.cachedResponse });
+      return res.status(200).json({ success: true, cached: true, data: preFlight.cachedResponse });
     }
   }
 
