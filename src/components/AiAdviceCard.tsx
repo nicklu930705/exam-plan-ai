@@ -58,7 +58,7 @@ export const AiAdviceCard: React.FC<Props> = ({
           <View style={[styles.badge, styles.geminiBadge]}>
             <Ionicons name="sparkles" size={14} color={colors.primary} style={{ marginRight: 4 }} />
             <AppText variant="caption" color={colors.primary} style={{ fontWeight: '700' }}>
-              {source === 'openai_ai' ? '✦ OpenAI GPT 深度分析中' : '✦ AI 智慧教練深度分析中'}
+              ✦ AI 讀書教練深度分析中
             </AppText>
           </View>
           {onDismiss ? (
@@ -223,11 +223,9 @@ export const AiAdviceCard: React.FC<Props> = ({
             color={isGemini ? colors.primary : colors.textSecondary}
             style={{ fontWeight: '700' }}
           >
-            {source === 'openai_ai'
-              ? '✦ OpenAI GPT 深度建議'
-              : source === 'gemini_ai'
-                ? '✦ Google Gemini AI 深度建議'
-                : '智慧讀書教練 (本機引擎)'}
+            {isAi
+              ? '✦ AI 讀書教練深度建議'
+              : '智慧讀書教練 (本機引擎)'}
           </AppText>
         </View>
 
@@ -339,9 +337,9 @@ export const AiAdviceCard: React.FC<Props> = ({
               {quota.tier === 'pro' ? '✦ Pro 會員' : '免費版'}今日已用 {quota.usedToday}/{quota.dailyLimit} 次（剩餘 {quota.remainingToday} 次 · 每日 00:00 重設）
             </AppText>
           </View>
-        ) : quotaStatus && quotaStatus.limit > 0 ? (
+        ) : !isAi ? (
           <AppText variant="caption" secondary style={styles.quotaText}>
-            本月 AI 額度：剩餘 {quotaStatus.remaining} / {quotaStatus.limit} 次
+            本機排程分析引擎（不消耗雲端每日 AI 額度）
           </AppText>
         ) : null}
         {disclaimer ? (

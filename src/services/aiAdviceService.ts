@@ -1,9 +1,9 @@
 /**
- * 考試計畫 AI - Gemini AI 讀書建議客戶端服務
+ * 考試計畫 AI - AI 讀書建議客戶端服務
  *
  * 設計原則（嚴格落實安全與成本控管）：
- * 1. 零金鑰原則：本前端 App 嚴禁存在任何 Gemini API 金鑰或付費密鑰。
- * 2. 伺服端代理：呼叫獨立後端 /api/study-advice，由後端環境變數安全保管 GEMINI_API_KEY。
+ * 1. 零金鑰原則：本前端 App 嚴禁存在任何 AI API 金鑰或私密密鑰。
+ * 2. 伺服端代理：呼叫獨立後端 /api/study-advice，由後端環境變數安全保管 API 金鑰。
  * 3. 優雅降級：若離線、逾時、伺服端配額耗盡（429）或尚未設定後端網址，自動無縫切換為高品質本機排程演算法，絕不中斷學習流程。
  * 4. 職責分離：AI 只提供學習輔導建議與策略分析，絕不直接篡改本機確定性排程資料。
  */
@@ -53,6 +53,7 @@ export interface StudyAdviceResponse {
   error?: string;
   code?: string;
   quota?: QuotaInfo;
+  cached?: boolean;
 }
 
 export type AiAdviceStatus =
@@ -75,6 +76,7 @@ export interface AiAdviceServiceResult {
   note?: string;
   error?: string;
   errorCode?: string;
+  cached?: boolean;
 }
 
 export interface RequestAiStudyAdviceParams {
@@ -261,10 +263,10 @@ export async function fetchFromBackendApi(
           rawError.includes('"code":503')
         ) {
           code = 'SERVICE_UNAVAILABLE';
-          errorMsg = 'Google Gemini 模型目前處於高負載尖峰，為暫時性現象，請稍候片刻後點擊「重新嘗試」。';
+          errorMsg = 'AI 雲端服務目前處於高負載尖峰，為暫時性現象，請稍候片刻後點擊「重新嘗試」。';
         } else if (rawError.includes('quota') || rawError.includes('RESOURCE_EXHAUSTED')) {
           code = 'QUOTA_EXCEEDED';
-          errorMsg = 'Google Gemini API 呼叫額度暫時達上限，請稍候 30 秒再試。';
+          errorMsg = 'AI 雲端服務呼叫頻率暫時達上限，請稍候 30 秒再試。';
         } else {
           try {
             const parsed = JSON.parse(rawError);
@@ -279,11 +281,11 @@ export async function fetchFromBackendApi(
 
       if (!errorMsg) {
         if (res.status === 429) {
-          errorMsg = 'AI 伺服器流量或 Google API 頻率已達上限，請稍候 30 秒再試。';
+          errorMsg = 'AI 伺服器流量或呼叫頻率已達上限，請稍候 30 秒再試。';
         } else if (res.status === 504) {
           errorMsg = 'AI 服務回應逾時 (超過 30 秒)，請稍後再試。';
         } else if (res.status === 503) {
-          errorMsg = 'Google Gemini 模型伺服器暫時繁忙，請點擊下方重新嘗試。';
+          errorMsg = 'AI 雲端伺服器暫時繁忙，請點擊下方重新嘗試。';
         } else if (res.status === 500) {
           errorMsg = 'AI 雲端服務內部發生錯誤，請稍後重試。';
         } else {
@@ -392,7 +394,7 @@ export async function requestAiStudyAdvice(
         source: 'fallback_rule_engine',
         quotaStatus,
         disclaimer: '此建議由本機排程演算法客觀計算生成。',
-        note: accessCheck.reason ?? '升級 Pro 會員即可解鎖 Gemini AI 深度個人化教練。',
+        note: accessCheck.reason ?? '升級 Pro 會員即可解鎖 AI 深度個人化教練。',
       };
     }
   }
@@ -424,7 +426,7 @@ export async function requestAiStudyAdvice(
       source: 'fallback_rule_engine',
       quotaStatus,
       disclaimer: '目前尚未設定 AI 雲端伺服器網址，已自動由本機排程引擎為您分析。',
-      note: '提示：您可在「設定 > AI 雲端服務」填入您的 Vercel 後端網址以啟用 Gemini AI。',
+      note: '提示：您可在「設定 > AI 雲端服務」填入您的 Vercel 後端網址以啟用 AI 讀書教練。',
     };
   }
 
@@ -440,6 +442,7 @@ export async function requestAiStudyAdvice(
       quotaStatus,
       quota: backendRes.quota,
       disclaimer: backendRes.disclaimer,
+      cached: backendRes.cached,
     };
   }
 
@@ -472,6 +475,7 @@ export async function requestAiStudyAdvice(
       disclaimer: backendRes.disclaimer || 'AI 建議僅供學習策略與心理激勵參考。',
       error: backendRes.error || 'AI 伺服器回應異常，請稍後再試。',
       errorCode: backendRes.code,
+      cached: backendRes.cached,
     };
 
     console.log('[AI Service] AI 請求結束（嚴格錯誤模式）', {
@@ -487,7 +491,7 @@ export async function requestAiStudyAdvice(
   const localAdvice = generateLocalRuleAdvice(request);
   const failureNote =
     backendRes.code === 'QUOTA_EXCEEDED'
-      ? 'Google Gemini API 免費額度暫時用盡，已自動切換為本機排程演算法。'
+      ? '今日 AI 雲端免費額度暫時用盡，已自動切換為本機排程演算法。'
       : `AI 伺服器暫時無法回應（${backendRes.error}），已自動啟用本機排程建議。`;
 
   return {

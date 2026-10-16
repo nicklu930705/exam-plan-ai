@@ -52,4 +52,5 @@ export interface StudyAdviceResponse {
     actualCostUSD?: number;
     isExactPricing?: boolean;
   };
+  cached?: boolean;
 }

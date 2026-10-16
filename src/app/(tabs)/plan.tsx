@@ -43,7 +43,7 @@ import {
 } from '../../utils/date';
 
 export default function PlanScreen() {
-  const { data, setTaskStatus, setSelectedExamId } = useAppStore();
+  const { data, setTaskStatus, setSelectedExamId, recordAiUsage } = useAppStore();
   const today = useToday();
   const { activeTimer, formattedTime, startTimer } = useStudyTimer();
   const thisWeek = startOfWeek(today);
@@ -55,7 +55,7 @@ export default function PlanScreen() {
   const [viewMode, setViewMode] = useState<'week' | 'all'>('week');
   const [customWeekStart, setCustomWeekStart] = useState<string | null>(null);
 
-  // Gemini AI 讀書建議狀態
+  // AI 讀書教練建議狀態
   const [aiAdviceResult, setAiAdviceResult] = useState<AiAdviceServiceResult | null>(null);
   const [isLoadingAi, setIsLoadingAi] = useState<boolean>(false);
   const [showAiSection, setShowAiSection] = useState<boolean>(false);
@@ -137,6 +137,15 @@ export default function PlanScreen() {
         strictError: true,
       });
 
+      const isFreshCloudAi =
+        result.success &&
+        (result.source === 'openai_ai' || result.source === 'gemini_ai') &&
+        !result.cached;
+
+      if (isFreshCloudAi) {
+        recordAiUsage();
+      }
+
       setAiAdviceResult(result);
     } catch (err: any) {
       logDiagnostic('AI_REQUEST_FAILED', {
@@ -146,7 +155,7 @@ export default function PlanScreen() {
       setAiAdviceResult({
         success: false,
         status: 'network_error',
-        source: 'gemini_ai',
+        source: 'fallback_rule_engine',
         disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
         error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
       });
@@ -254,7 +263,7 @@ export default function PlanScreen() {
           {showAiSection ? (
             <AiAdviceCard
               advice={aiAdviceResult?.advice}
-              source={aiAdviceResult?.source ?? 'gemini_ai'}
+              source={aiAdviceResult?.source ?? 'openai_ai'}
               status={aiAdviceResult?.status}
               isLoading={isLoadingAi}
               error={aiAdviceResult?.error}
@@ -287,7 +296,7 @@ export default function PlanScreen() {
                     </AppText>
                     <View style={styles.aiTagBadge}>
                       <AppText variant="caption" color={colors.primary} style={{ fontWeight: '700' }}>
-                        ✦ Gemini
+                        ✦ AI 建議
                       </AppText>
                     </View>
                   </View>

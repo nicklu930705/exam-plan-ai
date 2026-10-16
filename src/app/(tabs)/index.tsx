@@ -54,7 +54,7 @@ export default function HomeScreen() {
   const [sortByPriority, setSortByPriority] = useState<boolean>(true);
   // 使用者手動忽略的建議 ID
   const [dismissedRecIds, setDismissedRecIds] = useState<string[]>([]);
-  // Gemini AI 深度建議狀態
+  // AI 讀書教練建議狀態
   const [aiAdviceResult, setAiAdviceResult] = useState<AiAdviceServiceResult | null>(null);
   const [isLoadingAi, setIsLoadingAi] = useState<boolean>(false);
   const [showAiCard, setShowAiCard] = useState<boolean>(false);
@@ -178,7 +178,12 @@ export default function HomeScreen() {
         strictError: true,
       });
 
-      if (result.source === 'gemini_ai' && result.success) {
+      const isFreshCloudAi =
+        result.success &&
+        (result.source === 'openai_ai' || result.source === 'gemini_ai') &&
+        !result.cached;
+
+      if (isFreshCloudAi) {
         recordAiUsage();
       }
 
@@ -191,7 +196,7 @@ export default function HomeScreen() {
       setAiAdviceResult({
         success: false,
         status: 'network_error',
-        source: 'gemini_ai',
+        source: 'fallback_rule_engine',
         disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
         error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
       });
@@ -388,11 +393,11 @@ export default function HomeScreen() {
               style={({ pressed }) => [styles.aiHeaderPill, pressed && { opacity: 0.7 }]}
               hitSlop={8}
               accessibilityRole="button"
-              accessibilityLabel="取得 Gemini AI 深度讀書建議"
+              accessibilityLabel="取得 AI 讀書教練建議"
             >
               <Ionicons name="sparkles" size={12} color={colors.primary} />
               <AppText variant="caption" color={colors.primary} style={{ fontWeight: '700' }}>
-                {isLoadingAi ? 'AI 分析中...' : '✦ Gemini 深度建議'}
+                {isLoadingAi ? 'AI 分析中...' : '✦ AI 讀書建議'}
               </AppText>
             </Pressable>
           </View>
@@ -420,11 +425,11 @@ export default function HomeScreen() {
             style={({ pressed }) => [styles.aiStandaloneBtn, pressed && { opacity: 0.8 }]}
             hitSlop={8}
             accessibilityRole="button"
-            accessibilityLabel="取得 Gemini AI 深度讀書建議"
+            accessibilityLabel="取得 AI 讀書教練建議"
           >
             <Ionicons name="sparkles" size={15} color={colors.primary} />
             <AppText variant="subhead" color={colors.primary} style={{ fontWeight: '600' }}>
-              {isLoadingAi ? 'AI 分析中...' : '✦ 取得 Gemini AI 深度讀書建議'}
+              {isLoadingAi ? 'AI 分析中...' : '✦ 取得 AI 讀書建議'}
             </AppText>
           </Pressable>
         </View>

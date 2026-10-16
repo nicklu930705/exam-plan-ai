@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>客戶支援與常見問題 - 考試計畫 AI</title>
+  <style>
+    :root {
+      --bg: #F7F6F1;
+      --surface: #FFFFFF;
+      --primary: #788B73;
+      --primary-soft: #E9EEE5;
+      --text: #30332F;
+      --text-secondary: #858780;
+      --separator: #E8E7E0;
+    }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      padding: 24px 16px 48px;
+    }
+    .container {
+      max-width: 680px;
+      margin: 0 auto;
+    }
+    header {
+      margin-bottom: 24px;
+      text-align: center;
+    }
+    .badge {
+      display: inline-block;
+      background: var(--primary-soft);
+      color: var(--primary);
+      font-weight: 600;
+      padding: 4px 14px;
+      border-radius: 999px;
+      font-size: 13px;
+      margin-bottom: 12px;
+    }
+    h1 {
+      font-size: 26px;
+      font-weight: 700;
+      color: var(--text);
+      margin-bottom: 8px;
+    }
+    .subtitle {
+      font-size: 14px;
+      color: var(--text-secondary);
+    }
+    .card {
+      background: var(--surface);
+      border-radius: 14px;
+      padding: 20px 22px;
+      margin-bottom: 16px;
+      border: 1px solid var(--separator);
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.03);
+    }
+    .card h2 {
+      font-size: 17px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 10px;
+    }
+    .card p {
+      font-size: 14px;
+      color: var(--text-secondary);
+      line-height: 1.65;
+      margin-bottom: 8px;
+    }
+    .card p:last-child {
+      margin-bottom: 0;
+    }
+    .faq-item {
+      border-bottom: 1px solid var(--separator);
+      padding: 14px 0;
+    }
+    .faq-item:first-child {
+      padding-top: 0;
+    }
+    .faq-item:last-child {
+      border-bottom: none;
+      padding-bottom: 0;
+    }
+    .faq-q {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 6px;
+    }
+    .faq-a {
+      font-size: 14px;
+      color: var(--text-secondary);
+      line-height: 1.6;
+    }
+    .contact-box {
+      background: #F4F6F2;
+      border-radius: 10px;
+      padding: 16px;
+      margin-top: 12px;
+    }
+    .contact-row {
+      font-size: 14px;
+      margin-bottom: 8px;
+      color: var(--text);
+    }
+    .contact-row:last-child {
+      margin-bottom: 0;
+    }
+    .contact-label {
+      font-weight: 600;
+      color: var(--text);
+      display: inline-block;
+      min-width: 90px;
+    }
+    footer {
+      margin-top: 32px;
+      text-align: center;
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+    footer a {
+      color: var(--primary);
+      text-decoration: none;
+      font-weight: 500;
+      margin: 0 8px;
+    }
+    footer a:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="badge">考試計畫 AI 官方支援</div>
+      <h1>客戶支援與服務中心 (Support)</h1>
+      <p class="subtitle">為您的備考之路提供最即時的技術協助與回饋管道</p>
+    </header>
+
+    <!-- 關於 App -->
+    <div class="card">
+      <h2>關於「考試計畫 AI」</h2>
+      <p>「考試計畫 AI」是一款專為考生設計的智慧備考管理工具。結合確定性科學排程演算法與雲端 AI 讀書教練，協助您根據考試日期、每日研讀時間、科目弱項掌握度，自動生成專屬備考計畫與每日待辦任務，並提供專注計時與落後進度智慧平衡。</p>
+      <p style="margin-top: 6px;"><strong>目前版本：</strong>iOS 1.0.0 (TestFlight 測試階段)</p>
+    </div>
+
+    <!-- 常見問題 FAQ -->
+    <div class="card">
+      <h2>常見問題 (FAQ)</h2>
+
+      <div class="faq-item">
+        <div class="faq-q">Q1. 我的讀書資料與計畫會儲存在哪裡？會不會外洩？</div>
+        <div class="faq-a">所有的考試科目、章節進度、自訂時間與番茄鐘計時紀錄均以沙盒機制加密安全存放在您的 iPhone 本機（AsyncStorage）中。關閉或重啟 App 資料依然完整保存，絕不主動將您的私人筆記或日程同步至任何公共資料庫。</div>
+      </div>
+
+      <div class="faq-item">
+        <div class="faq-q">Q2. AI 讀書建議每日額度如何計算？何時重設？</div>
+        <div class="faq-a">免費版享有每日 3 次 AI 雲端讀書建議；Pro 與 Lifetime 方案享有每日 15 次配額。所有每日額度皆依「台北時間每日午夜 00:00:00」自動歸零重設。若當日額度用盡或處於離線狀態，系統會自動無縫切換至本機確定性規則排程，絕不中斷您的每日研讀。</div>
+      </div>
+
+      <div class="faq-item">
+        <div class="faq-q">Q3. 若我換手機或想備份資料該如何處理？</div>
+        <div class="faq-a">在目前 1.0.0 版本中，資料依隨 iPhone 系統備份。若您更換手機，請透過 iOS 整機 iCloud 或電腦 iTunes 備份進行無縫移轉。未來更新將進一步推出本機 JSON 匯出備份與雲端同步功能。</div>
+      </div>
+
+      <div class="faq-item">
+        <div class="faq-q">Q4. 如何提出功能建議或錯誤回報？</div>
+        <div class="faq-a">我們非常重視您的回饋！若在測試過程中遇到介面閃退、排程不如預期或計時器問題，歡迎隨時透過下方客服信箱提供問題截圖與 iPhone 機型，我們將盡速為您處理。</div>
+      </div>
+    </div>
+
+    <!-- 聯絡方式 -->
+    <div class="card">
+      <h2>聯絡我們 (Contact Us)</h2>
+      <p>若您遇到任何使用問題、付費諮詢或欲提出個人資料相關請求，請透過以下方式與開發者團隊聯繫：</p>
+
+      <div class="contact-box">
+        <div class="contact-row">
+          <span class="contact-label">技術支援信箱：</span>
+          <a href="mailto:examplanai.support@gmail.com" style="color: var(--primary); font-weight: 600; text-decoration: none;">examplanai.support@gmail.com</a>
+        </div>
+        <div class="contact-row">
+          <span class="contact-label">處理說明：</span>
+          <span>來信將由開發團隊依序檢視並盡速回覆，感謝您的耐心等候與寶貴回饋。</span>
+        </div>
+      </div>
+    </div>
+
+    <footer>
+      <p>© 2026 考試計畫 AI. All rights reserved.</p>
+      <p style="margin-top: 6px;">
+        <a href="/">服務狀態</a> ·
+        <a href="/support">支援服務</a> ·
+        <a href="/privacy">隱私權政策</a>
+      </p>
+    </footer>
+  </div>
+</body>
+</html>
