@@ -49,6 +49,17 @@ describe('Apple Sandbox 內購實機測試環境整合防護測試', () => {
       expect(easJson.build.sandbox.ios?.simulator).toBe(false);
     });
 
+    test('eas.json 必須包含獨立的 build["sandbox-testflight"] Profile (StoreKit TestFlight 模式)', () => {
+      const stf = easJson.build['sandbox-testflight'];
+      expect(stf).toBeDefined();
+      expect(stf.distribution).toBe('store');
+      expect(stf.ios?.simulator).toBe(false);
+      expect(stf.env.EXPO_PUBLIC_BACKEND_URL).toBe(
+        'https://exam-plan-ai-backend-sandbox.vercel.app',
+      );
+      expect(stf.env.EXPO_PUBLIC_ENABLE_IAP_SANDBOX).toBe('true');
+    });
+
     test('sandbox Profile 必須精確指向 Sandbox 後端網址並啟用 Sandbox 旗標', () => {
       const sandboxEnv = easJson.build.sandbox.env;
       expect(sandboxEnv.EXPO_PUBLIC_BACKEND_URL).toBe(
