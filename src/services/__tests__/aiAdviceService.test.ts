@@ -29,6 +29,7 @@ describe('aiAdviceService', () => {
     plan: 'pro',
     billingCycle: 'monthly',
     status: 'active',
+    expiresAt: new Date(Date.now() + 30 * 86400 * 1000).toISOString(),
   };
 
   const freeSubscription: UserSubscription = {

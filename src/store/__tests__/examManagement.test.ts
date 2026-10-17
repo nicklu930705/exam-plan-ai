@@ -111,7 +111,12 @@ describe('Exam Management (編輯、重新排程、保護歷史紀錄與刪除�
     tasks: [...sampleTasks1, ...sampleTasks2],
     selectedExamId: 'exam-1',
     preferences: samplePrefs,
-    subscription: { plan: 'pro', billingCycle: 'annual', status: 'active' },
+    subscription: {
+      plan: 'pro',
+      billingCycle: 'annual',
+      status: 'active',
+      expiresAt: new Date(Date.now() + 365 * 86400 * 1000).toISOString(),
+    },
   });
 
   // ───── 測試一：修改考試名稱並儲存（非排程變更） ─────

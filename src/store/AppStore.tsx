@@ -2,7 +2,7 @@ import React, { createContext, useContext, useEffect, useMemo, useReducer, useRe
 
 import { createDemoData } from '../data/demo';
 import { clearAppDataFromStorage, loadAppDataFromStorage, safeRestoreAppDataToStorage, saveAppDataToStorage } from '../storage';
-import { getEffectiveTier, getPlanEntitlements } from '../subscription/entitlements';
+import { getEffectiveTier, getPlanEntitlements, normalizeSubscriptionOnLoad } from '../subscription/entitlements';
 import type { BackupStudyData } from '../types/backup';
 import type { AiUsageRecord, UserSubscription } from '../subscription/types';
 import type { AppData, Exam, ISODate, StudyPreferences, StudyTask, TaskStatus } from '../types/models';
@@ -590,7 +590,7 @@ export function AppStoreProvider({
               ...saved,
               activeTimer,
               selectedExamId: effectiveSelected,
-              subscription: saved.subscription ?? DEFAULT_SUBSCRIPTION,
+              subscription: normalizeSubscriptionOnLoad(saved.subscription),
               aiUsage: saved.aiUsage ?? DEFAULT_AI_USAGE,
             },
           });
@@ -599,7 +599,7 @@ export function AppStoreProvider({
             type: 'setData',
             data: {
               ...saved,
-              subscription: saved.subscription ?? DEFAULT_SUBSCRIPTION,
+              subscription: normalizeSubscriptionOnLoad(saved.subscription),
               aiUsage: saved.aiUsage ?? DEFAULT_AI_USAGE,
             },
           });

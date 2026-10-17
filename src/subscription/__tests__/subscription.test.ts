@@ -8,7 +8,9 @@ import {
   getAiQuotaStatus,
   getEffectiveTier,
   getPlanEntitlements,
+  inspectProofToken,
   isSubscriptionActive,
+  normalizeSubscriptionOnLoad,
 } from '../entitlements';
 import { DevStoreKitService } from '../storeKitService';
 import type { AiUsageRecord, UserSubscription } from '../types';
@@ -329,6 +331,7 @@ describe('付費方案與權限控制模組 (Subscription & Entitlements)', () =
         plan: 'pro',
         billingCycle: 'monthly',
         status: 'active',
+        expiresAt: new Date(Date.now() + 30 * 86400 * 1000).toISOString(),
       };
 
       // 計算時若遇到不同月份，會視為 0 開始
@@ -343,6 +346,7 @@ describe('付費方案與權限控制模組 (Subscription & Entitlements)', () =
         plan: 'pro',
         billingCycle: 'monthly',
         status: 'active',
+        expiresAt: new Date(Date.now() + 30 * 86400 * 1000).toISOString(),
       };
       const usage: AiUsageRecord = {
         monthlyCalls: 100,
@@ -357,6 +361,299 @@ describe('付費方案與權限控制模組 (Subscription & Entitlements)', () =
 
       expect(result.source).toBe('fallback_rule_engine');
       expect(result.fallbackNote).toContain('已達上限');
+    });
+  });
+
+  describe('7. 會員有效期限與本地安全性檢驗 (Build 5 Phase 1 Security Suite)', () => {
+    const futureDate = new Date(Date.now() + 30 * 86400 * 1000).toISOString();
+    const pastDate = new Date(Date.now() - 3600 * 1000).toISOString();
+
+    const makeMockProofToken = (userId: string, originalTransactionId: string, expiresAtMs: number): string => {
+      const payload = `${userId}:${originalTransactionId}:${expiresAtMs}`;
+      const b64 = Buffer.from(payload).toString('base64url');
+      return `${b64}.mock_sha256_signature`;
+    };
+
+    test('1. 未過期且合法的 Pro 訂閱能正確取得 Pro 權限', () => {
+      const validPro: UserSubscription = {
+        plan: 'pro',
+        billingCycle: 'monthly',
+        status: 'active',
+        expiresAt: futureDate,
+        productId: 'exampro_monthly',
+        transactionId: 'txn-1001',
+      };
+      expect(isSubscriptionActive(validPro)).toBe(true);
+      expect(getEffectiveTier(validPro)).toBe('pro');
+    });
+
+    test('2. status === "active" 但 expiresAt 已過期的 Pro 訂閱，判定為非有效，有效方案退回 free', () => {
+      const expiredPro: UserSubscription = {
+        plan: 'pro',
+        billingCycle: 'monthly',
+        status: 'active', // 雖然狀態為 active，但 expiresAt 已經過去
+        expiresAt: pastDate,
+        productId: 'exampro_monthly',
+        transactionId: 'txn-1002',
+      };
+      expect(isSubscriptionActive(expiredPro)).toBe(false);
+      expect(getEffectiveTier(expiredPro)).toBe('free');
+    });
+
+    test('3. expiresAt 缺失、為空字串、或為無效日期的 Pro 訂閱，判定為非有效', () => {
+      const missingExpires: UserSubscription = {
+        plan: 'pro',
+        billingCycle: 'monthly',
+        status: 'active',
+      };
+      expect(isSubscriptionActive(missingExpires)).toBe(false);
+      expect(getEffectiveTier(missingExpires)).toBe('free');
+
+      const emptyExpires: UserSubscription = {
+        plan: 'pro',
+        billingCycle: 'monthly',
+        status: 'active',
+        expiresAt: '   ',
+      };
+      expect(isSubscriptionActive(emptyExpires)).toBe(false);
+      expect(getEffectiveTier(emptyExpires)).toBe('free');
+
+      const invalidDateExpires: UserSubscription = {
+        plan: 'pro',
+        billingCycle: 'monthly',
+        status: 'active',
+        expiresAt: 'invalid-date-string-xxx',
+      };
+      expect(isSubscriptionActive(invalidDateExpires)).toBe(false);
+      expect(getEffectiveTier(invalidDateExpires)).toBe('free');
+    });
+
+    test('4. 已取消自動續訂 (status: "canceled") 但仍在有效期的 Pro 不會被錯誤降級，到期後方降級', () => {
+      // A. 停止自動續訂但尚未到期：仍享有 Pro 權益
+      const canceledActivePro: UserSubscription = {
+        plan: 'pro',
+        billingCycle: 'monthly',
+        status: 'canceled',
+        expiresAt: futureDate,
+        productId: 'exampro_monthly',
+        transactionId: 'txn-canceled-future',
+      };
+      expect(isSubscriptionActive(canceledActivePro)).toBe(true);
+      expect(getEffectiveTier(canceledActivePro)).toBe('pro');
+
+      // 載入規範化保留 canceled 狀態，不誤降為 free
+      const normalizedCanceled = normalizeSubscriptionOnLoad(canceledActivePro);
+      expect(normalizedCanceled.status).toBe('canceled');
+      expect(getEffectiveTier(normalizedCanceled)).toBe('pro');
+
+      // B. 停止自動續訂且已經到期：正確降級為 free，狀態更新為 expired
+      const canceledExpiredPro: UserSubscription = {
+        plan: 'pro',
+        billingCycle: 'monthly',
+        status: 'canceled',
+        expiresAt: pastDate,
+        productId: 'exampro_monthly',
+        transactionId: 'txn-canceled-past',
+      };
+      expect(isSubscriptionActive(canceledExpiredPro)).toBe(false);
+      expect(getEffectiveTier(canceledExpiredPro)).toBe('free');
+
+      const normalizedExpired = normalizeSubscriptionOnLoad(canceledExpiredPro);
+      expect(normalizedExpired.status).toBe('expired');
+      expect(getEffectiveTier(normalizedExpired)).toBe('free');
+    });
+
+    test('5. 具有 revocationDate 或 status 為 revoked/refunded 的訂閱，即刻判定為非有效', () => {
+      const subWithRevocationDate: UserSubscription = {
+        plan: 'pro',
+        billingCycle: 'monthly',
+        status: 'active',
+        expiresAt: futureDate,
+        revocationDate: pastDate,
+      };
+      expect(isSubscriptionActive(subWithRevocationDate)).toBe(false);
+      expect(getEffectiveTier(subWithRevocationDate)).toBe('free');
+
+      const revokedStatusSub: UserSubscription = {
+        plan: 'pro',
+        billingCycle: 'monthly',
+        status: 'revoked',
+        expiresAt: futureDate,
+      };
+      expect(isSubscriptionActive(revokedStatusSub)).toBe(false);
+      expect(getEffectiveTier(revokedStatusSub)).toBe('free');
+
+      const refundedStatusSub: UserSubscription = {
+        plan: 'pro',
+        billingCycle: 'annual',
+        status: 'refunded',
+        expiresAt: futureDate,
+      };
+      expect(isSubscriptionActive(refundedStatusSub)).toBe(false);
+      expect(getEffectiveTier(refundedStatusSub)).toBe('free');
+
+      const revokedLifetime: UserSubscription = {
+        plan: 'lifetime',
+        billingCycle: 'lifetime',
+        status: 'revoked',
+        productId: 'exampro_lifetime',
+        transactionId: 'txn-revoked-life',
+        proofToken: makeMockProofToken('user_revoked', 'txn-revoked-life', Date.now() + 7 * 86400 * 1000),
+      };
+      expect(isSubscriptionActive(revokedLifetime)).toBe(false);
+      expect(getEffectiveTier(revokedLifetime)).toBe('free');
+    });
+
+    test('6. 偽造 Lifetime productId + transactionId 不能直接解鎖', () => {
+      // 模擬手動在 AsyncStorage 注入商品 ID 與假交易 ID，但缺乏伺服器 Proof Token
+      const fakeInjectedLifetime: UserSubscription = {
+        plan: 'lifetime',
+        billingCycle: 'lifetime',
+        status: 'active',
+        productId: 'exampro_lifetime',
+        transactionId: 'fake-transaction-id-999',
+        originalTransactionId: 'fake-transaction-id-999',
+      };
+      expect(isSubscriptionActive(fakeInjectedLifetime)).toBe(false);
+      expect(getEffectiveTier(fakeInjectedLifetime)).toBe('free');
+
+      // 啟動規範化：退回 free，但保留交易欄位供後續 StoreKit 恢復
+      const normalized = normalizeSubscriptionOnLoad(fakeInjectedLifetime);
+      expect(normalized.plan).toBe('free');
+      expect(normalized.status).toBe('none');
+      expect(normalized.productId).toBe('exampro_lifetime');
+      expect(normalized.transactionId).toBe('fake-transaction-id-999');
+      expect(getEffectiveTier(normalized)).toBe('free');
+    });
+
+    test('7. 偽造或過期 Proof Token 不能成為授權依據', () => {
+      // A. 隨意字串偽造 Token
+      expect(inspectProofToken('invalid_malformed_token_string').valid).toBe(false);
+      const fakeTokenLifetime: UserSubscription = {
+        plan: 'lifetime',
+        billingCycle: 'lifetime',
+        status: 'active',
+        productId: 'exampro_lifetime',
+        transactionId: 'txn-123',
+        originalTransactionId: 'txn-123',
+        proofToken: 'invalid_malformed_token_string',
+      };
+      expect(isSubscriptionActive(fakeTokenLifetime)).toBe(false);
+      expect(getEffectiveTier(fakeTokenLifetime)).toBe('free');
+
+      // B. 已過期 Proof Token
+      const expiredToken = makeMockProofToken('user_exp', 'txn-123', Date.now() - 1000);
+      const expiredInspection = inspectProofToken(expiredToken);
+      expect(expiredInspection.valid).toBe(false);
+      expect(expiredInspection.reason).toContain('逾期');
+      const expiredTokenLifetime: UserSubscription = {
+        plan: 'lifetime',
+        billingCycle: 'lifetime',
+        status: 'active',
+        productId: 'exampro_lifetime',
+        transactionId: 'txn-123',
+        originalTransactionId: 'txn-123',
+        proofToken: expiredToken,
+      };
+      expect(isSubscriptionActive(expiredTokenLifetime)).toBe(false);
+      expect(getEffectiveTier(expiredTokenLifetime)).toBe('free');
+
+      // C. 交易識別碼不相符的 Token (盜用他人收據 Token)
+      const mismatchedToken = makeMockProofToken('user_other', 'different-txn-id', Date.now() + 7 * 86400 * 1000);
+      const mismatchedLifetime: UserSubscription = {
+        plan: 'lifetime',
+        billingCycle: 'lifetime',
+        status: 'active',
+        productId: 'exampro_lifetime',
+        transactionId: 'txn-123',
+        originalTransactionId: 'txn-123',
+        proofToken: mismatchedToken,
+      };
+      expect(isSubscriptionActive(mismatchedLifetime)).toBe(false);
+      expect(getEffectiveTier(mismatchedLifetime)).toBe('free');
+    });
+
+    test('8. 有效 Lifetime 經可信任流程（含合法 Proof Token 或開發預覽）取得權益，不受 expiresAt 限制', () => {
+      // 正式 / Sandbox 驗證流程所產生的合格 Lifetime
+      const legitToken = makeMockProofToken('client_dev_1', 'txn-life-valid-1', Date.now() + 7 * 86400 * 1000);
+      const legitInspection = inspectProofToken(legitToken);
+      expect(legitInspection.valid).toBe(true);
+      expect(legitInspection.originalTransactionId).toBe('txn-life-valid-1');
+      const verifiedStoreKitLifetime: UserSubscription = {
+        plan: 'lifetime',
+        billingCycle: 'lifetime',
+        status: 'active',
+        productId: 'exampro_lifetime',
+        transactionId: 'txn-life-valid-1',
+        originalTransactionId: 'txn-life-valid-1',
+        purchaseDate: new Date(Date.now() - 86400 * 1000).toISOString(),
+        proofToken: legitToken,
+      };
+      expect(isSubscriptionActive(verifiedStoreKitLifetime)).toBe(true);
+      expect(getEffectiveTier(verifiedStoreKitLifetime)).toBe('lifetime');
+
+      // 開發測試模式
+      const devVerifiedLifetime: UserSubscription = {
+        plan: 'lifetime',
+        billingCycle: 'lifetime',
+        status: 'active',
+        isDevPreview: true,
+      };
+      expect(isSubscriptionActive(devVerifiedLifetime)).toBe(true);
+      expect(getEffectiveTier(devVerifiedLifetime)).toBe('lifetime');
+    });
+
+    test('9. 系統時間異常（時鐘往回撥：目前時間小於購買時間）時的安全防護', () => {
+      const futurePurchaseDate = new Date(Date.now() + 365 * 86400 * 1000).toISOString();
+      const farFutureExpires = new Date(Date.now() + 400 * 86400 * 1000).toISOString();
+
+      const clockRollbackPro: UserSubscription = {
+        plan: 'pro',
+        billingCycle: 'monthly',
+        status: 'active',
+        purchaseDate: futurePurchaseDate,
+        expiresAt: farFutureExpires,
+        productId: 'exampro_monthly',
+        transactionId: 'txn-clock-rollback',
+      };
+      expect(isSubscriptionActive(clockRollbackPro)).toBe(false);
+      expect(getEffectiveTier(clockRollbackPro)).toBe('free');
+    });
+
+    test('10. App 啟動載入已過期快取時，狀態正確退回 free，現有考試資料與舊訂閱紀錄絕不被破壞', () => {
+      const staleExpiredPro: UserSubscription = {
+        plan: 'pro',
+        billingCycle: 'monthly',
+        status: 'active',
+        expiresAt: pastDate,
+        productId: 'exampro_monthly',
+        transactionId: 'txn-old-stale',
+        originalTransactionId: 'txn-orig-stale',
+        purchaseDate: new Date(Date.now() - 30 * 86400 * 1000).toISOString(),
+      };
+
+      const normalized = normalizeSubscriptionOnLoad(staleExpiredPro);
+
+      expect(normalized.status).toBe('expired');
+      expect(normalized.plan).toBe('pro');
+      expect(normalized.productId).toBe('exampro_monthly');
+      expect(normalized.transactionId).toBe('txn-old-stale');
+      expect(normalized.originalTransactionId).toBe('txn-orig-stale');
+      expect(normalized.expiresAt).toBe(pastDate);
+      expect(getEffectiveTier(normalized)).toBe('free');
+
+      // 檢查考試資料完整性：退回 free 時絕不影響使用者的考試列表
+      const userExams = [
+        createDummyExam('exam-1', '高考會計'),
+        createDummyExam('exam-2', '證券分析師'),
+      ];
+      const data = baseAppData({
+        subscription: normalized,
+        exams: userExams,
+      });
+      expect(data.exams.length).toBe(2);
+      expect(data.exams[0].name).toBe('高考會計');
+      expect(data.exams[1].name).toBe('證券分析師');
     });
   });
 });

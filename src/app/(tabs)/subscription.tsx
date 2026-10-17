@@ -63,8 +63,7 @@ export default function SubscriptionScreen() {
     if (product.tier === 'pro') {
       return (
         currentTier === 'pro' &&
-        currentSub?.billingCycle === product.period &&
-        currentSub?.status === 'active'
+        currentSub?.billingCycle === product.period
       );
     }
     return false;
@@ -330,7 +329,9 @@ export default function SubscriptionScreen() {
               {currentTier === 'lifetime'
                 ? '永久授權'
                 : currentTier === 'pro'
-                  ? '有效訂閱中'
+                  ? currentSub?.status === 'canceled'
+                    ? '已取消續訂（效期內有效）'
+                    : '有效訂閱中'
                   : '免費體驗中'}
             </AppText>
           </View>
@@ -339,6 +340,11 @@ export default function SubscriptionScreen() {
         {currentSub?.expiresAt && currentTier === 'pro' && (
           <AppText secondary style={styles.expiresText}>
             有效期限至：{new Date(currentSub.expiresAt).toLocaleDateString()}
+          </AppText>
+        )}
+        {currentSub?.status === 'expired' && currentTier === 'free' && currentSub?.expiresAt && (
+          <AppText secondary style={styles.expiresText}>
+            先前訂閱已於 {new Date(currentSub.expiresAt).toLocaleDateString()} 到期（功能已切換回免費版）
           </AppText>
         )}
 
