@@ -3,6 +3,12 @@
  * 集中管理所有 In-App Purchase 產品 ID，避免在程式碼各處寫死不同字串。
  */
 
+import {
+  isIapSandboxConfigured,
+  isSandboxEnvironmentValid,
+  SANDBOX_BACKEND_URL,
+} from '../storage';
+
 export const STOREKIT_PRODUCT_IDS = {
   MONTHLY: 'exampro_monthly',
   YEARLY: 'exampro_yearly',
@@ -41,6 +47,22 @@ export const NON_CONSUMABLE_SKUS: readonly string[] = [
  */
 export const APPLE_MANAGE_SUBSCRIPTIONS_URL =
   'https://apps.apple.com/account/subscriptions';
+
+export {
+  isIapSandboxConfigured,
+  isSandboxEnvironmentValid,
+  SANDBOX_BACKEND_URL,
+};
+
+/**
+ * 檢查是否允許進入 Apple Sandbox 內購實機測試流程
+ * 條件：
+ * 1. process.env.EXPO_PUBLIC_ENABLE_IAP_SANDBOX === 'true'
+ * 2. process.env.EXPO_PUBLIC_BACKEND_URL 規範化後嚴格符合 SANDBOX_BACKEND_URL
+ */
+export function isSandboxIapAllowed(): boolean {
+  return isSandboxEnvironmentValid();
+}
 
 /**
  * 檢查給定的 ID 是否為合法的 StoreKit 產品 ID

@@ -12,6 +12,7 @@ import {
   getBackendUrlFromStorage,
   getOrCreateClientDeviceId,
   getStoredProofToken,
+  isIapSandboxConfigured,
 } from '../storage';
 import { checkAiAccess, getAiQuotaStatus } from '../subscription/entitlements';
 import type { AiQuotaStatus, AiUsageRecord, UserSubscription } from '../subscription/types';
@@ -425,8 +426,12 @@ export async function requestAiStudyAdvice(
         status: 'error',
         source: 'fallback_rule_engine',
         quotaStatus,
-        disclaimer: '尚未設定 AI 雲端伺服器網址。',
-        error: '尚未設定 AI 雲端伺服器網址，請在「設定 > AI 雲端服務」確認。',
+        disclaimer: isIapSandboxConfigured()
+          ? 'Sandbox 測試環境後端網址不合規。'
+          : '尚未設定 AI 雲端伺服器網址。',
+        error: isIapSandboxConfigured()
+          ? 'Sandbox 測試環境後端網址設定不合規，已安全阻斷連線。'
+          : '尚未設定 AI 雲端伺服器網址，請在「設定 > AI 雲端服務」確認。',
       };
     }
     const localAdvice = generateLocalRuleAdvice(request);

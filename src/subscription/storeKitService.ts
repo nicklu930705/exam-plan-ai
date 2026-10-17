@@ -3,6 +3,7 @@ import {
   clearStoredProofToken,
   getBackendUrlFromStorage,
   getOrCreateClientDeviceId,
+  isIapSandboxConfigured,
   saveStoredProofToken,
 } from '../storage';
 import {
@@ -119,6 +120,12 @@ export class ServerSideTransactionValidator implements ITransactionValidator {
     try {
       const baseUrl = this.customApiEndpoint || (await getBackendUrlFromStorage());
       if (!baseUrl) {
+        if (isIapSandboxConfigured()) {
+          return {
+            valid: false,
+            reason: 'Sandbox 測試環境後端網址設定不合規，已安全阻斷交易驗證。',
+          };
+        }
         return { valid: false, reason: '未配置伺服器驗證端點，請確認網路連線。' };
       }
 

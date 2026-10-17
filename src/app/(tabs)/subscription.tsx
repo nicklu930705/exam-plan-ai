@@ -15,7 +15,11 @@ import { ScreenHeader } from '../../components/ScreenHeader';
 import { useAppStore } from '../../store/AppStore';
 import { getEffectiveTier, getPlanEntitlements } from '../../subscription/entitlements';
 import { SUBSCRIPTION_PRODUCTS } from '../../subscription/products';
-import { STOREKIT_PRODUCT_IDS } from '../../subscription/storeKitConfig';
+import {
+  isIapSandboxConfigured,
+  isSandboxIapAllowed,
+  STOREKIT_PRODUCT_IDS,
+} from '../../subscription/storeKitConfig';
 import { storeKitService, type StoreStatus } from '../../subscription/storeKitService';
 import type { PlanTier, ProductDefinition, UserSubscription } from '../../subscription/types';
 import { colors, radius, shadow, spacing } from '../../theme';
@@ -42,6 +46,11 @@ export default function SubscriptionScreen() {
 
   const [isLoading, setIsLoading] = useState(false);
   const [isRestoring, setIsRestoring] = useState(false);
+
+  // Apple IAP 沙盒環境狀態檢查
+  const isSandboxConfigured = isIapSandboxConfigured();
+  const isSandboxAllowed = isSandboxIapAllowed();
+  const isSandboxMisconfigured = isSandboxConfigured && !isSandboxAllowed;
 
   // 判斷該商品是否為使用者目前正在生效的方案
   const isProductCurrent = (product: ProductDefinition) => {
@@ -98,8 +107,17 @@ export default function SubscriptionScreen() {
 
   // 處理方案購買流程
   const handlePurchase = async () => {
-    // TestFlight 首次測試版安全防護：付費交易驗證尚未完成前，停用正式版付費入口
-    if (!__DEV__ && selectedProduct.tier !== 'free') {
+    // 1. 若宣告啟用 Sandbox 但環境不合規（如 URL 未設或誤指正式環境），安全阻斷
+    if (isSandboxMisconfigured) {
+      Alert.alert(
+        'Sandbox 環境設定錯誤',
+        '此建置宣告啟用 Sandbox 內購測試，但後端網址未設定或不符合指定之 Sandbox URL，已安全阻斷購買，絕不連線至正式後端。',
+      );
+      return;
+    }
+
+    // 2. 一般正式版安全防護：未在開發環境且非合規 Sandbox 測試版時，停用付費購買入口
+    if (!__DEV__ && !isSandboxAllowed && selectedProduct.tier !== 'free') {
       Alert.alert(
         '尚未開放付費購買',
         '目前為 TestFlight 測試預覽版本，付費功能暫未開放。所有核心讀書計畫排程、計時器、進度追蹤與 AI 讀書建議皆可免費完整體驗！',
@@ -132,8 +150,17 @@ export default function SubscriptionScreen() {
 
   // 處理恢復購買 (Restore Purchases)
   const handleRestore = async () => {
-    // TestFlight 首次測試版安全防護：付費功能尚未正式開放時提示使用者
-    if (!__DEV__) {
+    // 1. 若宣告啟用 Sandbox 但環境不合規，安全阻斷
+    if (isSandboxMisconfigured) {
+      Alert.alert(
+        'Sandbox 環境設定錯誤',
+        '此建置宣告啟用 Sandbox 內購測試，但後端網址未設定或不符合指定之 Sandbox URL，已安全阻斷恢復購買。',
+      );
+      return;
+    }
+
+    // 2. 一般正式版安全防護：未在開發環境且非合規 Sandbox 測試版時提示使用者
+    if (!__DEV__ && !isSandboxAllowed) {
       Alert.alert(
         '尚未開放付費功能',
         '目前 TestFlight 版本尚未開放付費購買，暫無可恢復的 App Store 訂閱紀錄。',
@@ -474,8 +501,42 @@ export default function SubscriptionScreen() {
         />
       </View>
 
-      {/* TestFlight 測試版安全說明卡片（僅非開發環境顯示） */}
-      {!__DEV__ && (
+      {/* 依建置環境顯示對應說明卡片 */}
+      {isSandboxAllowed ? (
+        <View style={styles.sandboxNoticeCard}>
+          <View style={styles.sandboxNoticeHeader}>
+            <Ionicons
+              name="flask"
+              size={18}
+              color="#B45309"
+              style={{ marginRight: 6 }}
+            />
+            <AppText style={styles.sandboxNoticeTitle}>
+              Apple StoreKit 2 沙盒測試環境
+            </AppText>
+          </View>
+          <AppText secondary style={styles.sandboxNoticeText}>
+            本版本已連線至獨立 Sandbox 驗證伺服器，並啟用 StoreKit 2 測試購買。請使用 Apple Sandbox 測試帳號驗證交易，不會產生任何真實扣款。
+          </AppText>
+        </View>
+      ) : isSandboxMisconfigured ? (
+        <View style={styles.sandboxErrorNoticeCard}>
+          <View style={styles.sandboxNoticeHeader}>
+            <Ionicons
+              name="warning"
+              size={18}
+              color={colors.danger}
+              style={{ marginRight: 6 }}
+            />
+            <AppText style={[styles.sandboxNoticeTitle, { color: colors.danger }]}>
+              Sandbox 環境設定異常
+            </AppText>
+          </View>
+          <AppText secondary style={[styles.sandboxNoticeText, { color: colors.danger }]}>
+            已開啟 Sandbox 測試旗標，但後端網址不符合指定之 Sandbox URL。為防止污染正式環境，系統已全面阻斷所有購買與 API 請求。
+          </AppText>
+        </View>
+      ) : !__DEV__ ? (
         <View style={styles.testFlightNoticeCard}>
           <View style={styles.testFlightNoticeHeader}>
             <Ionicons
@@ -492,7 +553,7 @@ export default function SubscriptionScreen() {
             目前為 TestFlight 測試預覽版本，付費方案暫未開放購買。所有核心讀書計畫排程、計時器、任務進度追蹤與 AI 讀書建議皆可免費完整體驗！
           </AppText>
         </View>
-      )}
+      ) : null}
 
       {/* 購買與管理操作按鈕 */}
       <View style={styles.actionContainer}>
@@ -500,11 +561,15 @@ export default function SubscriptionScreen() {
           title={
             isLoading
               ? '處理中...'
-              : !__DEV__ && selectedProduct.tier !== 'free'
-                ? 'TestFlight 測試階段・暫未開放購買'
-                : isSelectedProductCurrent
-                  ? '目前已是此方案'
-                  : `以 ${selectedProduct.priceFormatted} 切換方案`
+              : isSandboxMisconfigured
+                ? 'Sandbox 設定錯誤・已安全阻斷'
+                : !__DEV__ && !isSandboxAllowed && selectedProduct.tier !== 'free'
+                  ? 'TestFlight 測試階段・暫未開放購買'
+                  : isSelectedProductCurrent
+                    ? '目前已是此方案'
+                    : isSandboxAllowed
+                      ? `以 ${selectedProduct.priceFormatted} 測試購買方案`
+                      : `以 ${selectedProduct.priceFormatted} 切換方案`
           }
           loading={isLoading}
           onPress={handlePurchase}
@@ -512,7 +577,8 @@ export default function SubscriptionScreen() {
             isLoading ||
             isRestoring ||
             isSelectedProductCurrent ||
-            (!__DEV__ && selectedProduct.tier !== 'free')
+            isSandboxMisconfigured ||
+            (!__DEV__ && !isSandboxAllowed && selectedProduct.tier !== 'free')
           }
           style={styles.mainActionButton}
         />
@@ -723,6 +789,37 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 18,
     color: colors.textSecondary,
+  },
+  sandboxNoticeCard: {
+    backgroundColor: '#FEF9EE',
+    borderRadius: radius.md,
+    padding: spacing.md,
+    marginBottom: spacing.lg,
+    borderWidth: 1,
+    borderColor: '#FDE68A',
+  },
+  sandboxErrorNoticeCard: {
+    backgroundColor: '#FEF2F2',
+    borderRadius: radius.md,
+    padding: spacing.md,
+    marginBottom: spacing.lg,
+    borderWidth: 1,
+    borderColor: '#FECACA',
+  },
+  sandboxNoticeHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  sandboxNoticeTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#B45309',
+  },
+  sandboxNoticeText: {
+    fontSize: 12,
+    lineHeight: 18,
+    color: '#92400E',
   },
   statusNoticeHeader: {
     flexDirection: 'row',

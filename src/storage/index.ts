@@ -185,6 +185,7 @@ export async function clearAppDataFromStorage(): Promise<void> {
 const BACKEND_URL_KEY = '@exam_plan_ai:backend_url';
 
 export const DEFAULT_BACKEND_URL = 'https://exam-plan-ai-backend-coral.vercel.app';
+export const SANDBOX_BACKEND_URL = 'https://exam-plan-ai-backend-sandbox.vercel.app';
 
 export function normalizeBackendUrl(url: string | null | undefined): string | null {
   if (!url) return null;
@@ -196,6 +197,33 @@ export function normalizeBackendUrl(url: string | null | undefined): string | nu
   return trimmed;
 }
 
+const ENV_KEY_SANDBOX = ['EXPO_PUBLIC', 'ENABLE_IAP_SANDBOX'].join('_');
+const ENV_KEY_BACKEND = ['EXPO_PUBLIC', 'BACKEND_URL'].join('_');
+
+/**
+ * 檢查當前建置是否宣告啟用 Apple IAP 沙盒測試旗標
+ */
+export function isIapSandboxConfigured(): boolean {
+  return (
+    process.env[ENV_KEY_SANDBOX] === 'true' ||
+    process.env.EXPO_PUBLIC_ENABLE_IAP_SANDBOX === 'true'
+  );
+}
+
+/**
+ * 檢查當前建置之沙盒環境是否合法合規：
+ * 必須同時滿足：
+ * 1. EXPO_PUBLIC_ENABLE_IAP_SANDBOX === 'true'
+ * 2. EXPO_PUBLIC_BACKEND_URL 經規範化後完全符合官方指定的 SANDBOX_BACKEND_URL
+ */
+export function isSandboxEnvironmentValid(): boolean {
+  if (!isIapSandboxConfigured()) return false;
+  const rawUrl =
+    process.env[ENV_KEY_BACKEND] ?? process.env.EXPO_PUBLIC_BACKEND_URL;
+  const envUrl = normalizeBackendUrl(rawUrl);
+  return envUrl === SANDBOX_BACKEND_URL;
+}
+
 export async function getBackendUrlFromStorage(allowDefault: boolean = true): Promise<string | null> {
   try {
     // 正式版僅連線至正式生產後端（或建置時環境變數），防止舊版儲存的自訂未知網址造成連線風險
@@ -204,13 +232,33 @@ export async function getBackendUrlFromStorage(allowDefault: boolean = true): Pr
     if (saved) {
       await AsyncStorage.removeItem(BACKEND_URL_KEY);
     }
-    // 環境變數預設值（非機密之 API 伺服器端點，嚴禁放入任何 API 金鑰）
-    const envUrl = process.env.EXPO_PUBLIC_BACKEND_URL;
+
+    const rawUrl =
+      process.env[ENV_KEY_BACKEND] ?? process.env.EXPO_PUBLIC_BACKEND_URL;
+    const envUrl = normalizeBackendUrl(rawUrl);
+
+    // 若建置宣告為 Sandbox 測試版
+    if (isIapSandboxConfigured()) {
+      if (envUrl === SANDBOX_BACKEND_URL) {
+        return SANDBOX_BACKEND_URL;
+      }
+      // 若宣告為 Sandbox 但環境變數缺失、為空或錯誤（例如指向了正式後端或其他未知網址），
+      // 必須安全拒絕發送 API 請求，絕不可自動回退到正式後端！
+      console.warn(
+        '[Storage] Sandbox 建置宣告啟用，但 EXPO_PUBLIC_BACKEND_URL 未設定或不符合指定之 Sandbox URL，已安全阻斷。',
+      );
+      return null;
+    }
+
+    // 一般正式建置流程
     if (envUrl && envUrl.trim().length > 0) {
-      return normalizeBackendUrl(envUrl);
+      return envUrl;
     }
     return allowDefault ? DEFAULT_BACKEND_URL : null;
   } catch {
+    if (isIapSandboxConfigured()) {
+      return null;
+    }
     return allowDefault ? DEFAULT_BACKEND_URL : null;
   }
 }
