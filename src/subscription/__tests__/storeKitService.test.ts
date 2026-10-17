@@ -12,6 +12,12 @@ import {
   ServerSideTransactionValidator,
 } from '../storeKitService';
 
+// 模擬 AsyncStorage
+jest.mock('@react-native-async-storage/async-storage', () =>
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  require('@react-native-async-storage/async-storage/jest/async-storage-mock'),
+);
+
 describe('StoreKit 2 與 Apple 內購系統核心邏輯', () => {
   describe('1. 產品 ID 集中管理與合法性檢驗', () => {
     test('包含指定的三種產品 ID 常數', () => {
@@ -199,10 +205,65 @@ describe('StoreKit 2 與 Apple 內購系統核心邏輯', () => {
       expect(resRevoked.reason).toContain('撤銷或退款');
     });
 
-    test('ServerSideTransactionValidator 支援預留之遠端驗證端點', async () => {
+    test('ServerSideTransactionValidator 支援預留之遠端驗證端點與 JWS 處理', async () => {
       const serverValidator = new ServerSideTransactionValidator('https://api.examplanai.com');
-      const res = await serverValidator.validate({ productId: 'exampro_monthly', id: '123' });
-      expect(res.valid).toBe(true);
+
+      // 1. 開發模式下無 JWS 之平滑回退
+      const resDev = await serverValidator.validate({ productId: 'exampro_monthly', id: '123' });
+      expect(resDev.valid).toBe(true);
+
+      // 2. 有 JWS 時模擬後端 /api/verify-transaction 成功回應
+      const originalFetch = global.fetch;
+      try {
+        global.fetch = jest.fn().mockResolvedValue({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            success: true,
+            tier: 'pro',
+            status: 'active',
+            productId: 'exampro_yearly',
+            originalTransactionId: 'orig_123',
+            proofToken: 'mock_proof_token_123',
+          }),
+        } as any);
+
+        const resServer = await serverValidator.validate({
+          productId: 'exampro_yearly',
+          id: 'txn_999',
+          purchaseToken: 'mock_signed_jws_string',
+        });
+
+        expect(resServer.valid).toBe(true);
+        expect(resServer.tier).toBe('pro');
+        expect(resServer.proofToken).toBe('mock_proof_token_123');
+        expect(resServer.originalTransactionId).toBe('orig_123');
+
+        // 3. 模擬後端回傳退款 (revoked) 狀態
+        global.fetch = jest.fn().mockResolvedValue({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            success: false,
+            code: 'TRANSACTION_REVOKED',
+            status: 'revoked',
+            tier: 'free',
+            error: '此交易已被 Apple 撤銷或退款。',
+          }),
+        } as any);
+
+        const resRevoked = await serverValidator.validate({
+          productId: 'exampro_yearly',
+          id: 'txn_999',
+          purchaseToken: 'mock_revoked_jws_string',
+        });
+
+        expect(resRevoked.valid).toBe(false);
+        expect(resRevoked.status).toBe('revoked');
+        expect(resRevoked.reason).toContain('撤銷或退款');
+      } finally {
+        global.fetch = originalFetch;
+      }
     });
   });
 

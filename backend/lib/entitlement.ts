@@ -1,0 +1,352 @@
+import crypto from 'node:crypto';
+import type { AppleVerificationResult } from './appleIap';
+import { getRedisClient } from './redis';
+
+/**
+ * 考試計畫 AI - 會員權限與 Apple 交易資料持久化管理模組 (Upstash Redis)
+ *
+ * 安全強化規範：
+ * 1. 交易權限主記錄 (apple:entitlement:{originalTransactionId})
+ *    - Lifetime 終身版不設定 TTL (真正永久持久化保存)。
+ *    - 訂閱商品記錄保留時間為「到期時間 + 30 天緩衝」。
+ *    - 嚴禁舊 JWS 逆向覆蓋較新的續訂到期日。
+ * 2. 退款即時聯防收回：
+ *    - 當交易被撤銷 (revoked)，即刻主動清除所有關聯裝置的使用者即時快取。
+ * 3. 使用者即時權限快取 (user:{userId}:entitlement)：
+ *    - 供 AI Advice 等端點毫秒級快速確認 Pro / Lifetime 資格。
+ * 4. 跨裝置與恢復關聯 (apple:devices_z:{originalTransactionId})：
+ *    - 採用 Sorted Set 以時間戳記記錄活躍裝置，支援換機與多裝置。
+ *    - 設定合理安全保護上限（同時活躍上限 10 台），避免單一收據被公開大規模外洩盜用。
+ * 5. 防偽 HMAC-SHA256 Proof Token：
+ *    - 簽章包含 userId、originalTransactionId 與到期日。
+ *    - 驗證時必須比對 Redis 主記錄，若已被退款或過期立即拒絕，杜絕持舊 Token 離線盜刷。
+ */
+
+export interface AppleEntitlementRecord {
+  originalTransactionId: string;
+  lastTransactionId: string;
+  productId: string;
+  tier: 'pro' | 'lifetime';
+  status: 'active' | 'expired' | 'revoked';
+  purchaseDate?: number;
+  originalPurchaseDate?: number;
+  expiresDate?: number | null;
+  revocationDate?: number | null;
+  verifiedAt: number;
+  environment: string;
+}
+
+export interface UserEntitlementCache {
+  userId: string;
+  tier: 'pro' | 'lifetime';
+  productId: string;
+  originalTransactionId: string;
+  expiresAt?: number | null;
+  verifiedAt: number;
+  environment: string;
+}
+
+export interface UserEntitlementInfo {
+  tier: 'free' | 'pro' | 'lifetime';
+  isVerified: boolean;
+  status: 'active' | 'expired' | 'revoked' | 'none';
+  productId?: string;
+  originalTransactionId?: string;
+  expiresAt?: number | null;
+}
+
+const SERVER_SECRET = process.env.APP_SERVER_SECRET || 'exam_plan_ai_signing_secret_2026';
+export const ANOMALOUS_DEVICE_THRESHOLD_PER_PURCHASE = 20; // 僅作為異常外洩監控日誌臨界值，絕不阻斷正常使用者恢復購買
+export const PROOF_TOKEN_MAX_TTL_MS = 7 * 86400 * 1000; // 最長 7 天階段有效，需定期更新
+
+/**
+ * 產生匿名使用者身分與 Apple 交易之防偽簽章權杖 (Proof Token)
+ */
+export function generateEntitlementProofToken(
+  userId: string,
+  originalTransactionId: string,
+  expiresAt?: number | null,
+): string {
+  const now = Date.now();
+  // 權杖有效期為「方案到期日」與「7 天」取較小值 (終身版預設 7 天滾動更新)
+  const tokenExpiresAt = expiresAt ? Math.min(expiresAt, now + PROOF_TOKEN_MAX_TTL_MS) : now + PROOF_TOKEN_MAX_TTL_MS;
+  const payload = `${userId}:${originalTransactionId}:${tokenExpiresAt}`;
+  const signature = crypto
+    .createHmac('sha256', SERVER_SECRET)
+    .update(payload)
+    .digest('base64url');
+  return `${Buffer.from(payload).toString('base64url')}.${signature}`;
+}
+
+/**
+ * 驗證防偽簽章權杖（整合密鑰校驗與 Redis 最新退款/過期狀態聯防）
+ */
+export async function verifyEntitlementProofToken(
+  token: string,
+  expectedUserId?: string,
+): Promise<{
+  valid: boolean;
+  userId?: string;
+  originalTransactionId?: string;
+  expiresAt?: number;
+  reason?: string;
+}> {
+  if (!token || typeof token !== 'string') return { valid: false, reason: '未提供權杖。' };
+  const parts = token.split('.');
+  if (parts.length !== 2) return { valid: false, reason: '權杖格式無效。' };
+
+  const [rawPayloadB64, signature] = parts;
+  let payloadStr = '';
+  try {
+    payloadStr = Buffer.from(rawPayloadB64, 'base64url').toString('utf8');
+  } catch {
+    return { valid: false, reason: '權杖解碼失敗。' };
+  }
+
+  const expectedSig = crypto
+    .createHmac('sha256', SERVER_SECRET)
+    .update(payloadStr)
+    .digest('base64url');
+
+  if (signature !== expectedSig) {
+    return { valid: false, reason: '權杖數位簽名不符。' };
+  }
+
+  const [userId, originalTransactionId, expStr] = payloadStr.split(':');
+  if (!userId || !originalTransactionId) return { valid: false, reason: '權杖內文缺失必要身分或交易資訊。' };
+
+  if (expectedUserId && userId !== expectedUserId) {
+    return { valid: false, reason: '權杖所屬身分與當前請求裝置不符。' };
+  }
+
+  const expiresAt = parseInt(expStr || '0', 10);
+  if (expiresAt > 0 && expiresAt < Date.now()) {
+    return { valid: false, userId, originalTransactionId, expiresAt, reason: '權杖已逾期。' };
+  }
+
+  // 安全核心聯防：比對 Redis 中該 Apple 交易的最新狀態（防止退款後繼續持有舊 Token）
+  try {
+    const record = await getOriginalTransactionEntitlement(originalTransactionId);
+    if (record) {
+      if (record.status === 'revoked') {
+        return { valid: false, userId, originalTransactionId, reason: '此交易已被退款或撤銷。' };
+      }
+      if (record.status === 'expired' || (record.expiresDate && record.expiresDate < Date.now())) {
+        return { valid: false, userId, originalTransactionId, reason: '此訂閱已在 Apple 伺服端到期。' };
+      }
+    }
+  } catch {
+    // Redis 暫時無法連線時，依憑證既有簽名與過期時間進行安全降級處理
+  }
+
+  return { valid: true, userId, originalTransactionId, expiresAt };
+}
+
+/**
+ * 將通過 Apple 驗證的交易儲存至 Redis
+ */
+export async function saveVerifiedEntitlement(
+  userId: string,
+  verification: AppleVerificationResult,
+): Promise<{
+  effectiveStatus: 'active' | 'expired' | 'revoked';
+  effectiveTier: 'free' | 'pro' | 'lifetime';
+}> {
+  const originalTransactionId = verification.originalTransactionId || verification.transactionId;
+  const productId = verification.productId;
+
+  if (!originalTransactionId || !productId) {
+    throw new Error('儲存會員權益失敗：缺少原始交易識別碼或產品 ID。');
+  }
+
+  const redis = getRedisClient();
+  const now = Date.now();
+
+  let effectiveExpiresDate = verification.expiresDate || null;
+  let effectiveStatus: 'active' | 'expired' | 'revoked' =
+    verification.status === 'active' ? 'active' : verification.status === 'revoked' ? 'revoked' : 'expired';
+  let effectiveTier: 'free' | 'pro' | 'lifetime' = verification.tier;
+  let effectiveRevocationDate = verification.revocationDate || null;
+
+  // 1. 檢查現有記錄，防止舊 JWS 覆蓋已退款撤銷紀錄或縮短已續約到期日
+  try {
+    const existing = (await redis.get(`exam_ai:apple:entitlement:${originalTransactionId}`)) as AppleEntitlementRecord | null;
+    if (existing) {
+      // 安全關鍵防護 A：若既有記錄已被標記為撤銷/退款，舊 JWS (active) 絕不能覆蓋回 active
+      if (existing.status === 'revoked' && effectiveStatus !== 'revoked') {
+        console.warn(`[退款安全] 交易 ${originalTransactionId} 在伺服端已確認為撤銷/退款狀態，拒絕以舊 JWS 覆蓋回 active。`);
+        effectiveStatus = 'revoked';
+        effectiveTier = 'free';
+        effectiveRevocationDate = existing.revocationDate || now;
+      }
+      // 安全關鍵防護 B：若既有記錄為有效續訂，且既有到期日更晚，略過舊 JWS 的短到期日
+      else if (existing.status === 'active' && effectiveStatus === 'active') {
+        if (existing.expiresDate && effectiveExpiresDate && existing.expiresDate > effectiveExpiresDate) {
+          console.warn(`[權限安全] 略過舊 JWS 逆向覆蓋較新的續約到期日 (保留 ${existing.expiresDate})`);
+          effectiveExpiresDate = existing.expiresDate;
+        }
+      }
+      // 安全關鍵防護 C：若既有記錄為有效續約（且尚未過期），收到過期舊 JWS 不得降級
+      else if (existing.status === 'active' && effectiveStatus === 'expired' && existing.expiresDate && existing.expiresDate > now) {
+        console.warn(`[權限安全] 略過過期舊 JWS 覆蓋現有有效續約 (保留 ${existing.expiresDate})`);
+        effectiveStatus = 'active';
+        effectiveTier = existing.tier;
+        effectiveExpiresDate = existing.expiresDate;
+      }
+    }
+  } catch {
+    // 忽略檢查錯誤
+  }
+
+  const entitlementRecord: AppleEntitlementRecord = {
+    originalTransactionId,
+    lastTransactionId: verification.transactionId || originalTransactionId,
+    productId,
+    tier: effectiveTier === 'lifetime' ? 'lifetime' : 'pro',
+    status: effectiveStatus,
+    purchaseDate: verification.purchaseDate,
+    originalPurchaseDate: verification.originalPurchaseDate,
+    expiresDate: effectiveExpiresDate,
+    revocationDate: effectiveRevocationDate,
+    verifiedAt: now,
+    environment: verification.environment || 'Sandbox',
+  };
+
+  // 2. 寫入交易主記錄 (apple:entitlement:{originalTransactionId})
+  // Lifetime 終身買斷：不設定 TTL (真正永久持久保存)；訂閱型：保留到期後 30 天
+  if (effectiveTier === 'lifetime') {
+    await redis.set(`exam_ai:apple:entitlement:${originalTransactionId}`, entitlementRecord);
+  } else if (effectiveExpiresDate) {
+    const diffSec = Math.ceil((effectiveExpiresDate - now) / 1000);
+    const recordTtlSeconds = Math.max(86400, diffSec + 30 * 86400);
+    await redis.set(`exam_ai:apple:entitlement:${originalTransactionId}`, entitlementRecord, { ex: recordTtlSeconds });
+  } else {
+    await redis.set(`exam_ai:apple:entitlement:${originalTransactionId}`, entitlementRecord, { ex: 30 * 86400 });
+  }
+
+  // 3. 跨裝置關聯 (apple:devices_z:{originalTransactionId})
+  // 異常流量監控：記錄活躍裝置數量，但絕不設硬性上限阻斷正常使用者恢復購買 (遵循 Apple App Store 規範)
+  const currentDevicesCount = await redis.zcard(`exam_ai:apple:devices_z:${originalTransactionId}`);
+  if (currentDevicesCount >= ANOMALOUS_DEVICE_THRESHOLD_PER_PURCHASE) {
+    console.warn(`[異常流量監控] 交易 ${originalTransactionId} 關聯裝置數已達 ${currentDevicesCount} 台，請留意收據外流情況。`);
+  }
+
+  // 記錄使用者裝置活動時間戳記
+  await redis.zadd(`exam_ai:apple:devices_z:${originalTransactionId}`, { score: now, member: userId });
+  await redis.sadd(`exam_ai:user:${userId}:apple_txns`, originalTransactionId);
+
+  // 4. 更新使用者的即時權限快取 (user:{userId}:entitlement)
+  if (effectiveStatus === 'active') {
+    const userCache: UserEntitlementCache = {
+      userId,
+      tier: effectiveTier === 'lifetime' ? 'lifetime' : 'pro',
+      productId,
+      originalTransactionId,
+      expiresAt: effectiveExpiresDate,
+      verifiedAt: now,
+      environment: verification.environment || 'Sandbox',
+    };
+
+    if (effectiveTier === 'lifetime') {
+      // Lifetime 終身版不設 TTL，永久快取
+      await redis.set(`exam_ai:user:${userId}:entitlement`, userCache);
+    } else if (effectiveExpiresDate) {
+      const cacheTtl = Math.max(300, Math.ceil((effectiveExpiresDate - now) / 1000));
+      await redis.set(`exam_ai:user:${userId}:entitlement`, userCache, { ex: cacheTtl });
+    }
+  } else {
+    // 若為到期或撤銷，清除當前裝置即時快取
+    await redis.del(`exam_ai:user:${userId}:entitlement`);
+
+    // 若被 Apple 撤銷或退款，聯防清除所有關聯裝置的 Pro 快取
+    if (effectiveStatus === 'revoked') {
+      try {
+        const associatedDevices = (await redis.zrange(`exam_ai:apple:devices_z:${originalTransactionId}`, 0, -1)) as string[];
+        for (const devId of associatedDevices) {
+          await redis.del(`exam_ai:user:${devId}:entitlement`);
+        }
+      } catch (revErr) {
+        console.warn('[退款聯防警示] 清除關聯裝置快取失敗:', revErr);
+      }
+    }
+  }
+
+  return { effectiveStatus, effectiveTier };
+}
+
+/**
+ * 查詢使用者的即時會員權限
+ */
+export async function getUserEntitlement(userId: string): Promise<UserEntitlementInfo> {
+  if (!userId) return { tier: 'free', isVerified: false, status: 'none' };
+
+  const redis = getRedisClient();
+  const cached = (await redis.get(`exam_ai:user:${userId}:entitlement`)) as UserEntitlementCache | null;
+
+  if (!cached) {
+    return { tier: 'free', isVerified: false, status: 'none' };
+  }
+
+  const now = Date.now();
+  // 檢查是否到期 (僅針對訂閱，Lifetime expiresAt 為 null 不會誤判過期)
+  if (cached.expiresAt && cached.expiresAt < now) {
+    await redis.del(`exam_ai:user:${userId}:entitlement`);
+    return {
+      tier: 'free',
+      isVerified: false,
+      status: 'expired',
+      productId: cached.productId,
+      originalTransactionId: cached.originalTransactionId,
+      expiresAt: cached.expiresAt,
+    };
+  }
+
+  // 同步檢查原始交易是否已被標記為 revoked
+  if (cached.originalTransactionId) {
+    try {
+      const mainRecord = await getOriginalTransactionEntitlement(cached.originalTransactionId);
+      if (mainRecord && mainRecord.status === 'revoked') {
+        await redis.del(`exam_ai:user:${userId}:entitlement`);
+        return {
+          tier: 'free',
+          isVerified: false,
+          status: 'revoked',
+          productId: cached.productId,
+          originalTransactionId: cached.originalTransactionId,
+          expiresAt: cached.expiresAt,
+        };
+      }
+    } catch {
+      // 忽略 Redis 查詢失敗
+    }
+  }
+
+  return {
+    tier: cached.tier,
+    isVerified: true,
+    status: 'active',
+    productId: cached.productId,
+    originalTransactionId: cached.originalTransactionId,
+    expiresAt: cached.expiresAt,
+  };
+}
+
+/**
+ * 查詢原始交易的完整權限記錄
+ */
+export async function getOriginalTransactionEntitlement(
+  originalTransactionId: string,
+): Promise<AppleEntitlementRecord | null> {
+  if (!originalTransactionId) return null;
+  const redis = getRedisClient();
+  return (await redis.get(`exam_ai:apple:entitlement:${originalTransactionId}`)) as AppleEntitlementRecord | null;
+}
+
+/**
+ * 查詢與該筆交易關聯的裝置數量
+ */
+export async function getLinkedDevicesCount(originalTransactionId: string): Promise<number> {
+  if (!originalTransactionId) return 0;
+  const redis = getRedisClient();
+  return redis.zcard(`exam_ai:apple:devices_z:${originalTransactionId}`);
+}

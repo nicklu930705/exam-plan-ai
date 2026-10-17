@@ -23,6 +23,9 @@ export interface StudyAdviceRequest {
   userId?: string;
   idempotencyKey?: string;
   appleTransactionId?: string;
+  appleJws?: string;
+  signedTransaction?: string;
+  proofToken?: string;
 }
 
 export interface StructuredAdvice {

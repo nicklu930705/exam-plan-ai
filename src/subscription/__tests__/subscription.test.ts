@@ -14,6 +14,12 @@ import { DevStoreKitService } from '../storeKitService';
 import type { AiUsageRecord, UserSubscription } from '../types';
 import type { AppData, Exam, StudyPreferences, Weekday } from '../../types/models';
 
+// 模擬 AsyncStorage
+jest.mock('@react-native-async-storage/async-storage', () =>
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  require('@react-native-async-storage/async-storage/jest/async-storage-mock'),
+);
+
 describe('付費方案與權限控制模組 (Subscription & Entitlements)', () => {
   const basePreferences: StudyPreferences = {
     dailyMinutes: 120,

@@ -240,3 +240,33 @@ export async function getOrCreateClientDeviceId(): Promise<string> {
   }
 }
 
+const PROOF_TOKEN_KEY = '@exam_plan_ai:apple_proof_token';
+
+export async function getStoredProofToken(): Promise<string | null> {
+  try {
+    return await AsyncStorage.getItem(PROOF_TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export async function saveStoredProofToken(token: string): Promise<void> {
+  try {
+    if (token && typeof token === 'string' && token.trim().length > 0) {
+      await AsyncStorage.setItem(PROOF_TOKEN_KEY, token.trim());
+    } else {
+      await AsyncStorage.removeItem(PROOF_TOKEN_KEY);
+    }
+  } catch (error) {
+    console.error('儲存 Apple 驗證權杖失敗：', error);
+  }
+}
+
+export async function clearStoredProofToken(): Promise<void> {
+  try {
+    await AsyncStorage.removeItem(PROOF_TOKEN_KEY);
+  } catch (error) {
+    console.error('清除 Apple 驗證權杖失敗：', error);
+  }
+}
+

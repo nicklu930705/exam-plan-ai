@@ -1,5 +1,11 @@
 import { Linking, Platform } from 'react-native';
 import {
+  clearStoredProofToken,
+  getBackendUrlFromStorage,
+  getOrCreateClientDeviceId,
+  saveStoredProofToken,
+} from '../storage';
+import {
   ALL_STOREKIT_PRODUCT_IDS,
   APPLE_MANAGE_SUBSCRIPTIONS_URL,
   isValidProductId,
@@ -31,18 +37,28 @@ export interface StoreStatus {
   notice: string;
 }
 
+export interface ValidationResult {
+  valid: boolean;
+  tier?: PlanTier;
+  status?: 'active' | 'expired' | 'revoked' | 'invalid';
+  proofToken?: string;
+  originalTransactionId?: string;
+  expiresDate?: number;
+  reason?: string;
+}
+
 /**
- * 伺服器端與客戶端憑證驗證介面（保留未來 App Store Server API 擴充彈性）
+ * 伺服器端與客戶端憑證驗證介面（支援 StoreKit 2 JWS 與 App Store Server API）
  */
 export interface ITransactionValidator {
-  validate(purchase: unknown): Promise<{ valid: boolean; reason?: string }>;
+  validate(purchase: unknown): Promise<ValidationResult>;
 }
 
 /**
  * 客戶端預設交易驗證器（基礎格式與時序校驗）
  */
 export class ClientSideTransactionValidator implements ITransactionValidator {
-  async validate(purchase: any): Promise<{ valid: boolean; reason?: string }> {
+  async validate(purchase: any): Promise<ValidationResult> {
     if (!purchase || !purchase.productId) {
       return { valid: false, reason: '無效的交易資訊。' };
     }
@@ -50,29 +66,114 @@ export class ClientSideTransactionValidator implements ITransactionValidator {
       return { valid: false, reason: '未知的產品識別碼。' };
     }
     if (purchase.revocationDateIOS != null) {
-      return { valid: false, reason: '此交易已被 Apple 撤銷或退款。' };
+      return { valid: false, status: 'revoked', reason: '此交易已被 Apple 撤銷或退款。' };
     }
-    return { valid: true };
+    const isLife = purchase.productId === STOREKIT_PRODUCT_IDS.LIFETIME;
+    return {
+      valid: true,
+      tier: isLife ? 'lifetime' : 'pro',
+      status: 'active',
+      originalTransactionId: purchase.originalTransactionIdentifierIOS ?? purchase.id,
+      expiresDate: purchase.expirationDateIOS,
+    };
   }
 }
 
 /**
- * 預留未來後端伺服器驗證器（App Store Server API / Notifications V2）
+ * 正式後端伺服器驗證器（呼叫 POST /api/verify-transaction 進行 StoreKit 2 JWS 官方密碼學驗證）
  */
 export class ServerSideTransactionValidator implements ITransactionValidator {
-  constructor(private readonly apiEndpoint: string) {}
+  constructor(private readonly customApiEndpoint?: string) {}
 
-  async validate(purchase: any): Promise<{ valid: boolean; reason?: string }> {
-    if (!this.apiEndpoint) {
-      return { valid: true };
+  async validate(purchase: any): Promise<ValidationResult> {
+    if (!purchase || !purchase.productId) {
+      return { valid: false, reason: '無效的交易資訊。' };
     }
-    // 未來部署後端時：
-    // const res = await fetch(`${this.apiEndpoint}/api/iap/verify-receipt`, {
-    //   method: 'POST',
-    //   headers: { 'Content-Type': 'application/json' },
-    //   body: JSON.stringify({ transactionId: purchase.id, purchaseToken: purchase.purchaseToken }),
-    // });
-    return { valid: true };
+
+    if (!isValidProductId(purchase.productId)) {
+      return { valid: false, reason: `未知的產品識別碼「${purchase.productId}」。` };
+    }
+
+    // 檢查客戶端初步標記
+    if (purchase.revocationDateIOS != null) {
+      await clearStoredProofToken();
+      return { valid: false, status: 'revoked', reason: '此交易已被 Apple 撤銷或退款。' };
+    }
+
+    // 取得 Apple JWS 憑證 (expo-iap 在 iOS 上放置於 purchaseToken 或 transactionReceiptIOS)
+    const signedTransaction =
+      purchase.purchaseToken ||
+      purchase.transactionReceiptIOS ||
+      purchase.signedTransaction;
+
+    if (!signedTransaction || typeof signedTransaction !== 'string' || signedTransaction.trim().length === 0) {
+      // 若無 JWS (例如在尚未完成真實連線的本機測試)，在開發模式下可平滑回退，否則拒絕
+      if (__DEV__) {
+        console.warn('[StoreKit] 交易未帶有 JWS 簽署字串，於開發測試模式下使用客戶端驗證。');
+        const clientVal = new ClientSideTransactionValidator();
+        return clientVal.validate(purchase);
+      }
+      return { valid: false, reason: 'Apple 交易憑證遺漏必要之 JWS 數位簽署。' };
+    }
+
+    try {
+      const baseUrl = this.customApiEndpoint || (await getBackendUrlFromStorage());
+      if (!baseUrl) {
+        return { valid: false, reason: '未配置伺服器驗證端點，請確認網路連線。' };
+      }
+
+      const deviceId = await getOrCreateClientDeviceId();
+      const verifyEndpoint = `${baseUrl.replace(/\/+$/, '')}/api/verify-transaction`;
+
+      const response = await fetch(verifyEndpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'X-Client-Device-Id': deviceId,
+        },
+        body: JSON.stringify({
+          signedTransaction: signedTransaction.trim(),
+          deviceId,
+        }),
+      });
+
+      let json: any = null;
+      try {
+        json = await response.json();
+      } catch {
+        json = null;
+      }
+
+      if (!response.ok || !json || json.success === false) {
+        if (json?.status === 'revoked' || json?.code === 'TRANSACTION_REVOKED') {
+          await clearStoredProofToken();
+          return { valid: false, tier: 'free', status: 'revoked', reason: json.error || '此交易已被 Apple 撤銷或退款。' };
+        }
+        if (json?.status === 'expired' || json?.code === 'SUBSCRIPTION_EXPIRED') {
+          await clearStoredProofToken();
+          return { valid: false, tier: 'free', status: 'expired', reason: json.error || '此訂閱方案已到期。' };
+        }
+        return { valid: false, reason: json?.error || `Apple 交易伺服端驗證失敗 (HTTP ${response.status})。` };
+      }
+
+      // 驗證成功！
+      if (json.proofToken) {
+        await saveStoredProofToken(json.proofToken);
+      }
+
+      return {
+        valid: true,
+        tier: json.tier,
+        status: 'active',
+        proofToken: json.proofToken,
+        originalTransactionId: json.originalTransactionId,
+        expiresDate: json.expiresDate,
+      };
+    } catch (err: any) {
+      console.error('[StoreKit] 呼叫後端交易驗證端點失敗:', err?.message || err);
+      return { valid: false, reason: '無法連線至驗證伺服器，請檢查網路連線後重試。' };
+    }
   }
 }
 
@@ -318,10 +419,10 @@ export class ProductionStoreKitService implements IStoreKitService {
   private devService = new DevStoreKitService();
   private devModeForced = false;
   private isInitialized = false;
-  private validator: ITransactionValidator = new ClientSideTransactionValidator();
+  private validator: ITransactionValidator;
 
   constructor(validator?: ITransactionValidator) {
-    if (validator) this.validator = validator;
+    this.validator = validator || new ServerSideTransactionValidator();
   }
 
   setDevPreviewMode(enabled: boolean): void {
@@ -474,8 +575,31 @@ export class ProductionStoreKitService implements IStoreKitService {
             return;
           }
 
-          // 評估授權等級
+          // 評估授權等級 (優先依據伺服端權威授權結果)
           const ent = evaluatePurchasesEntitlement([purchase]);
+          const effectiveTier: PlanTier = valRes.tier || ent.tier;
+          const isYearly = purchase.productId === STOREKIT_PRODUCT_IDS.YEARLY;
+          const isSub =
+            purchase.productId === STOREKIT_PRODUCT_IDS.MONTHLY ||
+            purchase.productId === STOREKIT_PRODUCT_IDS.YEARLY;
+
+          const verifiedSub: UserSubscription = {
+            plan: effectiveTier,
+            billingCycle: isYearly ? 'annual' : isSub ? 'monthly' : 'lifetime',
+            status: 'active',
+            expiresAt: valRes.expiresDate
+              ? new Date(valRes.expiresDate).toISOString()
+              : ent.subscription?.expiresAt,
+            productId: purchase.productId,
+            transactionId: purchase.id,
+            originalTransactionId:
+              valRes.originalTransactionId ||
+              purchase.originalTransactionIdentifierIOS ||
+              purchase.id,
+            purchaseDate: new Date(purchase.transactionDate || Date.now()).toISOString(),
+            isAutoRenewing: Boolean(purchase.isAutoRenewing),
+            proofToken: valRes.proofToken,
+          };
 
           // 完成 StoreKit 交易，從 Apple 佇列中移除
           try {
@@ -489,7 +613,7 @@ export class ProductionStoreKitService implements IStoreKitService {
           resolve({
             success: true,
             status: 'success',
-            subscription: ent.subscription,
+            subscription: verifiedSub,
             transactionId: purchase.id,
             productId,
             message: '購買成功！已為您開通會員專屬權益。',
@@ -587,10 +711,13 @@ export class ProductionStoreKitService implements IStoreKitService {
 
       // 驗證並評估權限
       const validPurchases: any[] = [];
+      let latestProofToken: string | undefined;
+
       for (const p of purchases) {
         const check = await this.validator.validate(p);
         if (check.valid) {
           validPurchases.push(p);
+          if (check.proofToken) latestProofToken = check.proofToken;
           // 確保未結算的交易被正常標記完成
           try {
             await finishTransaction({ purchase: p, isConsumable: false });
@@ -603,10 +730,14 @@ export class ProductionStoreKitService implements IStoreKitService {
       const evalResult = evaluatePurchasesEntitlement(validPurchases);
 
       if (evalResult.status === 'active' && evalResult.subscription) {
+        const activeSub: UserSubscription = {
+          ...evalResult.subscription,
+          proofToken: latestProofToken,
+        };
         return {
           success: true,
           status: 'success',
-          subscription: evalResult.subscription,
+          subscription: activeSub,
           message: '已成功恢復您的會員方案權益！',
         };
       }

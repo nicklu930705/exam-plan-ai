@@ -8,7 +8,11 @@
  * 4. 職責分離：AI 只提供學習輔導建議與策略分析，絕不直接篡改本機確定性排程資料。
  */
 
-import { getBackendUrlFromStorage, getOrCreateClientDeviceId } from '../storage';
+import {
+  getBackendUrlFromStorage,
+  getOrCreateClientDeviceId,
+  getStoredProofToken,
+} from '../storage';
 import { checkAiAccess, getAiQuotaStatus } from '../subscription/entitlements';
 import type { AiQuotaStatus, AiUsageRecord, UserSubscription } from '../subscription/types';
 import { diffDays } from '../utils/date';
@@ -210,16 +214,23 @@ export async function fetchFromBackendApi(
 
   try {
     const deviceId = await getOrCreateClientDeviceId();
+    const proofToken = await getStoredProofToken();
     const idempotencyKey = `idem_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'X-Client-Device-Id': deviceId,
+      'X-Idempotency-Key': idempotencyKey,
+    };
+
+    if (proofToken) {
+      headers['X-Apple-Proof-Token'] = proofToken;
+    }
 
     const fetchPromise = fetch(targetUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        'X-Client-Device-Id': deviceId,
-        'X-Idempotency-Key': idempotencyKey,
-      },
+      headers,
       body: JSON.stringify(request),
       signal: controller.signal,
     });

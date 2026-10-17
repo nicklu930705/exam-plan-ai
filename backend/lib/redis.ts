@@ -372,6 +372,71 @@ class InMemoryRedisMock {
     return 'OK';
   }
 
+  async get<T = any>(key: string): Promise<T | null> {
+    const val = this.getCleanKey(key);
+    if (val === null) return null;
+    try {
+      return JSON.parse(val);
+    } catch {
+      return val as any;
+    }
+  }
+
+  async set(key: string, value: any, opts?: { ex?: number }): Promise<'OK'> {
+    const str = typeof value === 'string' ? value : JSON.stringify(value);
+    const expireAt = opts?.ex ? Date.now() + opts.ex * 1000 : undefined;
+    this.store.set(key, { value: str, expireAt });
+    return 'OK';
+  }
+
+  async del(...keys: string[]): Promise<number> {
+    let count = 0;
+    for (const k of keys) {
+      if (this.store.delete(k)) count++;
+    }
+    return count;
+  }
+
+  async sadd(key: string, ...members: any[]): Promise<number> {
+    const existing = (await this.get<string[]>(key)) || [];
+    const set = new Set(Array.isArray(existing) ? existing : []);
+    let added = 0;
+    for (const m of members) {
+      const sm = String(m);
+      if (!set.has(sm)) {
+        set.add(sm);
+        added++;
+      }
+    }
+    this.store.set(key, { value: JSON.stringify(Array.from(set)) });
+    return added;
+  }
+
+  async smembers(key: string): Promise<string[]> {
+    const existing = await this.get<string[]>(key);
+    return Array.isArray(existing) ? existing : [];
+  }
+
+  async zadd(key: string, scoreMember: { score: number; member: string }): Promise<number> {
+    const existing = (await this.get<Array<{ score: number; member: string }>>(key)) || [];
+    const list = Array.isArray(existing) ? existing.filter((x) => x.member !== scoreMember.member) : [];
+    list.push(scoreMember);
+    this.store.set(key, { value: JSON.stringify(list) });
+    return 1;
+  }
+
+  async zcard(key: string): Promise<number> {
+    const existing = (await this.get<Array<{ score: number; member: string }>>(key)) || [];
+    return Array.isArray(existing) ? existing.length : 0;
+  }
+
+  async zrange(key: string, min: number, max: number): Promise<string[]> {
+    const existing = (await this.get<Array<{ score: number; member: string }>>(key)) || [];
+    if (!Array.isArray(existing)) return [];
+    const sorted = [...existing].sort((a, b) => a.score - b.score);
+    return sorted.map((x) => x.member).slice(min, max === -1 ? undefined : max + 1);
+  }
+
   clear() {
     this.store.clear();
   }
@@ -382,7 +447,7 @@ export const inMemoryRedisMockInstance = new InMemoryRedisMock();
 /**
  * 取得 Redis 客戶端實例
  */
-export function getRedisClient(): { eval: (script: string, keys: string[], args: any[]) => Promise<any> } {
+export function getRedisClient(): any {
   // 若明確標記使用 Mock（單元測試時），直接回傳記憶體 Mock
   if (process.env.MOCK_REDIS === 'true') {
     return inMemoryRedisMockInstance;
