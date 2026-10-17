@@ -147,8 +147,8 @@ export default function SubscriptionScreen() {
     }
   };
 
-  // 處理恢復購買 (Restore Purchases)
-  const handleRestore = async () => {
+  // 處理恢復購買 (兩階段策略：優先查詢本機安全憑證快取，查無紀錄時引導向 Apple 伺服器深度同步)
+  const handleRestore = async (options?: { syncWithAppStore?: boolean }) => {
     // 1. 若宣告啟用 Sandbox 但環境不合規，安全阻斷
     if (isSandboxMisconfigured) {
       Alert.alert(
@@ -169,7 +169,12 @@ export default function SubscriptionScreen() {
 
     setIsRestoring(true);
     try {
-      const result = await storeKitService.restorePurchases();
+      const restoreOpts =
+        options && typeof options === 'object' && typeof options.syncWithAppStore === 'boolean'
+          ? options
+          : undefined;
+
+      const result = await storeKitService.restorePurchases(restoreOpts);
 
       if (result.status === 'success' && result.subscription) {
         setSubscription(result.subscription);
@@ -177,10 +182,51 @@ export default function SubscriptionScreen() {
       } else if (result.status === 'expired' && result.subscription) {
         setSubscription(result.subscription);
         Alert.alert('訂閱過期通知', result.message);
+      } else if (result.status === 'needs_sync') {
+        // 本機快取無購買紀錄，主動詢問使用者是否執行 Apple 伺服器深度同步
+        Alert.alert(
+          '未查到本機購買紀錄',
+          result.message || '本機未查到有效訂閱紀錄。若您先前曾購買過，是否向 Apple 伺服器重新同步？',
+          [
+            { text: '取消', style: 'cancel' },
+            {
+              text: '向 Apple 伺服器同步',
+              onPress: () => {
+                handleRestore({ syncWithAppStore: true });
+              },
+            },
+          ],
+        );
       } else if (result.status === 'no_purchases') {
         Alert.alert('恢復購買結果', result.message);
+      } else if (result.status === 'sync_error') {
+        // Code 14 或 StoreKit 暫時錯誤：友善說明，保留本機狀態，指引檢查設定
+        Alert.alert(
+          'Apple 伺服器同步暫時中斷',
+          (result.message || 'Apple App Store 伺服器同步暫時中斷。') +
+            '\n\n您可稍後再次嘗試，或前往 iPhone「設定 → Apple 帳號 → 訂閱項目」確認您的訂閱狀態。',
+          [
+            { text: '確定', style: 'default' },
+            {
+              text: '重試同步',
+              onPress: () => handleRestore({ syncWithAppStore: true }),
+            },
+          ],
+        );
+      } else if (result.status === 'verification_failed') {
+        Alert.alert(
+          '安全驗證未通過',
+          result.message || 'Apple 交易憑證未能通過伺服器驗證，無法恢復會員權益。',
+        );
+      } else if (result.status === 'cancelled') {
+        // 使用者主動取消，安靜處理
+      } else if (result.status === 'busy') {
+        Alert.alert('處理中', result.message || '恢復購買程序正在進行中，請稍候。');
       } else {
-        Alert.alert('恢復失敗', result.message || '無法從 App Store 恢復購買，請稍後再試。');
+        Alert.alert(
+          '恢復未能完成',
+          result.message || '無法從 App Store 恢復購買，請稍後再試。',
+        );
       }
     } catch {
       Alert.alert('處理失敗', '無法完成恢復購買，請確認網路連線。');
@@ -591,7 +637,7 @@ export default function SubscriptionScreen() {
 
         <View style={styles.actionButtonsRow}>
           <Pressable
-            onPress={handleRestore}
+            onPress={() => handleRestore()}
             disabled={isLoading || isRestoring}
             style={styles.secondaryActionBtn}
           >

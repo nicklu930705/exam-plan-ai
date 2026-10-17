@@ -8,6 +8,8 @@ import {
   ClientSideTransactionValidator,
   DevStoreKitService,
   evaluatePurchasesEntitlement,
+  isStoreKitCode14,
+  isStoreKitUserCancelled,
   ProductionStoreKitService,
   ServerSideTransactionValidator,
 } from '../storeKitService';
@@ -17,6 +19,26 @@ jest.mock('@react-native-async-storage/async-storage', () =>
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   require('@react-native-async-storage/async-storage/jest/async-storage-mock'),
 );
+
+export const mockGetAvailablePurchases = jest.fn();
+export const mockRestorePurchases = jest.fn();
+export const mockFinishTransaction = jest.fn().mockResolvedValue(true);
+
+jest.mock('expo-iap', () => ({
+  initConnection: jest.fn().mockResolvedValue(true),
+  getAvailablePurchases: (...args: any[]) => mockGetAvailablePurchases(...args),
+  restorePurchases: (...args: any[]) => mockRestorePurchases(...args),
+  finishTransaction: (...args: any[]) => mockFinishTransaction(...args),
+  requestPurchase: jest.fn(),
+  purchaseUpdatedListener: jest.fn(() => ({ remove: jest.fn() })),
+  purchaseErrorListener: jest.fn(() => ({ remove: jest.fn() })),
+  fetchProducts: jest.fn().mockResolvedValue([]),
+  deepLinkToSubscriptions: jest.fn(),
+  isUserCancelledError: (err: any) =>
+    err?.code === 'user-cancelled' ||
+    err?.code === 'E_USER_CANCELLED' ||
+    err?.message?.includes('user-cancelled'),
+}));
 
 describe('StoreKit 2 與 Apple 內購系統核心邏輯', () => {
   describe('1. 產品 ID 集中管理與合法性檢驗', () => {
@@ -177,6 +199,105 @@ describe('StoreKit 2 與 Apple 內購系統核心邏輯', () => {
       expect(res.tier).toBe('lifetime');
       expect(res.status).toBe('active');
     });
+
+    test('由月訂閱切換為年訂閱時，即使月訂閱尚未到期，仍以最新交易之年訂閱為準', () => {
+      const now = Date.now();
+      const purchases = [
+        {
+          id: 'txn-month-early',
+          productId: 'exampro_monthly',
+          transactionDate: now - 10 * 86400 * 1000,
+          expirationDateIOS: now + 20 * 86400 * 1000,
+          originalTransactionIdentifierIOS: 'orig-sub-chain',
+        },
+        {
+          id: 'txn-year-upgrade',
+          productId: 'exampro_yearly',
+          transactionDate: now - 1 * 86400 * 1000, // 較新升級交易
+          expirationDateIOS: now + 364 * 86400 * 1000,
+          originalTransactionIdentifierIOS: 'orig-sub-chain',
+        },
+      ];
+
+      const res = evaluatePurchasesEntitlement(purchases);
+      expect(res.tier).toBe('pro');
+      expect(res.status).toBe('active');
+      expect(res.subscription?.plan).toBe('pro');
+      expect(res.subscription?.billingCycle).toBe('annual');
+      expect(res.subscription?.productId).toBe('exampro_yearly');
+      expect(res.subscription?.transactionId).toBe('txn-year-upgrade');
+    });
+
+    test('月訂閱已過期但年訂閱有效時，正確挑選有效之年訂閱方案', () => {
+      const now = Date.now();
+      const purchases = [
+        {
+          id: 'txn-month-old',
+          productId: 'exampro_monthly',
+          transactionDate: now - 40 * 86400 * 1000,
+          expirationDateIOS: now - 10 * 86400 * 1000, // 已過期
+        },
+        {
+          id: 'txn-year-current',
+          productId: 'exampro_yearly',
+          transactionDate: now - 5 * 86400 * 1000,
+          expirationDateIOS: now + 360 * 86400 * 1000, // 有效
+        },
+      ];
+
+      const res = evaluatePurchasesEntitlement(purchases);
+      expect(res.tier).toBe('pro');
+      expect(res.status).toBe('active');
+      expect(res.subscription?.billingCycle).toBe('annual');
+    });
+
+    test('多筆訂閱皆已過期時，以最新交易之方案為準且標記 status=expired', () => {
+      const now = Date.now();
+      const purchases = [
+        {
+          id: 'txn-month-old',
+          productId: 'exampro_monthly',
+          transactionDate: now - 90 * 86400 * 1000,
+          expirationDateIOS: now - 60 * 86400 * 1000,
+        },
+        {
+          id: 'txn-year-later',
+          productId: 'exampro_yearly',
+          transactionDate: now - 40 * 86400 * 1000, // 較新交易
+          expirationDateIOS: now - 5 * 86400 * 1000,
+        },
+      ];
+
+      const res = evaluatePurchasesEntitlement(purchases);
+      expect(res.tier).toBe('free');
+      expect(res.status).toBe('expired');
+      expect(res.subscription?.productId).toBe('exampro_yearly');
+      expect(res.subscription?.billingCycle).toBe('annual');
+    });
+
+    test('月訂閱有效但年訂閱生效日期在未來時，不可提前授權未生效之年訂閱，應維持當前有效之月訂閱', () => {
+      const now = Date.now();
+      const purchases = [
+        {
+          id: 'txn-month-active-now',
+          productId: 'exampro_monthly',
+          transactionDate: now - 10 * 86400 * 1000,
+          expirationDateIOS: now + 20 * 86400 * 1000,
+        },
+        {
+          id: 'txn-year-scheduled-future',
+          productId: 'exampro_yearly',
+          transactionDate: now + 20 * 86400 * 1000, // 未來生效
+          expirationDateIOS: now + 385 * 86400 * 1000,
+        },
+      ];
+
+      const res = evaluatePurchasesEntitlement(purchases);
+      expect(res.tier).toBe('pro');
+      expect(res.status).toBe('active');
+      expect(res.subscription?.productId).toBe('exampro_monthly');
+      expect(res.subscription?.billingCycle).toBe('monthly');
+    });
   });
 
   describe('3. 交易驗證器架構 (Transaction Validators)', () => {
@@ -336,6 +457,282 @@ describe('StoreKit 2 與 Apple 內購系統核心邏輯', () => {
       } finally {
         (global as any).__DEV__ = originalDev;
       }
+    });
+  });
+
+  describe('6. StoreKit 2 錯誤識別與取消判斷', () => {
+    test('正確識別 SKInternalErrorDomain Code 14 錯誤字串與物件', () => {
+      // 情況 1: 標準 iOS 系統錯誤字串
+      const err1 = new Error(
+        "The operation couldn't be completed. (SKInternalErrorDomain error 14.)",
+      );
+      expect(isStoreKitCode14(err1)).toBe(true);
+
+      // 情況 2: 物件形式具備 code: 14 與 domain
+      const err2 = { code: 14, domain: 'SKInternalErrorDomain' };
+      expect(isStoreKitCode14(err2)).toBe(true);
+
+      // 情況 3: code: '14' 字串
+      const err3 = { code: '14', domain: 'SKInternalErrorDomain' };
+      expect(isStoreKitCode14(err3)).toBe(true);
+
+      // 情況 4: 包含 SKInternalErrorDomain 與 14 之訊息
+      const err4 = new Error('Error: [SKInternalErrorDomain:14] Sync failed');
+      expect(isStoreKitCode14(err4)).toBe(true);
+
+      // 情況 5: 一般網路或非 Code 14 錯誤，不應誤判
+      expect(isStoreKitCode14(new Error('Network request failed'))).toBe(false);
+      expect(isStoreKitCode14(new Error('SKErrorDomain error 2'))).toBe(false);
+      expect(isStoreKitCode14(null)).toBe(false);
+    });
+
+    test('正確識別使用者主動取消操作', () => {
+      expect(isStoreKitUserCancelled({ code: 'user-cancelled' })).toBe(true);
+      expect(isStoreKitUserCancelled({ code: 'E_USER_CANCELLED' })).toBe(true);
+      expect(
+        isStoreKitUserCancelled(
+          new Error('User cancelled the authorization modal'),
+        ),
+      ).toBe(true);
+      expect(isStoreKitUserCancelled(new Error('使用者取消交易'))).toBe(true);
+      expect(isStoreKitUserCancelled(new Error('Network timeout'))).toBe(false);
+    });
+  });
+
+  describe('7. 兩階段恢復購買 (Two-Phase Restore Purchases)', () => {
+    beforeEach(() => {
+      mockGetAvailablePurchases.mockReset();
+      mockRestorePurchases.mockReset();
+      mockFinishTransaction.mockReset().mockResolvedValue(true);
+    });
+
+    test('階段一：裝置端快取已有購買紀錄時，不調用 AppStore.sync() 即可成功恢復', async () => {
+      const now = Date.now();
+      mockGetAvailablePurchases.mockResolvedValue([
+        {
+          id: 'txn-cached-1',
+          productId: 'exampro_yearly',
+          transactionDate: now - 5 * 86400 * 1000,
+          expirationDateIOS: now + 360 * 86400 * 1000,
+          originalTransactionIdentifierIOS: 'orig-chain-1',
+          isAutoRenewing: true,
+          purchaseToken: 'mock-valid-jws-token',
+        },
+      ]);
+
+      const mockValidator = {
+        validate: jest.fn().mockResolvedValue({
+          valid: true,
+          tier: 'pro',
+          status: 'active',
+          proofToken: 'mock-proof-token-abc',
+          expiresDate: now + 360 * 86400 * 1000,
+        }),
+      };
+
+      const prod = new ProductionStoreKitService(mockValidator as any);
+      prod.setNativeModeForTesting(true);
+
+      const result = await prod.restorePurchases({ syncWithAppStore: false });
+
+      expect(result.success).toBe(true);
+      expect(result.status).toBe('success');
+      expect(result.subscription?.plan).toBe('pro');
+      expect(result.subscription?.billingCycle).toBe('annual');
+      expect(result.subscription?.proofToken).toBe('mock-proof-token-abc');
+
+      // 核心安全驗證：階段一絕不調用 expo-iap 的 restorePurchases (即不觸發 AppStore.sync())
+      expect(mockRestorePurchases).not.toHaveBeenCalled();
+      expect(mockValidator.validate).toHaveBeenCalledTimes(1);
+    });
+
+    test('階段一：裝置端快取查無紀錄且未要求深度同步時，回傳 needs_sync 並允許重試', async () => {
+      mockGetAvailablePurchases.mockResolvedValue([]);
+
+      const prod = new ProductionStoreKitService();
+      prod.setNativeModeForTesting(true);
+
+      const result = await prod.restorePurchases({ syncWithAppStore: false });
+
+      expect(result.success).toBe(false);
+      expect(result.status).toBe('needs_sync');
+      expect(result.canRetrySync).toBe(true);
+      expect(mockRestorePurchases).not.toHaveBeenCalled();
+    });
+
+    test('階段二：向 Apple 深度同步遭遇 SKInternalErrorDomain Code 14 時，回傳 sync_error 友善提示且不清除狀態', async () => {
+      mockRestorePurchases.mockRejectedValue(
+        new Error(
+          "The operation couldn't be completed. (SKInternalErrorDomain error 14.)",
+        ),
+      );
+
+      const prod = new ProductionStoreKitService();
+      prod.setNativeModeForTesting(true);
+
+      const result = await prod.restorePurchases({ syncWithAppStore: true });
+
+      expect(result.success).toBe(false);
+      expect(result.status).toBe('sync_error');
+      expect(result.errorCode).toBe('SKInternalErrorDomain:14');
+      expect(result.canRetrySync).toBe(true);
+      expect(result.message).toContain('Apple App Store 伺服器同步暫時中斷');
+      expect(result.message).toContain('錯誤代碼: 14');
+      // 確保未給出錯誤覆寫訂閱
+      expect(result.subscription).toBeUndefined();
+    });
+
+    test('階段二：向 Apple 深度同步時使用者取消驗證，回傳 cancelled 狀態', async () => {
+      mockRestorePurchases.mockRejectedValue({ code: 'user-cancelled' });
+
+      const prod = new ProductionStoreKitService();
+      prod.setNativeModeForTesting(true);
+
+      const result = await prod.restorePurchases({ syncWithAppStore: true });
+
+      expect(result.success).toBe(false);
+      expect(result.status).toBe('cancelled');
+      expect(result.message).toContain('取消');
+    });
+
+    test('Lifetime 購買紀錄可正確恢復為永久會員，無過期時間且標記 active', async () => {
+      mockGetAvailablePurchases.mockResolvedValue([
+        {
+          id: 'txn-life-1',
+          productId: 'exampro_lifetime',
+          transactionDate: Date.now() - 30 * 86400 * 1000,
+          purchaseToken: 'mock-life-jws',
+        },
+      ]);
+
+      const mockValidator = {
+        validate: jest.fn().mockResolvedValue({
+          valid: true,
+          tier: 'lifetime',
+          status: 'active',
+          proofToken: 'proof-life-xyz',
+        }),
+      };
+
+      const prod = new ProductionStoreKitService(mockValidator as any);
+      prod.setNativeModeForTesting(true);
+
+      const result = await prod.restorePurchases({ syncWithAppStore: false });
+
+      expect(result.success).toBe(true);
+      expect(result.status).toBe('success');
+      expect(result.subscription?.plan).toBe('lifetime');
+      expect(result.subscription?.billingCycle).toBe('lifetime');
+      expect(result.subscription?.expiresAt).toBeUndefined();
+      expect(result.subscription?.proofToken).toBe('proof-life-xyz');
+    });
+
+    test('後端驗證失敗時，不可開通付費會員權益並回傳 verification_failed', async () => {
+      mockGetAvailablePurchases.mockResolvedValue([
+        {
+          id: 'txn-forged-1',
+          productId: 'exampro_yearly',
+          transactionDate: Date.now(),
+          purchaseToken: 'invalid-jws-signature',
+        },
+      ]);
+
+      const mockValidator = {
+        validate: jest.fn().mockResolvedValue({
+          valid: false,
+          reason: 'Apple JWS 數位簽章無效或憑證已被撤銷。',
+        }),
+      };
+
+      const prod = new ProductionStoreKitService(mockValidator as any);
+      prod.setNativeModeForTesting(true);
+
+      const result = await prod.restorePurchases({ syncWithAppStore: false });
+
+      expect(result.success).toBe(false);
+      expect(result.status).toBe('verification_failed');
+      expect(result.subscription).toBeUndefined();
+      expect(result.message).toContain('數位簽章無效');
+    });
+
+    test('並行防護：當恢復購買正在進行中時，重複呼叫回傳 busy 狀態', async () => {
+      let resolveFirstCall: (v: any) => void = () => {};
+      const slowPromise = new Promise((resolve) => {
+        resolveFirstCall = resolve;
+      });
+
+      mockGetAvailablePurchases.mockReturnValue(slowPromise);
+
+      const prod = new ProductionStoreKitService();
+      prod.setNativeModeForTesting(true);
+
+      // 第一個請求發起（仍在進行中）
+      const promise1 = prod.restorePurchases({ syncWithAppStore: false });
+
+      // 第二個請求立即跟進
+      const promise2 = prod.restorePurchases({ syncWithAppStore: false });
+
+      const result2 = await promise2;
+      expect(result2.success).toBe(false);
+      expect(result2.status).toBe('busy');
+      expect(result2.message).toContain('處理中');
+
+      // 結束第一個請求
+      resolveFirstCall([]);
+      await promise1;
+    });
+
+    test('多筆交易恢復時，確保回傳之 proofToken 精確匹配勝出方案的交易識別碼，不因陣列順序錯配', async () => {
+      const now = Date.now();
+      mockGetAvailablePurchases.mockResolvedValue([
+        {
+          id: 'txn-month-earlier',
+          productId: 'exampro_monthly',
+          transactionDate: now - 15 * 86400 * 1000,
+          expirationDateIOS: now + 15 * 86400 * 1000,
+          originalTransactionIdentifierIOS: 'orig-chain-month',
+        },
+        {
+          id: 'txn-year-winner',
+          productId: 'exampro_yearly',
+          transactionDate: now - 1 * 86400 * 1000,
+          expirationDateIOS: now + 364 * 86400 * 1000,
+          originalTransactionIdentifierIOS: 'orig-chain-year',
+        },
+      ]);
+
+      const mockValidator = {
+        validate: jest.fn().mockImplementation(async (p: any) => {
+          if (p.productId === 'exampro_yearly') {
+            return {
+              valid: true,
+              tier: 'pro',
+              status: 'active',
+              proofToken: 'proof-token-YEARLY-CORRECT',
+              expiresDate: now + 364 * 86400 * 1000,
+            };
+          }
+          return {
+            valid: true,
+            tier: 'pro',
+            status: 'active',
+            proofToken: 'proof-token-MONTHLY-OLD',
+            expiresDate: now + 15 * 86400 * 1000,
+          };
+        }),
+      };
+
+      const prod = new ProductionStoreKitService(mockValidator as any);
+      prod.setNativeModeForTesting(true);
+
+      const result = await prod.restorePurchases({ syncWithAppStore: false });
+
+      expect(result.success).toBe(true);
+      expect(result.status).toBe('success');
+      expect(result.subscription?.billingCycle).toBe('annual');
+      expect(result.subscription?.productId).toBe('exampro_yearly');
+      // 確保 proofToken 絕對是勝出年繳方案的 proofToken，絕不被月繳覆蓋
+      expect(result.subscription?.proofToken).toBe('proof-token-YEARLY-CORRECT');
     });
   });
 });
