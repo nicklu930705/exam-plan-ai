@@ -266,6 +266,15 @@ export class LiveAppleWebhookEventHandler implements IAppleWebhookEventHandler {
       };
     }
 
+    // TEST 測試通知不包含交易資訊，無須更新 Redis 主記錄
+    if (notification.notificationType === 'TEST') {
+      return {
+        success: true,
+        action: 'IGNORE_TEST_NOTIFICATION',
+        reason: '收到 Apple 測試連線通知 (TEST)，連線正常無須更新資料庫。',
+      };
+    }
+
     const isDryRun = process.env.APPLE_WEBHOOK_DRY_RUN !== 'false';
     const originalTxId =
       notification.originalTransactionId ||

@@ -1,8 +1,10 @@
 import {
   AppStoreServerAPIClient,
+  CheckTestNotificationResponse,
   Environment,
   HistoryResponse,
   RefundHistoryResponse,
+  SendTestNotificationResponse,
   Status,
   StatusResponse,
   TransactionHistoryRequest,
@@ -60,6 +62,8 @@ export interface IAppleServerApiClient {
   ): Promise<HistoryResponse>;
   getRefundHistory(anyTransactionId: string, revision?: string | null): Promise<RefundHistoryResponse>;
   getTransactionInfo(transactionId: string): Promise<TransactionInfoResponse>;
+  requestTestNotification(): Promise<SendTestNotificationResponse>;
+  getTestNotificationStatus(testNotificationToken: string): Promise<CheckTestNotificationResponse>;
 }
 
 export function resolveAppleServerApiEnvironment(): {
@@ -231,6 +235,21 @@ export class AppleServerApiClientWrapper implements IAppleServerApiClient {
       throw new Error('未提供有效之交易識別碼 (transactionId)。');
     }
     return client.getTransactionInfo(transactionId.trim());
+  }
+
+  async requestTestNotification(): Promise<SendTestNotificationResponse> {
+    const client = this.ensureClient();
+    return client.requestTestNotification();
+  }
+
+  async getTestNotificationStatus(
+    testNotificationToken: string,
+  ): Promise<CheckTestNotificationResponse> {
+    const client = this.ensureClient();
+    if (!testNotificationToken || typeof testNotificationToken !== 'string' || testNotificationToken.trim().length === 0) {
+      throw new Error('未提供有效之 testNotificationToken。');
+    }
+    return client.getTestNotificationStatus(testNotificationToken.trim());
   }
 }
 
