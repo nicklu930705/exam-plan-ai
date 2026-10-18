@@ -221,6 +221,33 @@ end
 return 'OK'
 `;
 
+// ───── Lua 腳本 4: Apple 訂閱與交易權限主記錄原子樂觀並行更新 (OCC) ─────
+export const SAVE_ENTITLEMENT_OCC_LUA = `
+local mainKey = KEYS[1]
+local recordStr = ARGV[1]
+local incomingTimestamp = tonumber(ARGV[2])
+local ttlSeconds = tonumber(ARGV[3])
+
+local existing = redis.call('GET', mainKey)
+if existing then
+  local ok, data = pcall(cjson.decode, existing)
+  if ok and data then
+    local currentTimestamp = tonumber(data.verifiedAt or data.purchaseDate or 0)
+    if currentTimestamp and currentTimestamp > incomingTimestamp then
+      return {'STALE', tostring(currentTimestamp)}
+    end
+  end
+end
+
+if ttlSeconds and ttlSeconds > 0 then
+  redis.call('SET', mainKey, recordStr, 'EX', ttlSeconds)
+else
+  redis.call('SET', mainKey, recordStr)
+end
+
+return {'OK'}
+`;
+
 // ───── 記憶體 Mock 轉接器 (測試專用) ─────
 class InMemoryRedisMock {
   private store = new Map<string, { value: string; expireAt?: number }>();
@@ -369,7 +396,54 @@ class InMemoryRedisMock {
       return 'OK';
     }
 
+    if (script === SAVE_ENTITLEMENT_OCC_LUA) {
+      const [mainKey] = keys;
+      const [recordStr, incomingTimestampStr, ttlSecondsStr] = args;
+      const incomingTimestamp = Number(incomingTimestampStr);
+      const ttlSeconds = Number(ttlSecondsStr);
+
+      const existingRaw = this.getCleanKey(mainKey);
+      if (existingRaw) {
+        try {
+          const data = JSON.parse(existingRaw);
+          const currentTimestamp = Number(data.verifiedAt || data.purchaseDate || 0);
+          if (currentTimestamp > incomingTimestamp) {
+            return ['STALE', String(currentTimestamp)];
+          }
+        } catch {
+          // 忽略格式解析例外
+        }
+      }
+
+      if (ttlSeconds > 0) {
+        this.store.set(mainKey, {
+          value: String(recordStr),
+          expireAt: Date.now() + ttlSeconds * 1000,
+        });
+      } else {
+        this.store.set(mainKey, {
+          value: String(recordStr),
+        });
+      }
+      return ['OK'];
+    }
+
     return 'OK';
+  }
+
+  async incr(key: string): Promise<number> {
+    const raw = this.getCleanKey(key);
+    const num = (raw ? parseInt(raw, 10) : 0) + 1;
+    const existing = this.store.get(key);
+    this.store.set(key, { value: String(num), expireAt: existing?.expireAt });
+    return num;
+  }
+
+  async expire(key: string, seconds: number): Promise<number> {
+    const existing = this.store.get(key);
+    if (!existing) return 0;
+    existing.expireAt = Date.now() + seconds * 1000;
+    return 1;
   }
 
   async get<T = any>(key: string): Promise<T | null> {

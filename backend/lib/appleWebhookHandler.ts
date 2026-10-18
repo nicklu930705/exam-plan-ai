@@ -396,6 +396,7 @@ let customNotificationVerifier: AppleNotificationVerifier | null = null;
 export function setCustomNotificationVerifier(verifier: AppleNotificationVerifier | null) {
   customNotificationVerifier = verifier;
 }
+export const setCustomAppleNotificationVerifier = setCustomNotificationVerifier;
 export function getAppleNotificationVerifier(): AppleNotificationVerifier {
   return customNotificationVerifier || new AppleNotificationVerifier();
 }

@@ -1,9 +1,11 @@
 import { Linking, Platform } from 'react-native';
 import {
+  clearStoredLatestAppleJws,
   clearStoredProofToken,
   getBackendUrlFromStorage,
   getOrCreateClientDeviceId,
   isIapSandboxConfigured,
+  saveStoredLatestAppleJws,
   saveStoredProofToken,
 } from '../storage';
 import {
@@ -13,6 +15,7 @@ import {
   STOREKIT_PRODUCT_IDS,
 } from './storeKitConfig';
 import { SUBSCRIPTION_PRODUCTS } from './products';
+import { invalidateInflightSyncRequests } from './subscriptionSyncService';
 import type { PlanTier, ProductDefinition, UserSubscription } from './types';
 
 export interface PurchaseResult {
@@ -117,6 +120,7 @@ export class ServerSideTransactionValidator implements ITransactionValidator {
     // 檢查客戶端初步標記
     if (purchase.revocationDateIOS != null) {
       await clearStoredProofToken();
+      await clearStoredLatestAppleJws();
       return { valid: false, status: 'revoked', reason: '此交易已被 Apple 撤銷或退款。' };
     }
 
@@ -174,10 +178,12 @@ export class ServerSideTransactionValidator implements ITransactionValidator {
       if (!response.ok || !json || json.success === false) {
         if (json?.status === 'revoked' || json?.code === 'TRANSACTION_REVOKED') {
           await clearStoredProofToken();
+          await clearStoredLatestAppleJws();
           return { valid: false, tier: 'free', status: 'revoked', reason: json.error || '此交易已被 Apple 撤銷或退款。' };
         }
         if (json?.status === 'expired' || json?.code === 'SUBSCRIPTION_EXPIRED') {
           await clearStoredProofToken();
+          await clearStoredLatestAppleJws();
           return { valid: false, tier: 'free', status: 'expired', reason: json.error || '此訂閱方案已到期。' };
         }
         return { valid: false, reason: json?.error || `Apple 交易伺服端驗證失敗 (HTTP ${response.status})。` };
@@ -186,6 +192,9 @@ export class ServerSideTransactionValidator implements ITransactionValidator {
       // 驗證成功！
       if (json.proofToken) {
         await saveStoredProofToken(json.proofToken);
+      }
+      if (signedTransaction && typeof signedTransaction === 'string') {
+        await saveStoredLatestAppleJws(signedTransaction.trim());
       }
 
       return {
@@ -754,6 +763,7 @@ export class ProductionStoreKitService implements IStoreKitService {
 
           isResolved = true;
           cleanup();
+          invalidateInflightSyncRequests();
           resolve({
             success: true,
             status: 'success',
@@ -1003,6 +1013,7 @@ export class ProductionStoreKitService implements IStoreKitService {
           ...evalResult.subscription,
           proofToken: matchedProofToken,
         };
+        invalidateInflightSyncRequests();
         return {
           success: true,
           status: 'success',

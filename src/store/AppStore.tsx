@@ -3,6 +3,11 @@ import React, { createContext, useContext, useEffect, useMemo, useReducer, useRe
 import { createDemoData } from '../data/demo';
 import { clearAppDataFromStorage, loadAppDataFromStorage, safeRestoreAppDataToStorage, saveAppDataToStorage } from '../storage';
 import { getEffectiveTier, getPlanEntitlements, normalizeSubscriptionOnLoad } from '../subscription/entitlements';
+import {
+  invalidateInflightSyncRequests,
+  setupForegroundSubscriptionSync,
+  syncSubscriptionStatus,
+} from '../subscription/subscriptionSyncService';
 import type { BackupStudyData } from '../types/backup';
 import type { AiUsageRecord, UserSubscription } from '../subscription/types';
 import type { AppData, Exam, ISODate, StudyPreferences, StudyTask, TaskStatus } from '../types/models';
@@ -381,6 +386,7 @@ export function reducer(state: AppData, action: Action): AppData {
     }
 
     case 'setSubscription':
+      invalidateInflightSyncRequests();
       return {
         ...state,
         subscription: action.subscription,
@@ -615,7 +621,32 @@ export function AppStoreProvider({
     };
   }, [initialData]);
 
-  // 2. 狀態變更時自動同步寫入本機儲存（還原作業進行中時暫停 auto-save 以防競態）
+  // 2. 啟動與前景恢復會員狀態自動同步 (Phase 3.2b)
+  useEffect(() => {
+    if (!isLoaded || initialData) return;
+
+    // 啟動時非同步靜默同步
+    syncSubscriptionStatus({
+      currentSubscription: dataRef.current.subscription,
+      getCurrentSubscription: () => dataRef.current.subscription,
+      setSubscription: (sub) => dispatch({ type: 'setSubscription', subscription: sub }),
+      force: false,
+    }).catch((err) => {
+      console.warn('[AppStore] 啟動會員狀態同步未完成:', err?.message || err);
+    });
+
+    // 註冊 AppState 前景喚醒節流同步
+    const unsubscribe = setupForegroundSubscriptionSync({
+      getSubscription: () => dataRef.current.subscription,
+      setSubscription: (sub) => dispatch({ type: 'setSubscription', subscription: sub }),
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, [isLoaded, initialData]);
+
+  // 3. 狀態變更時自動同步寫入本機儲存（還原作業進行中時暫停 auto-save 以防競態）
   useEffect(() => {
     if (isLoaded && !isRestoringRef.current) {
       saveAppDataToStorage(data);

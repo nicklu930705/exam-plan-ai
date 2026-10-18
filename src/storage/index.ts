@@ -318,3 +318,32 @@ export async function clearStoredProofToken(): Promise<void> {
   }
 }
 
+const LATEST_APPLE_JWS_KEY = '@exam_plan_ai:latest_apple_jws';
+
+export async function getStoredLatestAppleJws(): Promise<string | null> {
+  try {
+    return await AsyncStorage.getItem(LATEST_APPLE_JWS_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export async function saveStoredLatestAppleJws(jws: string): Promise<void> {
+  try {
+    if (jws && typeof jws === 'string' && jws.trim().length > 0) {
+      await AsyncStorage.setItem(LATEST_APPLE_JWS_KEY, jws.trim());
+    } else {
+      await AsyncStorage.removeItem(LATEST_APPLE_JWS_KEY);
+    }
+  } catch (error) {
+    console.error('儲存 Apple 交易憑證 (JWS) 失敗：', error);
+  }
+}
+
+export async function clearStoredLatestAppleJws(): Promise<void> {
+  try {
+    await AsyncStorage.removeItem(LATEST_APPLE_JWS_KEY);
+  } catch (error) {
+    console.error('清除 Apple 交易憑證 (JWS) 失敗：', error);
+  }
+}

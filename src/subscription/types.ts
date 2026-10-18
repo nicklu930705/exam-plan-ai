@@ -27,6 +27,7 @@ export interface UserSubscription {
   isAutoRenewing?: boolean;
   revocationDate?: string;
   proofToken?: string;
+  signedTransaction?: string;
 }
 
 export interface AiUsageRecord {

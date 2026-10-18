@@ -9,7 +9,7 @@ import {
   syncUserDeviceEffectiveEntitlement,
   UserEntitlementCache,
 } from './entitlement';
-import { getRedisClient } from './redis';
+import { getRedisClient, SAVE_ENTITLEMENT_OCC_LUA } from './redis';
 import {
   evaluateSubscriptionStateTransition,
   IAppleWebhookEventHandler,
@@ -171,39 +171,39 @@ export async function applySubscriptionStateToRedis(params: {
       'Sandbox',
   };
 
-  // 3. 樂觀並行控制 (OCC): 重新檢查 Redis 中現有記錄，防止已逾期或慢速工作覆蓋較新的記錄
-  const latestInRedis = await getOriginalTransactionEntitlement(originalTransactionId);
+  // 3 & 4. 樂觀並行控制 (OCC) 與原子寫入 Redis 交易主記錄 (apple:entitlement:{originalTransactionId})
+  let recordTtl = 0;
+  if (targetTier !== 'lifetime') {
+    if (effectiveExpiresDate && targetStatus === 'active') {
+      const diffSec = Math.ceil((effectiveExpiresDate - now) / 1000);
+      recordTtl = Math.max(86400, diffSec + 30 * 86400);
+    } else {
+      recordTtl = 30 * 86400;
+    }
+  }
+
   const incomingTimestamp = verifiedNotification?.signedDate || now;
-  if (latestInRedis) {
-    const currentTimestamp = latestInRedis.verifiedAt || latestInRedis.purchaseDate || 0;
-    if (currentTimestamp > incomingTimestamp) {
+  const mainKey = `exam_ai:apple:entitlement:${originalTransactionId}`;
+
+  try {
+    const occRes = (await redis.eval(
+      SAVE_ENTITLEMENT_OCC_LUA,
+      [mainKey],
+      [JSON.stringify(updatedRecord), String(incomingTimestamp), String(recordTtl)],
+    )) as string[];
+
+    if (occRes && occRes[0] === 'STALE') {
+      const currentTimestamp = occRes[1] || 'unknown';
       return {
         success: true,
         action: 'IGNORE_STALE_RECORD',
         originalTransactionId,
-        status: latestInRedis.status,
-        tier: latestInRedis.status === 'active' ? latestInRedis.tier : 'free',
+        status: existingRecord?.status || 'active',
+        tier: existingRecord?.status === 'active' ? (existingRecord.tier || 'free') : 'free',
         devicesUpdatedCount: 0,
         dryRun: false,
         reason: `Redis 中現有記錄時間戳記 (${currentTimestamp}) 比本次寫入事件 (${incomingTimestamp}) 更新，略過過期工作以防覆蓋。`,
       };
-    }
-  }
-
-  // 4. 寫入 Redis 交易主記錄 (apple:entitlement:{originalTransactionId})
-  try {
-    const mainKey = `exam_ai:apple:entitlement:${originalTransactionId}`;
-    if (targetTier === 'lifetime') {
-      // Lifetime 終身買斷版無 TTL，永久保存
-      await redis.set(mainKey, updatedRecord);
-    } else if (effectiveExpiresDate && targetStatus === 'active') {
-      // 訂閱型：保留至到期後 30 天緩衝
-      const diffSec = Math.ceil((effectiveExpiresDate - now) / 1000);
-      const recordTtl = Math.max(86400, diffSec + 30 * 86400);
-      await redis.set(mainKey, updatedRecord, { ex: recordTtl });
-    } else {
-      // 到期或撤銷：保留 30 天記錄防重放
-      await redis.set(mainKey, updatedRecord, { ex: 30 * 86400 });
     }
   } catch (saveErr: any) {
     throw new SubscriptionSyncError(
