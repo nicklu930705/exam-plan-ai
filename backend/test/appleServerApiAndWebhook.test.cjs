@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const crypto = require('node:crypto');
 
 // 設定測試環境變數
 process.env.MOCK_REDIS = 'true';
@@ -17,6 +18,7 @@ const {
   setCustomAppleServerApiClient,
   AppleServerApiClientWrapper,
   AppleServerApiNotConfiguredError,
+  normalizeAndValidateApplePrivateKey,
 } = require('../dist/lib/appleServerApi.js');
 const {
   AppleNotificationVerifier,
@@ -185,6 +187,157 @@ test('Apple App Store Server API 客戶端封裝與安全降級測試', async (t
     assert.strictEqual(active.isConfigured(), true);
     const res = await active.getAllSubscriptionStatuses('test_tx_888');
     assert.strictEqual(res.environment, 'Sandbox');
+  });
+});
+
+test('Apple ES256 PKCS#8 私鑰正規化與安全校驗測試 (Phase 3.3c)', async (t) => {
+  // 生成測試用非對稱金鑰（嚴格僅用於本機 Mock 測試，絕不碰觸或洩漏真實環境金鑰）
+  const testEcP256Key = crypto.generateKeyPairSync('ec', {
+    namedCurve: 'prime256v1',
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+  }).privateKey;
+
+  const testSecpKey = crypto.generateKeyPairSync('ec', {
+    namedCurve: 'secp256k1',
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+  }).privateKey;
+
+  const testRsaKey = crypto.generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+  }).privateKey;
+
+  const testEdKey = crypto.generateKeyPairSync('ed25519', {
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+  }).privateKey;
+
+  await t.test('1. 正常多行 PKCS#8 PEM 金鑰校驗通過', () => {
+    const res = normalizeAndValidateApplePrivateKey(testEcP256Key);
+    assert.strictEqual(res.valid, true);
+    assert.strictEqual(typeof res.normalizedPem, 'string');
+    assert(res.normalizedPem.includes('-----BEGIN PRIVATE KEY-----'));
+    assert(res.normalizedPem.includes('-----END PRIVATE KEY-----'));
+  });
+
+  await t.test('2. 字面上的 \\n 換行單行 PEM 正確轉譯並校驗通過', () => {
+    const escapedKey = testEcP256Key.replace(/\n/g, '\\n');
+    assert(escapedKey.includes('\\n'));
+    assert(!escapedKey.includes('\n'));
+
+    const res = normalizeAndValidateApplePrivateKey(escapedKey);
+    assert.strictEqual(res.valid, true);
+    assert(res.normalizedPem.includes('\n'));
+    assert(!res.normalizedPem.includes('\\n'));
+  });
+
+  await t.test('3. 外層雙引號/單引號包裹並帶有 \\n 換行正確去除並校驗通過', () => {
+    const doubleQuoted = `"${testEcP256Key.replace(/\n/g, '\\n')}"`;
+    const singleQuoted = `'${testEcP256Key.replace(/\n/g, '\\n')}'`;
+
+    const res1 = normalizeAndValidateApplePrivateKey(doubleQuoted);
+    assert.strictEqual(res1.valid, true);
+    assert(!res1.normalizedPem.startsWith('"'));
+
+    const res2 = normalizeAndValidateApplePrivateKey(singleQuoted);
+    assert.strictEqual(res2.valid, true);
+    assert(!res2.normalizedPem.startsWith("'"));
+  });
+
+  await t.test('4. 完整 PKCS#8 PEM 經 Base64 編碼字串正確解碼並校驗通過', () => {
+    const base64Key = Buffer.from(testEcP256Key, 'utf8').toString('base64');
+    const res = normalizeAndValidateApplePrivateKey(base64Key);
+    assert.strictEqual(res.valid, true);
+    assert(res.normalizedPem.includes('-----BEGIN PRIVATE KEY-----'));
+  });
+
+  await t.test('5. 缺少 Header/Footer 的字串安全拒絕（絕不替其自動拼湊結構）', () => {
+    const rawBody = testEcP256Key
+      .replace(/-----BEGIN PRIVATE KEY-----/g, '')
+      .replace(/-----END PRIVATE KEY-----/g, '')
+      .replace(/\s+/g, '');
+
+    const res = normalizeAndValidateApplePrivateKey(rawBody);
+    assert.strictEqual(res.valid, false);
+    assert.match(res.error, /缺少完整的 PKCS#8 PEM 標頭或頁尾/);
+  });
+
+  await t.test('6. 錯誤曲線 (secp256k1) 安全拒絕並明確指出曲線不符', () => {
+    const res = normalizeAndValidateApplePrivateKey(testSecpKey);
+    assert.strictEqual(res.valid, false);
+    assert.match(res.error, /Apple 私鑰曲線不符/);
+    assert.match(res.error, /secp256k1/);
+  });
+
+  await t.test('7. 錯誤金鑰演算法 (RSA 2048 / Ed25519) 安全拒絕', () => {
+    const resRsa = normalizeAndValidateApplePrivateKey(testRsaKey);
+    assert.strictEqual(resRsa.valid, false);
+    assert.match(resRsa.error, /Apple 私鑰演算法不符/);
+
+    const resEd = normalizeAndValidateApplePrivateKey(testEdKey);
+    assert.strictEqual(resEd.valid, false);
+    assert.match(resEd.error, /Apple 私鑰演算法不符/);
+  });
+
+  await t.test('8. 對稱金鑰與隨機字串安全拒絕', () => {
+    const randomHex = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    const res = normalizeAndValidateApplePrivateKey(randomHex);
+    assert.strictEqual(res.valid, false);
+  });
+
+  await t.test('9. 損壞的 PEM 內容安全拒絕', () => {
+    const corruptPem = '-----BEGIN PRIVATE KEY-----\nNOT_VALID_BASE64_KEY_BYTES\n-----END PRIVATE KEY-----';
+    const res = normalizeAndValidateApplePrivateKey(corruptPem);
+    assert.strictEqual(res.valid, false);
+    assert.match(res.error, /Apple 私鑰解析失敗/);
+  });
+
+  await t.test('10. 空字串或非字串安全拒絕', () => {
+    assert.strictEqual(normalizeAndValidateApplePrivateKey('').valid, false);
+    assert.strictEqual(normalizeAndValidateApplePrivateKey(null).valid, false);
+    assert.strictEqual(normalizeAndValidateApplePrivateKey(undefined).valid, false);
+  });
+
+  await t.test('11. 整合測試：AppleServerApiClientWrapper 在環境變數含有字面 \\n 時成功初始化', () => {
+    process.env.APPLE_API_PRIVATE_KEY = testEcP256Key.replace(/\n/g, '\\n');
+    process.env.APPLE_API_KEY_ID = 'KEY_ID_TEST';
+    process.env.APPLE_API_ISSUER_ID = 'ISSUER_ID_TEST';
+    process.env.APPLE_IAP_ENVIRONMENT = 'sandbox';
+    process.env.APPLE_ALLOW_SANDBOX = 'true';
+
+    const client = new AppleServerApiClientWrapper();
+    assert.strictEqual(client.isConfigured(), true);
+    const status = client.getStatus();
+    assert.strictEqual(status.isConfigured, true);
+    assert.strictEqual(status.keyId, 'KEY_ID_TEST');
+
+    delete process.env.APPLE_API_PRIVATE_KEY;
+    delete process.env.APPLE_API_KEY_ID;
+    delete process.env.APPLE_API_ISSUER_ID;
+    delete process.env.APPLE_IAP_ENVIRONMENT;
+    delete process.env.APPLE_ALLOW_SANDBOX;
+  });
+
+  await t.test('12. 整合測試：AppleServerApiClientWrapper 在私鑰演算法或曲線錯誤時安全拒絕且不崩潰', () => {
+    process.env.APPLE_API_PRIVATE_KEY = testSecpKey; // 錯誤曲線
+    process.env.APPLE_API_KEY_ID = 'KEY_ID_TEST';
+    process.env.APPLE_API_ISSUER_ID = 'ISSUER_ID_TEST';
+    process.env.APPLE_IAP_ENVIRONMENT = 'sandbox';
+    process.env.APPLE_ALLOW_SANDBOX = 'true';
+
+    const client = new AppleServerApiClientWrapper();
+    assert.strictEqual(client.isConfigured(), false);
+    const status = client.getStatus();
+    assert.strictEqual(status.isConfigured, false);
+    assert.match(status.reason, /Apple Server API 私鑰校驗失敗/);
+    assert.match(status.reason, /曲線不符/);
+    // 確認原因中絕未洩漏任何私鑰或 PEM 內容
+    assert(!status.reason.includes('BEGIN PRIVATE KEY'));
+
+    delete process.env.APPLE_API_PRIVATE_KEY;
+    delete process.env.APPLE_API_KEY_ID;
+    delete process.env.APPLE_API_ISSUER_ID;
+    delete process.env.APPLE_IAP_ENVIRONMENT;
+    delete process.env.APPLE_ALLOW_SANDBOX;
   });
 });
 
