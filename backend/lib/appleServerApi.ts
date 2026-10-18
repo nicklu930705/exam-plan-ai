@@ -8,7 +8,7 @@ import {
   TransactionHistoryRequest,
   TransactionInfoResponse,
 } from '@apple/app-store-server-library';
-import { EXPECTED_BUNDLE_ID } from './appleIap';
+import { EXPECTED_BUNDLE_ID, resolveAppleEnvironment } from './appleEnvironment';
 
 /**
  * 考試計畫 AI - Apple App Store Server API 客戶端封裝模組 (v2)
@@ -68,44 +68,12 @@ export function resolveAppleServerApiEnvironment(): {
   envString: 'sandbox' | 'production';
   error?: string;
 } {
-  const rawEnv = (process.env.APPLE_IAP_ENVIRONMENT || '').trim().toLowerCase();
-  const rawAllow = process.env.APPLE_ALLOW_SANDBOX?.trim().toLowerCase();
-
-  // 1. 若明確提供 APPLE_IAP_ENVIRONMENT，必須是 sandbox 或 production
-  if (rawEnv && rawEnv !== 'sandbox' && rawEnv !== 'production') {
-    return {
-      valid: false,
-      targetEnv: Environment.PRODUCTION,
-      envString: 'production',
-      error: `無效的 APPLE_IAP_ENVIRONMENT 設定值「${rawEnv}」，僅允許 "sandbox" 或 "production"。`,
-    };
-  }
-
-  // 2. 衝突檢查：環境宣告為 sandbox，但明確禁用 sandbox
-  if (rawEnv === 'sandbox' && rawAllow === 'false') {
-    return {
-      valid: false,
-      targetEnv: Environment.SANDBOX,
-      envString: 'sandbox',
-      error: '環境設定矛盾：APPLE_IAP_ENVIRONMENT 設為 "sandbox"，但 APPLE_ALLOW_SANDBOX 設為 "false"。',
-    };
-  }
-
-  // 3. 衝突檢查：在嚴格正式環境下，若宣告 production 但卻開啟 allow_sandbox
-  if (rawEnv === 'production' && rawAllow === 'true' && process.env.NODE_ENV === 'production') {
-    return {
-      valid: false,
-      targetEnv: Environment.PRODUCTION,
-      envString: 'production',
-      error: '正式環境安全防護：正式環境 (NODE_ENV=production, APPLE_IAP_ENVIRONMENT=production) 嚴禁開啟 APPLE_ALLOW_SANDBOX。',
-    };
-  }
-
-  const isSandbox = rawEnv === 'sandbox' || (rawEnv !== 'production' && rawAllow === 'true');
+  const env = resolveAppleEnvironment();
   return {
-    valid: true,
-    targetEnv: isSandbox ? Environment.SANDBOX : Environment.PRODUCTION,
-    envString: isSandbox ? 'sandbox' : 'production',
+    valid: env.valid,
+    targetEnv: env.targetAppleEnv,
+    envString: env.targetRole,
+    error: env.error,
   };
 }
 

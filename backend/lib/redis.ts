@@ -417,7 +417,11 @@ class InMemoryRedisMock {
     return Array.isArray(existing) ? existing : [];
   }
 
-  async zadd(key: string, scoreMember: { score: number; member: string }): Promise<number> {
+  async zadd(key: string, scoreOrObj: any, maybeMember?: string): Promise<number> {
+    const scoreMember: { score: number; member: string } =
+      typeof scoreOrObj === 'object' && scoreOrObj !== null
+        ? scoreOrObj
+        : { score: Number(scoreOrObj), member: String(maybeMember) };
     const existing = (await this.get<Array<{ score: number; member: string }>>(key)) || [];
     const list = Array.isArray(existing) ? existing.filter((x) => x.member !== scoreMember.member) : [];
     list.push(scoreMember);
@@ -431,9 +435,18 @@ class InMemoryRedisMock {
   }
 
   async zrange(key: string, min: number, max: number): Promise<string[]> {
-    const existing = (await this.get<Array<{ score: number; member: string }>>(key)) || [];
-    if (!Array.isArray(existing)) return [];
-    const sorted = [...existing].sort((a, b) => a.score - b.score);
+    const raw = this.store.get(key);
+    if (!raw) return [];
+    let parsed: any;
+    try {
+      parsed = JSON.parse(raw.value);
+    } catch {
+      throw new Error('WRONGTYPE Operation against a key holding the wrong kind of value');
+    }
+    if (!Array.isArray(parsed)) {
+      throw new Error('WRONGTYPE Operation against a key holding the wrong kind of value');
+    }
+    const sorted = [...parsed].sort((a, b) => a.score - b.score);
     return sorted.map((x) => x.member).slice(min, max === -1 ? undefined : max + 1);
   }
 

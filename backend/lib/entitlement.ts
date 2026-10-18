@@ -235,43 +235,117 @@ export async function saveVerifiedEntitlement(
   await redis.zadd(`exam_ai:apple:devices_z:${originalTransactionId}`, { score: now, member: userId });
   await redis.sadd(`exam_ai:user:${userId}:apple_txns`, originalTransactionId);
 
-  // 4. 更新使用者的即時權限快取 (user:{userId}:entitlement)
-  if (effectiveStatus === 'active') {
-    const userCache: UserEntitlementCache = {
-      userId,
-      tier: effectiveTier === 'lifetime' ? 'lifetime' : 'pro',
-      productId,
-      originalTransactionId,
-      expiresAt: effectiveExpiresDate,
-      verifiedAt: now,
-      environment: verification.environment || 'Sandbox',
-    };
+  // 4. 跨交易綜合評估並更新使用者的即時權限快取 (user:{userId}:entitlement)
+  await syncUserDeviceEffectiveEntitlement(userId, originalTransactionId, entitlementRecord);
 
-    if (effectiveTier === 'lifetime') {
-      // Lifetime 終身版不設 TTL，永久快取
-      await redis.set(`exam_ai:user:${userId}:entitlement`, userCache);
-    } else if (effectiveExpiresDate) {
-      const cacheTtl = Math.max(300, Math.ceil((effectiveExpiresDate - now) / 1000));
-      await redis.set(`exam_ai:user:${userId}:entitlement`, userCache, { ex: cacheTtl });
-    }
-  } else {
-    // 若為到期或撤銷，清除當前裝置即時快取
-    await redis.del(`exam_ai:user:${userId}:entitlement`);
-
-    // 若被 Apple 撤銷或退款，聯防清除所有關聯裝置的 Pro 快取
-    if (effectiveStatus === 'revoked') {
-      try {
-        const associatedDevices = (await redis.zrange(`exam_ai:apple:devices_z:${originalTransactionId}`, 0, -1)) as string[];
-        for (const devId of associatedDevices) {
-          await redis.del(`exam_ai:user:${devId}:entitlement`);
+  // 若被 Apple 撤銷或退款，聯防同步所有關聯裝置 (確保不誤殺其他有效交易)
+  if (effectiveStatus === 'revoked') {
+    try {
+      const associatedDevices = (await redis.zrange(`exam_ai:apple:devices_z:${originalTransactionId}`, 0, -1)) as string[];
+      for (const devId of associatedDevices) {
+        if (devId !== userId) {
+          await syncUserDeviceEffectiveEntitlement(devId, originalTransactionId, entitlementRecord);
         }
-      } catch (revErr) {
-        console.warn('[退款聯防警示] 清除關聯裝置快取失敗:', revErr);
       }
+    } catch (revErr) {
+      console.warn('[退款聯防警示] 跨裝置同步失敗:', revErr);
     }
   }
 
   return { effectiveStatus, effectiveTier };
+}
+
+/**
+ * 跨交易綜合評估並更新使用者裝置之即時會員快取 (Multi-Transaction Device Entitlement Sync)
+ *
+ * 核心安全保證：
+ * 1. 當使用者同時擁有多筆 Apple 交易（如 Lifetime 終身版 + 月訂閱，或多筆訂閱），
+ *    到期或撤銷其中一筆時，嚴禁無條件刪除裝置快取誤殺其他有效交易！
+ * 2. 評估優先級：Lifetime (終身有效) > Pro (到期日最晚之有效續約)。
+ * 3. 僅當名下所有交易皆為 expired / revoked 時，才真正清除裝置快取收回權益。
+ */
+export async function syncUserDeviceEffectiveEntitlement(
+  userId: string,
+  targetOriginalTxId?: string,
+  updatedTargetRecord?: AppleEntitlementRecord | null,
+  now?: number,
+): Promise<UserEntitlementCache | null> {
+  if (!userId) return null;
+  const currentNow = now || Date.now();
+  const redis = getRedisClient();
+  const txnsKey = `exam_ai:user:${userId}:apple_txns`;
+  const userCacheKey = `exam_ai:user:${userId}:entitlement`;
+
+  const allTxns = (await redis.smembers(txnsKey)) as string[];
+  const txnsSet = new Set(Array.isArray(allTxns) ? allTxns : []);
+  if (targetOriginalTxId) {
+    txnsSet.add(targetOriginalTxId);
+  }
+
+  if (txnsSet.size === 0) {
+    await redis.del(userCacheKey);
+    return null;
+  }
+
+  let bestLifetimeRecord: AppleEntitlementRecord | null = null;
+  let bestProRecord: AppleEntitlementRecord | null = null;
+
+  for (const txId of txnsSet) {
+    if (!txId) continue;
+    let record: AppleEntitlementRecord | null = null;
+    if (txId === targetOriginalTxId && updatedTargetRecord !== undefined) {
+      record = updatedTargetRecord;
+    } else {
+      record = await getOriginalTransactionEntitlement(txId);
+    }
+
+    if (!record) continue;
+
+    // 排除已撤銷/退款之交易
+    if (record.status === 'revoked') continue;
+
+    // 檢查 Lifetime (終身買斷版)
+    if (record.tier === 'lifetime' && record.status === 'active') {
+      bestLifetimeRecord = record;
+      break; // Lifetime 優先度最高，直接採用
+    }
+
+    // 檢查 Pro 訂閱型方案：必須為 active 且到期日大於目前時間
+    if (record.tier === 'pro' && record.status === 'active') {
+      const exp = record.expiresDate;
+      if (!exp || exp > currentNow) {
+        if (!bestProRecord || (exp && (!bestProRecord.expiresDate || exp > bestProRecord.expiresDate))) {
+          bestProRecord = record;
+        }
+      }
+    }
+  }
+
+  const activeRecord = bestLifetimeRecord || bestProRecord;
+
+  if (activeRecord) {
+    const userCache: UserEntitlementCache = {
+      userId,
+      tier: activeRecord.tier,
+      productId: activeRecord.productId,
+      originalTransactionId: activeRecord.originalTransactionId,
+      expiresAt: activeRecord.expiresDate,
+      verifiedAt: currentNow,
+      environment: activeRecord.environment,
+    };
+
+    if (activeRecord.tier === 'lifetime') {
+      await redis.set(userCacheKey, userCache);
+    } else if (activeRecord.expiresDate) {
+      const cacheTtl = Math.max(300, Math.ceil((activeRecord.expiresDate - currentNow) / 1000));
+      await redis.set(userCacheKey, userCache, { ex: cacheTtl });
+    }
+    return userCache;
+  } else {
+    // 該使用者名下所有交易均無有效權限，安全刪除快取
+    await redis.del(userCacheKey);
+    return null;
+  }
 }
 
 /**
@@ -281,7 +355,12 @@ export async function getUserEntitlement(userId: string): Promise<UserEntitlemen
   if (!userId) return { tier: 'free', isVerified: false, status: 'none' };
 
   const redis = getRedisClient();
-  const cached = (await redis.get(`exam_ai:user:${userId}:entitlement`)) as UserEntitlementCache | null;
+  let cached = (await redis.get(`exam_ai:user:${userId}:entitlement`)) as UserEntitlementCache | null;
+
+  // 快取遺失自我修復：若快取為空，但該裝置關聯有交易，自動嘗試重新聚合最優權益
+  if (!cached) {
+    cached = await syncUserDeviceEffectiveEntitlement(userId);
+  }
 
   if (!cached) {
     return { tier: 'free', isVerified: false, status: 'none' };

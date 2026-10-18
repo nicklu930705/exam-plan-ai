@@ -6,6 +6,7 @@ import {
   VerificationStatus,
 } from '@apple/app-store-server-library';
 import { getAppleRootCertificatesBuffers } from './appleCertificates';
+import { isTransactionEnvironmentAllowed, resolveAppleEnvironment } from './appleEnvironment';
 
 /**
  * 考試計畫 AI - Apple StoreKit 2 交易驗證模組
@@ -118,27 +119,36 @@ export class AppleStoreKitVerifier implements ITransactionVerifier {
 
     this.initVerifiers();
 
-    const isStrictProd =
-      process.env.NODE_ENV === 'production' &&
-      (process.env.APPLE_IAP_ENVIRONMENT || 'production').toLowerCase() === 'production';
-    const allowSandbox =
-      options.allowSandbox ??
-      (isStrictProd
-        ? process.env.APPLE_ALLOW_SANDBOX === 'true'
-        : process.env.APPLE_ALLOW_SANDBOX !== 'false');
-    const preferredEnv = (process.env.APPLE_IAP_ENVIRONMENT || 'production').toLowerCase();
+    const envConfig = resolveAppleEnvironment();
+    if (!envConfig.valid) {
+      return {
+        isValid: false,
+        status: 'invalid',
+        tier: 'free',
+        isExpired: false,
+        isRevoked: false,
+        errorMessage: envConfig.error || 'Apple 環境設定無效或衝突。',
+      };
+    }
+
+    const allowSandbox = envConfig.allowSandbox && (options.allowSandbox ?? true);
+    const preferredEnv = envConfig.targetRole;
 
     let decoded: JWSTransactionDecodedPayload | null = null;
     let verifiedEnv = '';
     let lastError: any = null;
 
-    // 依據偏好環境先進行驗證
+    // 依據後端角色配置候選驗證器
     const verifiersToTry: Array<{ verifier: SignedDataVerifier; envName: string }> = [];
 
-    if (preferredEnv === 'sandbox' || !this.productionVerifier) {
+    if (preferredEnv === 'sandbox') {
       if (this.sandboxVerifier) verifiersToTry.push({ verifier: this.sandboxVerifier, envName: 'Sandbox' });
-      if (this.productionVerifier) verifiersToTry.push({ verifier: this.productionVerifier, envName: 'Production' });
+      // 僅在有 sandbox 權限時允許備用
+      if (allowSandbox && this.productionVerifier) {
+        verifiersToTry.push({ verifier: this.productionVerifier, envName: 'Production' });
+      }
     } else {
+      // 正式後端：嚴格僅掛載正式驗證器，絕對不允許 Sandbox
       if (this.productionVerifier) verifiersToTry.push({ verifier: this.productionVerifier, envName: 'Production' });
       if (allowSandbox && this.sandboxVerifier) {
         verifiersToTry.push({ verifier: this.sandboxVerifier, envName: 'Sandbox' });
@@ -170,6 +180,18 @@ export class AppleStoreKitVerifier implements ITransactionVerifier {
         isExpired: false,
         isRevoked: false,
         errorMessage: errDetail,
+      };
+    }
+
+    // 嚴格檢驗交易環境是否符合當前伺服器角色
+    if (!isTransactionEnvironmentAllowed(verifiedEnv)) {
+      return {
+        isValid: false,
+        status: 'invalid',
+        tier: 'free',
+        isExpired: false,
+        isRevoked: false,
+        errorMessage: `正式後端嚴格禁止處理 ${verifiedEnv} 交易憑證。`,
       };
     }
 

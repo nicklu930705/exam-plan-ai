@@ -9,6 +9,11 @@ import {
 } from '@apple/app-store-server-library';
 import { getAppleRootCertificatesBuffers } from './appleCertificates';
 import {
+  isNotificationEnvironmentAllowed,
+  isTransactionEnvironmentAllowed,
+  resolveAppleEnvironment,
+} from './appleEnvironment';
+import {
   EXPECTED_APP_APPLE_ID,
   EXPECTED_BUNDLE_ID,
   isValidProductId,
@@ -114,42 +119,18 @@ export class AppleNotificationVerifier {
 
     this.initVerifiers();
 
-    const rawEnv = (process.env.APPLE_IAP_ENVIRONMENT || '').trim().toLowerCase();
-    const rawAllow = process.env.APPLE_ALLOW_SANDBOX?.trim().toLowerCase();
-
-    // 1. 環境設定格式與衝突檢查
-    if (rawEnv && rawEnv !== 'sandbox' && rawEnv !== 'production') {
+    const envConfig = resolveAppleEnvironment();
+    if (!envConfig.valid) {
       return {
         isValid: false,
         notificationType: 'INVALID',
         notificationUUID: '',
-        errorMessage: `無效的 APPLE_IAP_ENVIRONMENT 設定值「${rawEnv}」，僅允許 "sandbox" 或 "production"。`,
-      };
-    }
-    if (rawEnv === 'sandbox' && rawAllow === 'false') {
-      return {
-        isValid: false,
-        notificationType: 'INVALID',
-        notificationUUID: '',
-        errorMessage: '環境設定矛盾：APPLE_IAP_ENVIRONMENT 設為 "sandbox"，但 APPLE_ALLOW_SANDBOX 設為 "false"。',
-      };
-    }
-    if (rawEnv === 'production' && rawAllow === 'true' && process.env.NODE_ENV === 'production') {
-      return {
-        isValid: false,
-        notificationType: 'INVALID',
-        notificationUUID: '',
-        errorMessage: '正式環境安全防護：正式環境 (NODE_ENV=production, APPLE_IAP_ENVIRONMENT=production) 嚴禁開啟 APPLE_ALLOW_SANDBOX。',
+        errorMessage: envConfig.error || 'Apple 環境設定無效或衝突。',
       };
     }
 
-    const isStrictProd =
-      process.env.NODE_ENV === 'production' &&
-      (rawEnv || 'production') === 'production';
-    const allowSandbox = isStrictProd
-      ? rawAllow === 'true'
-      : rawAllow !== 'false';
-    const preferredEnv = (rawEnv || 'production');
+    const preferredEnv = envConfig.targetRole;
+    const allowSandbox = envConfig.allowSandbox;
 
     let decodedPayload: ResponseBodyV2DecodedPayload | null = null;
     let activeVerifier: SignedDataVerifier | null = null;
@@ -157,10 +138,13 @@ export class AppleNotificationVerifier {
     let lastError: any = null;
 
     const candidateVerifiers: Array<{ verifier: SignedDataVerifier; envName: string }> = [];
-    if (preferredEnv === 'sandbox' || !this.productionVerifier) {
+    if (preferredEnv === 'sandbox') {
       if (this.sandboxVerifier) candidateVerifiers.push({ verifier: this.sandboxVerifier, envName: 'Sandbox' });
-      if (this.productionVerifier) candidateVerifiers.push({ verifier: this.productionVerifier, envName: 'Production' });
+      if (allowSandbox && this.productionVerifier) {
+        candidateVerifiers.push({ verifier: this.productionVerifier, envName: 'Production' });
+      }
     } else {
+      // 正式後端：嚴格僅掛載正式驗證器，絕對不允許 Sandbox
       if (this.productionVerifier) candidateVerifiers.push({ verifier: this.productionVerifier, envName: 'Production' });
       if (allowSandbox && this.sandboxVerifier) {
         candidateVerifiers.push({ verifier: this.sandboxVerifier, envName: 'Sandbox' });
@@ -188,6 +172,16 @@ export class AppleNotificationVerifier {
         notificationType: 'INVALID',
         notificationUUID: '',
         errorMessage: this.formatError(lastError),
+      };
+    }
+
+    // 嚴格比對 Webhook 通知環境是否符合當前伺服器角色 (正式後端拒絕 Sandbox Webhook)
+    if (!isNotificationEnvironmentAllowed(verifiedEnv)) {
+      return {
+        isValid: false,
+        notificationType: decodedPayload.notificationType || 'UNKNOWN',
+        notificationUUID: decodedPayload.notificationUUID || '',
+        errorMessage: `正式後端嚴格禁止處理 ${verifiedEnv} Webhook 通知。`,
       };
     }
 
@@ -244,6 +238,15 @@ export class AppleNotificationVerifier {
           errorMessage: `外層通知與內層交易之環境不一致 (${outerEnv} vs ${decodedTransaction.environment})。`,
         };
       }
+      // 內層交易環境是否符合當前伺服器角色
+      if (decodedTransaction.environment && !isTransactionEnvironmentAllowed(decodedTransaction.environment)) {
+        return {
+          isValid: false,
+          notificationType: decodedPayload.notificationType || 'UNKNOWN',
+          notificationUUID: decodedPayload.notificationUUID || '',
+          errorMessage: `正式後端嚴格禁止處理 ${decodedTransaction.environment} 內層交易憑證。`,
+        };
+      }
     }
 
     // 解密內嵌的 signedRenewalInfo (若有)
@@ -283,6 +286,89 @@ export class AppleNotificationVerifier {
       revocationDate: decodedTransaction?.revocationDate,
       rawPayload: decodedPayload,
     };
+  }
+
+  async verifyAndDecodeTransaction(
+    signedTransactionInfo: string,
+  ): Promise<JWSTransactionDecodedPayload> {
+    if (!signedTransactionInfo || typeof signedTransactionInfo !== 'string') {
+      throw new Error('未提供有效的 signedTransactionInfo。');
+    }
+    this.initVerifiers();
+    const envConfig = resolveAppleEnvironment();
+    if (!envConfig.valid) {
+      throw new Error(envConfig.error || 'Apple 環境設定無效。');
+    }
+
+    const candidateVerifiers: Array<{ verifier: SignedDataVerifier; envName: string }> = [];
+    if (envConfig.targetRole === 'sandbox') {
+      if (this.sandboxVerifier) candidateVerifiers.push({ verifier: this.sandboxVerifier, envName: 'Sandbox' });
+      if (envConfig.allowSandbox && this.productionVerifier) {
+        candidateVerifiers.push({ verifier: this.productionVerifier, envName: 'Production' });
+      }
+    } else {
+      if (this.productionVerifier) candidateVerifiers.push({ verifier: this.productionVerifier, envName: 'Production' });
+      if (envConfig.allowSandbox && this.sandboxVerifier) {
+        candidateVerifiers.push({ verifier: this.sandboxVerifier, envName: 'Sandbox' });
+      }
+    }
+
+    let lastError: any = null;
+    for (const { verifier, envName } of candidateVerifiers) {
+      try {
+        const decoded = await verifier.verifyAndDecodeTransaction(signedTransactionInfo.trim());
+        if (decoded.bundleId && decoded.bundleId !== EXPECTED_BUNDLE_ID) {
+          throw new Error(`交易 Bundle ID 不符 (預期 ${EXPECTED_BUNDLE_ID}，實際 ${decoded.bundleId})。`);
+        }
+        if (decoded.environment && !isTransactionEnvironmentAllowed(decoded.environment)) {
+          throw new Error(`環境不相符：禁止在當前伺服器處理 ${decoded.environment} 交易。`);
+        }
+        return decoded;
+      } catch (err: any) {
+        lastError = err;
+        if (err instanceof VerificationException && err.status === VerificationStatus.INVALID_ENVIRONMENT) {
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw lastError || new Error('Apple 交易簽章驗證失敗。');
+  }
+
+  async verifyAndDecodeRenewalInfo(
+    signedRenewalInfo: string,
+  ): Promise<JWSRenewalInfoDecodedPayload> {
+    if (!signedRenewalInfo || typeof signedRenewalInfo !== 'string') {
+      throw new Error('未提供有效的 signedRenewalInfo。');
+    }
+    this.initVerifiers();
+    const envConfig = resolveAppleEnvironment();
+    if (!envConfig.valid) {
+      throw new Error(envConfig.error || 'Apple 環境設定無效。');
+    }
+
+    const candidateVerifiers: SignedDataVerifier[] = [];
+    if (envConfig.targetRole === 'sandbox') {
+      if (this.sandboxVerifier) candidateVerifiers.push(this.sandboxVerifier);
+      if (envConfig.allowSandbox && this.productionVerifier) candidateVerifiers.push(this.productionVerifier);
+    } else {
+      if (this.productionVerifier) candidateVerifiers.push(this.productionVerifier);
+      if (envConfig.allowSandbox && this.sandboxVerifier) candidateVerifiers.push(this.sandboxVerifier);
+    }
+
+    let lastError: any = null;
+    for (const verifier of candidateVerifiers) {
+      try {
+        return await verifier.verifyAndDecodeRenewalInfo(signedRenewalInfo.trim());
+      } catch (err: any) {
+        lastError = err;
+        if (err instanceof VerificationException && err.status === VerificationStatus.INVALID_ENVIRONMENT) {
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw lastError || new Error('Apple 續約資訊簽章驗證失敗。');
   }
 
   private formatError(err: any): string {
@@ -451,14 +537,24 @@ export function evaluateSubscriptionStateTransition(params: {
 
   // 4. 安全關鍵防護：若既有記錄已被撤銷/退款
   if (existingRecord && existingRecord.status === 'revoked') {
-    // 檢查 incoming 是否為「在退款後才發生的全新購買/重新訂閱」
+    // 嚴格安全規範：
+    // 1. 新交易本身不得帶有撤銷標記 (revocationDate 必須為空)。
+    // 2. 新購買時間 (purchaseDate) 必須嚴格晚於先前的退款撤銷時間 (revocationDate)。
+    //    嚴禁僅因簽章時間 (signedDate) 較新就忽視先前的退款紀錄！
+    // 3. 必須為明確的購買/重新訂閱事件。
     const incomingPurchaseDate = incomingNotification.purchaseDate || tx?.purchaseDate || 0;
-    const incomingSignedDate = incomingNotification.signedDate || 0;
     const existingRevocationDate = existingRecord.revocationDate || 0;
+    const incomingRevocationDate = incomingNotification.revocationDate || tx?.revocationDate;
 
-    const isSubscribedEvent = type === 'SUBSCRIBED' || subtype === 'INITIAL_BUY' || subtype === 'RESUBSCRIBE';
+    const isSubscribedEvent =
+      type === 'SUBSCRIBED' ||
+      type === 'DID_RENEW' ||
+      subtype === 'INITIAL_BUY' ||
+      subtype === 'RESUBSCRIBE';
+
     const isNewPurchaseAfterRevoke =
-      (incomingPurchaseDate > existingRevocationDate || incomingSignedDate > existingRevocationDate) &&
+      !incomingRevocationDate &&
+      incomingPurchaseDate > existingRevocationDate &&
       isSubscribedEvent;
 
     if (!isNewPurchaseAfterRevoke) {
@@ -656,9 +752,16 @@ export class DryRunAppleWebhookEventHandler implements IAppleWebhookEventHandler
 }
 
 let customWebhookEventHandler: IAppleWebhookEventHandler | null = null;
+let defaultWebhookEventHandler: IAppleWebhookEventHandler = new DryRunAppleWebhookEventHandler();
+
+export function setDefaultAppleWebhookEventHandler(handler: IAppleWebhookEventHandler) {
+  defaultWebhookEventHandler = handler;
+}
+
 export function setCustomAppleWebhookEventHandler(handler: IAppleWebhookEventHandler | null) {
   customWebhookEventHandler = handler;
 }
+
 export function getAppleWebhookEventHandler(): IAppleWebhookEventHandler {
-  return customWebhookEventHandler || new DryRunAppleWebhookEventHandler();
+  return customWebhookEventHandler || defaultWebhookEventHandler;
 }

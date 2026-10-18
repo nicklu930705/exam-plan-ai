@@ -3,9 +3,10 @@ import {
   acquireWebhookIdempotency,
   completeWebhookIdempotency,
   getAppleNotificationVerifier,
-  getAppleWebhookEventHandler,
   releaseWebhookIdempotency,
+  getAppleWebhookEventHandler,
 } from '../lib/appleWebhookHandler';
+import '../lib/appleSubscriptionSync';
 
 /**
  * 考試計畫 AI - Apple App Store Server Notifications V2 Webhook 端點
