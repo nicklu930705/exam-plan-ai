@@ -20,6 +20,7 @@ const {
 } = require('../dist/lib/redis.js');
 const {
   generateEntitlementProofToken,
+  verifyEntitlementProofToken,
   saveVerifiedEntitlement,
   getOriginalTransactionEntitlement,
 } = require('../dist/lib/entitlement.js');
@@ -730,6 +731,183 @@ test('會員狀態查詢 API (subscription-status) 與 Redis OCC 安全測試套
     const cachedAfter = await redis.get(`exam_ai:user:${userId}:entitlement`);
     assert.ok(cachedAfter);
     assert.equal(cachedAfter.tier, 'lifetime');
+  });
+
+  await t.test('15. Lifetime 購買後 Proof Token 過期不影響終身權益：查詢時自動續簽全新 Token', async () => {
+    const userId = 'dev_lifetime_token_expiry_user';
+    const originalTransactionId = 'orig_tx_lifetime_perm_001';
+
+    // 建立永久 Lifetime 主記錄與裝置關聯
+    await saveVerifiedEntitlement(userId, {
+      isValid: true,
+      tier: 'lifetime',
+      status: 'active',
+      productId: 'exampro_lifetime',
+      transactionId: 'tx_perm_001',
+      originalTransactionId,
+      environment: 'Sandbox',
+      bundleId: EXPECTED_BUNDLE_ID,
+    });
+
+    // 1. 驗證 Redis 中的裝置會員資格永久有效 (不隨 Token 到期失效)
+    const { getUserEntitlement } = require('../dist/lib/entitlement.js');
+    const entitlement = await getUserEntitlement(userId);
+    assert.equal(entitlement.tier, 'lifetime');
+    assert.equal(entitlement.status, 'active');
+    assert.equal(entitlement.isVerified, true);
+
+    // 2. 簽發一個過期的 Proof Token (模擬 8 天後過期)
+    const expiredToken = generateEntitlementProofToken(userId, originalTransactionId, Date.now() - 86400 * 1000);
+    const tokenCheck = await verifyEntitlementProofToken(expiredToken, userId);
+    assert.equal(tokenCheck.valid, false);
+    assert.match(tokenCheck.reason, /逾期/);
+
+    // 3. 用戶端 StoreKit 2 於 Token 過期時自動攜帶本機 JWS 向伺服端換發新 Token
+    setCustomTransactionVerifier({
+      async verify(jws) {
+        if (jws === 'valid_storekit2_lifetime_jws') {
+          return {
+            isValid: true,
+            tier: 'lifetime',
+            status: 'active',
+            productId: 'exampro_lifetime',
+            transactionId: 'tx_perm_001',
+            originalTransactionId,
+            purchaseDate: Date.now() - 365 * 86400 * 1000,
+            environment: 'Sandbox',
+            bundleId: EXPECTED_BUNDLE_ID,
+          };
+        }
+        return { isValid: false, errorMessage: '無效簽署' };
+      },
+    });
+
+    const res = await makeRequest(
+      server,
+      {
+        method: 'POST',
+        headers: {
+          'X-Client-Device-Id': userId,
+          Authorization: `Bearer ${expiredToken}`,
+          'X-Apple-JWS': 'valid_storekit2_lifetime_jws',
+        },
+      },
+      {
+        signedTransaction: 'valid_storekit2_lifetime_jws',
+      },
+    );
+
+    assert.equal(res.status, 200);
+    assert.equal(res.body.success, true);
+    assert.equal(res.body.tier, 'lifetime');
+    assert.equal(res.body.status, 'active');
+    assert.equal(res.body.isVerified, true);
+    assert.ok(res.body.proofToken);
+    assert.notEqual(res.body.proofToken, expiredToken);
+
+    // 驗證新換發的 Token 有效性
+    const newTokenCheck = await verifyEntitlementProofToken(res.body.proofToken, userId);
+    assert.equal(newTokenCheck.valid, true);
+    assert.equal(newTokenCheck.originalTransactionId, originalTransactionId);
+  });
+
+  await t.test('16. Lifetime 退款/撤銷後：舊 Proof Token 絕不能繼續授予 Lifetime 權限', async () => {
+    const userId = 'dev_lifetime_revoked_token_user';
+    const originalTransactionId = 'orig_tx_lifetime_revoked_002';
+
+    // 先建立正常 Lifetime 並取得有效 Proof Token
+    await saveVerifiedEntitlement(userId, {
+      isValid: true,
+      tier: 'lifetime',
+      status: 'active',
+      productId: 'exampro_lifetime',
+      transactionId: 'tx_perm_002',
+      originalTransactionId,
+      environment: 'Sandbox',
+      bundleId: EXPECTED_BUNDLE_ID,
+    });
+
+    const activeProofToken = generateEntitlementProofToken(userId, originalTransactionId, Date.now() + 5 * 86400 * 1000);
+    const beforeCheck = await verifyEntitlementProofToken(activeProofToken, userId);
+    assert.equal(beforeCheck.valid, true);
+
+    // 隨後 Apple 執行退款，將交易主記錄標記為 revoked
+    await saveVerifiedEntitlement(userId, {
+      isValid: true,
+      tier: 'lifetime',
+      status: 'revoked',
+      productId: 'exampro_lifetime',
+      transactionId: 'tx_revoked_002',
+      originalTransactionId,
+      revocationDate: Date.now(),
+      environment: 'Sandbox',
+      bundleId: EXPECTED_BUNDLE_ID,
+    });
+
+    // 驗證舊 Proof Token 是否被即時阻斷
+    const afterCheck = await verifyEntitlementProofToken(activeProofToken, userId);
+    assert.equal(afterCheck.valid, false);
+    assert.match(afterCheck.reason, /退款或撤銷/);
+
+    // 嘗試持舊 Token 發送 API 請求
+    const res = await makeRequest(
+      server,
+      {
+        method: 'POST',
+        headers: {
+          'X-Client-Device-Id': userId,
+          Authorization: `Bearer ${activeProofToken}`,
+        },
+      },
+      {},
+    );
+
+    assert.equal(res.status, 200);
+    assert.equal(res.body.tier, 'free');
+    assert.equal(res.body.isVerified, false);
+    assert.equal(res.body.proofToken, undefined); // 絕不簽發新 Token
+  });
+
+  await t.test('17. 裝置快取未更新殘留 active 但主記錄已退款時：getUserEntitlement 主動清除殘留快取並降級', async () => {
+    const userId = 'dev_stale_cache_victim_003';
+    const originalTransactionId = 'orig_tx_stale_cache_003';
+    const redis = require('../dist/lib/redis.js').getRedisClient();
+
+    // 1. 刻意寫入一個狀態為 active 的殘留裝置快取 (模擬快取更新遺失之極端異常情況)
+    await redis.set(`exam_ai:user:${userId}:entitlement`, {
+      userId,
+      tier: 'lifetime',
+      productId: 'exampro_lifetime',
+      originalTransactionId,
+      verifiedAt: Date.now(),
+      environment: 'Sandbox',
+    });
+
+    // 2. 但交易主記錄已被 Apple 標記為 revoked
+    await redis.set(`exam_ai:apple:entitlement:${originalTransactionId}`, {
+      originalTransactionId,
+      lastTransactionId: 'tx_stale_revoked',
+      productId: 'exampro_lifetime',
+      tier: 'lifetime',
+      status: 'revoked',
+      purchaseDate: Date.now() - 100000,
+      revocationDate: Date.now(),
+      verifiedAt: Date.now(),
+      environment: 'Sandbox',
+    });
+
+    // 3. 呼叫 getUserEntitlement
+    const { getUserEntitlement } = require('../dist/lib/entitlement.js');
+    const entitlement = await getUserEntitlement(userId);
+
+    // 驗證：及時偵測到主記錄為 revoked，強制降級為 Free，isVerified 必須為 false！
+    assert.equal(entitlement.tier, 'free');
+    assert.equal(entitlement.status, 'revoked');
+    assert.equal(entitlement.isVerified, false);
+
+    // 驗證殘留的裝置快取已在查詢過程中被安全清除
+    const cleanedCache = await redis.get(`exam_ai:user:${userId}:entitlement`);
+    assert.equal(cleanedCache, null);
   });
 });
 

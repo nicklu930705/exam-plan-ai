@@ -69,6 +69,8 @@ export interface StateTransitionResult {
     | 'IGNORE_STALE_TIMESTAMP'
     | 'IGNORE_OLD_RECEIPT_AFTER_REVOCATION'
     | 'IGNORE_TEST_NOTIFICATION'
+    | 'NOOP_REFUND_DECLINED'
+    | 'NOOP_UNHANDLED_EVENT'
     | 'INVALID_PRODUCT';
   status: 'active' | 'expired' | 'revoked' | 'noop';
   tier: 'free' | 'pro' | 'lifetime';
@@ -522,7 +524,19 @@ export function evaluateSubscriptionStateTransition(params: {
   const productConfig = VALID_PRODUCT_CONFIG[productId as ValidProductId];
   const targetTier = productConfig.tier;
 
-  // 3. 處理 REFUND 與 REVOKE (最高優先級)
+  // 3. 處理 REFUND_DECLINED (退款申請被 Apple 拒絕：維持現狀，不撤銷權益)
+  if (type === 'REFUND_DECLINED') {
+    return {
+      actionable: false,
+      action: 'NOOP_REFUND_DECLINED',
+      status: existingRecord?.status || 'noop',
+      tier: existingRecord?.tier || targetTier,
+      effectiveExpiresDate: existingRecord?.expiresDate || incomingNotification.expiresDate,
+      reason: 'Apple 已駁回退款申請 (REFUND_DECLINED)，維持現有會員權益與方案效期。',
+    };
+  }
+
+  // 4. 處理 REFUND 與 REVOKE (最高優先級)
   if (type === 'REFUND' || type === 'REVOKE') {
     const revocationDate = incomingNotification.revocationDate || incomingNotification.signedDate || now;
     return {
@@ -604,6 +618,12 @@ export function evaluateSubscriptionStateTransition(params: {
 
   // 6. 處理扣款失敗 (DID_FAIL_TO_RENEW)
   if (type === 'DID_FAIL_TO_RENEW') {
+    // 依據 Apple 規範：扣款失敗不代表使用者取消續訂，Apple 會在重試期內繼續扣款，依 renewal.autoRenewStatus 判定
+    const willRenew =
+      renewal?.autoRenewStatus !== undefined
+        ? renewal.autoRenewStatus === 1
+        : (existingRecord?.willRenew ?? true);
+
     // 檢查是否處於寬限期 (Grace Period)
     const inGracePeriod =
       subtype === 'GRACE_PERIOD' ||
@@ -617,7 +637,7 @@ export function evaluateSubscriptionStateTransition(params: {
         status: 'active',
         tier: targetTier,
         effectiveExpiresDate: incomingNotification.expiresDate || existingRecord?.expiresDate,
-        willRenew: true,
+        willRenew,
         reason: '訂閱扣款失敗，目前處於 Apple 帳單寬限期 (Grace Period)，保留會員資格。',
       };
     }
@@ -634,6 +654,17 @@ export function evaluateSubscriptionStateTransition(params: {
         reason: '訂閱續約扣款失敗且已逾到期日，會員資格降為免費版。',
       };
     }
+
+    // 尚未逾期但續約扣款失敗（一般帳單重試 Billing Retry）：維持 Pro 權益至原到期日
+    return {
+      actionable: true,
+      action: 'UPDATE_RENEWAL_INFO',
+      status: 'active',
+      tier: targetTier,
+      effectiveExpiresDate: currentExpiry,
+      willRenew,
+      reason: '訂閱續約扣款失敗進入帳單重試期，目前尚未逾期，保留 Pro 權益至到期日為止。',
+    };
   }
 
   // 7. 寬限期結束 (GRACE_PERIOD_EXPIRED)
@@ -699,10 +730,10 @@ export function evaluateSubscriptionStateTransition(params: {
     };
   }
 
-  // 10. 預設非關鍵通知
+  // 10. 預設非關鍵通知或未特別處理之事件
   return {
     actionable: false,
-    action: 'IGNORE_TEST_NOTIFICATION',
+    action: 'NOOP_UNHANDLED_EVENT',
     status: 'noop',
     tier: existingRecord?.tier || 'free',
     reason: `未特別處理之 Apple 事件類型「${type}」。`,

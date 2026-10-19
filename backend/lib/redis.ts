@@ -230,11 +230,58 @@ local ttlSeconds = tonumber(ARGV[3])
 
 local existing = redis.call('GET', mainKey)
 if existing then
-  local ok, data = pcall(cjson.decode, existing)
-  if ok and data then
-    local currentTimestamp = tonumber(data.verifiedAt or data.purchaseDate or 0)
-    if currentTimestamp and currentTimestamp > incomingTimestamp then
-      return {'STALE', tostring(currentTimestamp)}
+  local okExisting, existingData = pcall(cjson.decode, existing)
+  local okIncoming, incomingData = pcall(cjson.decode, recordStr)
+
+  if okExisting and existingData and okIncoming and incomingData then
+    -- 1. 退款撤銷鎖定防護 (Revocation Lock)：
+    -- 若既有記錄已被撤銷/退款，新寫入者若非更晚購買的全新合法交易，嚴禁逆向覆蓋為 active
+    if existingData.status == 'revoked' and incomingData.status ~= 'revoked' then
+      local existingRevocation = tonumber(existingData.revocationDate or existingData.lastAppleSignedDate or 0)
+      local incomingPurchase = tonumber(incomingData.purchaseDate or 0)
+      if incomingPurchase <= existingRevocation then
+        return {'REVOKED_LOCK', tostring(existingRevocation)}
+      end
+    end
+
+    -- 2. 權威 Apple 事件時間戳記比對 (優先採用 Apple 簽署時間 lastAppleSignedDate，次為 purchaseDate，絕不依賴伺服器本機時鐘 verifiedAt)
+    local existingEventTime = tonumber(existingData.lastAppleSignedDate or existingData.purchaseDate or 0)
+    local incomingEventTime = tonumber(incomingData.lastAppleSignedDate or incomingTimestamp or 0)
+
+    -- A. 既有記錄明確更新於傳入事件：
+    if existingEventTime > incomingEventTime then
+      -- 特例：若傳入為退款 (revoked) 且其 revocationDate >= existingEventTime，退款具最高優先級，允許覆蓋
+      local incomingRevocation = tonumber(incomingData.revocationDate or 0)
+      if incomingData.status == 'revoked' and incomingRevocation >= existingEventTime then
+        -- 允許寫入退款
+      else
+        return {'STALE', tostring(existingEventTime)}
+      end
+    end
+
+    -- 3. 亂序過期保護 (Out-of-order Expired Protection)：
+    -- 若既有記錄為有效續訂，且既有到期日大於傳入過期通知之到期日，絕不允許將會員降級為 expired
+    if existingData.status == 'active' and incomingData.status == 'expired' then
+      local existingExpires = tonumber(existingData.expiresDate or 0)
+      local incomingExpires = tonumber(incomingData.expiresDate or 0)
+      if existingExpires > 0 and incomingExpires > 0 and existingExpires > incomingExpires then
+        return {'OUT_OF_ORDER_EXPIRED', tostring(existingExpires)}
+      end
+    end
+
+    -- 4. 時間戳記完全相同 (incomingEventTime == existingEventTime) 但狀態不同衝突防護：
+    if incomingEventTime == existingEventTime then
+      -- 退款優先於有效或過期：若現有為 revoked，不可被 active 覆蓋
+      if existingData.status == 'revoked' and incomingData.status ~= 'revoked' then
+        return {'REVOKED_LOCK', tostring(existingEventTime)}
+      end
+      -- 若現有為 active 且尚未逾期，相同時間戳記之 expired 不得覆蓋 active
+      if existingData.status == 'active' and incomingData.status == 'expired' then
+        local existingExpires = tonumber(existingData.expiresDate or 0)
+        if existingExpires > 0 and incomingData.expiresDate and existingExpires >= tonumber(incomingData.expiresDate) then
+          return {'OUT_OF_ORDER_EXPIRED', tostring(existingExpires)}
+        end
+      end
     end
   end
 end
@@ -405,10 +452,51 @@ class InMemoryRedisMock {
       const existingRaw = this.getCleanKey(mainKey);
       if (existingRaw) {
         try {
-          const data = JSON.parse(existingRaw);
-          const currentTimestamp = Number(data.verifiedAt || data.purchaseDate || 0);
-          if (currentTimestamp > incomingTimestamp) {
-            return ['STALE', String(currentTimestamp)];
+          const existingData = JSON.parse(existingRaw);
+          const incomingData = JSON.parse(String(recordStr));
+
+          // 1. 退款撤銷鎖定防護
+          if (existingData.status === 'revoked' && incomingData.status !== 'revoked') {
+            const existingRevocation = Number(existingData.revocationDate || existingData.lastAppleSignedDate || 0);
+            const incomingPurchase = Number(incomingData.purchaseDate || 0);
+            if (incomingPurchase <= existingRevocation) {
+              return ['REVOKED_LOCK', String(existingRevocation)];
+            }
+          }
+
+          // 2. Apple 事件時間戳記比對
+          let existingEventTime = Number(existingData.lastAppleSignedDate || existingData.purchaseDate || 0);
+          const incomingEventTime = Number(incomingData.lastAppleSignedDate || incomingTimestamp || 0);
+
+          if (existingEventTime > incomingEventTime) {
+            const incomingRevocation = Number(incomingData.revocationDate || 0);
+            if (incomingData.status === 'revoked' && incomingRevocation >= existingEventTime) {
+              // 允許寫入退款
+            } else {
+              return ['STALE', String(existingEventTime)];
+            }
+          }
+
+          // 3. 亂序過期保護
+          if (existingData.status === 'active' && incomingData.status === 'expired') {
+            const existingExpires = Number(existingData.expiresDate || 0);
+            const incomingExpires = Number(incomingData.expiresDate || 0);
+            if (existingExpires > 0 && incomingExpires > 0 && existingExpires > incomingExpires) {
+              return ['OUT_OF_ORDER_EXPIRED', String(existingExpires)];
+            }
+          }
+
+          // 4. 時間戳記完全相同衝突防護
+          if (incomingEventTime === existingEventTime) {
+            if (existingData.status === 'revoked' && incomingData.status !== 'revoked') {
+              return ['REVOKED_LOCK', String(existingEventTime)];
+            }
+            if (existingData.status === 'active' && incomingData.status === 'expired') {
+              const existingExpires = Number(existingData.expiresDate || 0);
+              if (existingExpires > 0 && incomingData.expiresDate && existingExpires >= Number(incomingData.expiresDate)) {
+                return ['OUT_OF_ORDER_EXPIRED', String(existingExpires)];
+              }
+            }
           }
         } catch {
           // 忽略格式解析例外
@@ -444,6 +532,18 @@ class InMemoryRedisMock {
     if (!existing) return 0;
     existing.expireAt = Date.now() + seconds * 1000;
     return 1;
+  }
+
+  async ttl(key: string): Promise<number> {
+    const entry = this.store.get(key);
+    if (!entry) return -2;
+    if (entry.expireAt === undefined) return -1;
+    const remainingMs = entry.expireAt - Date.now();
+    if (remainingMs <= 0) {
+      this.store.delete(key);
+      return -2;
+    }
+    return Math.ceil(remainingMs / 1000);
   }
 
   async get<T = any>(key: string): Promise<T | null> {

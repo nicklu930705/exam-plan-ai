@@ -61,6 +61,7 @@ export interface AppleVerificationResult {
   originalPurchaseDate?: number;
   expiresDate?: number;
   revocationDate?: number;
+  signedDate?: number;
   environment?: string;
   isExpired: boolean;
   isRevoked: boolean;
@@ -237,6 +238,7 @@ export class AppleStoreKitVerifier implements ITransactionVerifier {
         originalPurchaseDate: decoded.originalPurchaseDate,
         expiresDate: decoded.expiresDate,
         revocationDate: decoded.revocationDate,
+        signedDate: decoded.signedDate,
         environment: verifiedEnv,
         isExpired: false,
         isRevoked: true,
@@ -272,6 +274,7 @@ export class AppleStoreKitVerifier implements ITransactionVerifier {
           purchaseDate: decoded.purchaseDate,
           originalPurchaseDate: decoded.originalPurchaseDate,
           expiresDate,
+          signedDate: decoded.signedDate,
           environment: verifiedEnv,
           isExpired: true,
           isRevoked: false,
@@ -291,6 +294,7 @@ export class AppleStoreKitVerifier implements ITransactionVerifier {
       purchaseDate: decoded.purchaseDate,
       originalPurchaseDate: decoded.originalPurchaseDate,
       expiresDate: decoded.expiresDate,
+      signedDate: decoded.signedDate,
       environment: verifiedEnv,
       isExpired: false,
       isRevoked: false,

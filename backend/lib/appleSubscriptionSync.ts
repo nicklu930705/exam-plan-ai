@@ -164,7 +164,16 @@ export async function applySubscriptionStateToRedis(params: {
       now,
     expiresDate: effectiveExpiresDate,
     revocationDate: effectiveRevocationDate,
-    verifiedAt: verifiedNotification?.signedDate || now,
+    willRenew:
+      transition.willRenew !== undefined
+        ? transition.willRenew
+        : existingRecord?.willRenew,
+    verifiedAt: now,
+    lastAppleSignedDate:
+      verifiedNotification?.signedDate ||
+      verifiedNotification?.transaction?.signedDate ||
+      verifiedNotification?.purchaseDate ||
+      now,
     environment:
       verifiedNotification?.environment ||
       existingRecord?.environment ||
@@ -182,7 +191,11 @@ export async function applySubscriptionStateToRedis(params: {
     }
   }
 
-  const incomingTimestamp = verifiedNotification?.signedDate || now;
+  const incomingTimestamp =
+    verifiedNotification?.signedDate ||
+    verifiedNotification?.transaction?.signedDate ||
+    verifiedNotification?.purchaseDate ||
+    now;
   const mainKey = `exam_ai:apple:entitlement:${originalTransactionId}`;
 
   try {
@@ -192,20 +205,74 @@ export async function applySubscriptionStateToRedis(params: {
       [JSON.stringify(updatedRecord), String(incomingTimestamp), String(recordTtl)],
     )) as string[];
 
-    if (occRes && occRes[0] === 'STALE') {
-      const currentTimestamp = occRes[1] || 'unknown';
+    if (occRes && occRes[0] !== 'OK') {
+      const occCode = occRes[0];
+      const detail = occRes[1] || 'unknown';
+
+      // 關鍵防護：即使主記錄因 STALE、REVOKED_LOCK 或 OUT_OF_ORDER_EXPIRED 略過主鍵寫入，
+      // 仍必須對關聯裝置進行補償同步，確保所有裝置與目前 Redis 中的權威記錄保持一致！
+      let compensatedDevicesCount = 0;
+      try {
+        const devicesKey = `exam_ai:apple:devices_z:${originalTransactionId}`;
+        const associatedDevices = (await redis.zrange(devicesKey, 0, -1)) as string[];
+        if (Array.isArray(associatedDevices) && associatedDevices.length > 0) {
+          for (const devId of associatedDevices) {
+            if (!devId || typeof devId !== 'string') continue;
+            // 傳入 null 作為 updatedTargetRecord，直接讀取 Redis 最新權威記錄進行裝置權益評估
+            await syncUserDeviceEffectiveEntitlement(devId, originalTransactionId, null, now);
+            compensatedDevicesCount++;
+          }
+        }
+      } catch (compErr: any) {
+        console.error(`[訂閱同步補償異常] 裝置補償同步失敗 (交易: ${originalTransactionId}):`, compErr?.message || compErr);
+        throw new SubscriptionSyncError(
+          `裝置補償同步失敗: ${compErr?.message || compErr}`,
+          originalTransactionId,
+          compErr,
+        );
+      }
+
+      if (occCode === 'REVOKED_LOCK') {
+        return {
+          success: true,
+          action: 'IGNORE_OLD_RECEIPT_AFTER_REVOCATION',
+          originalTransactionId,
+          status: 'revoked',
+          tier: 'free',
+          devicesUpdatedCount: compensatedDevicesCount,
+          dryRun: false,
+          reason: `Redis OCC 阻擋：此交易已被 Apple 撤銷或退款 (鎖定時間戳: ${detail})，拒絕以舊收據覆蓋。已補償確認關聯裝置 (${compensatedDevicesCount} 台)。`,
+        };
+      }
+
+      if (occCode === 'OUT_OF_ORDER_EXPIRED') {
+        return {
+          success: true,
+          action: 'IGNORE_OUT_OF_ORDER',
+          originalTransactionId,
+          status: 'active',
+          tier: existingRecord?.tier || targetTier,
+          devicesUpdatedCount: compensatedDevicesCount,
+          dryRun: false,
+          reason: `Redis OCC 阻擋：收到亂序過期通知，現有有效續約到期日 (${detail}) 較新，予以忽略。已補償確認關聯裝置 (${compensatedDevicesCount} 台)。`,
+        };
+      }
+
       return {
         success: true,
         action: 'IGNORE_STALE_RECORD',
         originalTransactionId,
         status: existingRecord?.status || 'active',
         tier: existingRecord?.status === 'active' ? (existingRecord.tier || 'free') : 'free',
-        devicesUpdatedCount: 0,
+        devicesUpdatedCount: compensatedDevicesCount,
         dryRun: false,
-        reason: `Redis 中現有記錄時間戳記 (${currentTimestamp}) 比本次寫入事件 (${incomingTimestamp}) 更新，略過過期工作以防覆蓋。`,
+        reason: `Redis OCC 阻擋：現有記錄時間戳記 (${detail}) 比本次寫入事件 (${incomingTimestamp}) 更新，略過過期工作以防覆蓋。已補償確認關聯裝置 (${compensatedDevicesCount} 台)。`,
       };
     }
   } catch (saveErr: any) {
+    if (saveErr instanceof SubscriptionSyncError) {
+      throw saveErr;
+    }
     throw new SubscriptionSyncError(
       `寫入交易主記錄失敗: ${saveErr?.message || saveErr}`,
       originalTransactionId,

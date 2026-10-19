@@ -32,7 +32,9 @@ export interface AppleEntitlementRecord {
   originalPurchaseDate?: number;
   expiresDate?: number | null;
   revocationDate?: number | null;
+  willRenew?: boolean;
   verifiedAt: number;
+  lastAppleSignedDate?: number;
   environment: string;
 }
 
@@ -209,6 +211,7 @@ export async function saveVerifiedEntitlement(
     expiresDate: effectiveExpiresDate,
     revocationDate: effectiveRevocationDate,
     verifiedAt: now,
+    lastAppleSignedDate: verification.signedDate || verification.purchaseDate || now,
     environment: verification.environment || 'Sandbox',
   };
 
