@@ -95,6 +95,11 @@ export async function verifyEntitlementProofToken(
   originalTransactionId?: string;
   expiresAt?: number;
   reason?: string;
+  isExpired?: boolean;
+  isSignatureValid?: boolean;
+  canRenew?: boolean;
+  latestExpiresAt?: number;
+  isRevoked?: boolean;
 }> {
   if (!token || typeof token !== 'string') return { valid: false, reason: '未提供權杖。' };
   const parts = token.split('.');
@@ -125,23 +130,96 @@ export async function verifyEntitlementProofToken(
   }
 
   const expiresAt = parseInt(expStr || '0', 10);
-  if (expiresAt > 0 && expiresAt < Date.now()) {
-    return { valid: false, userId, originalTransactionId, expiresAt, reason: '權杖已逾期。' };
-  }
+  const now = Date.now();
+  const isTokenExpired = expiresAt > 0 && expiresAt < now;
 
-  // 安全核心聯防：比對 Redis 中該 Apple 交易的最新狀態（防止退款後繼續持有舊 Token）
+  // 安全核心聯防：比對 Redis 中該 Apple 交易的最新狀態（防止退款後繼續持有舊 Token、並支援雲端續約自動輪轉）
   try {
     const record = await getOriginalTransactionEntitlement(originalTransactionId);
     if (record) {
-      if (record.status === 'revoked') {
-        return { valid: false, userId, originalTransactionId, reason: '此交易已被退款或撤銷。' };
+      if (record.status === 'revoked' || record.revocationDate) {
+        return {
+          valid: false,
+          userId,
+          originalTransactionId,
+          expiresAt,
+          reason: '此交易已被退款或撤銷。',
+          isRevoked: true,
+        };
       }
-      if (record.status === 'expired' || (record.expiresDate && record.expiresDate < Date.now())) {
-        return { valid: false, userId, originalTransactionId, reason: '此訂閱已在 Apple 伺服端到期。' };
+
+      if (isTokenExpired) {
+        // 嚴格安全續約換發檢查：
+        // 1. 簽章必須合法 (前面已驗證)
+        // 2. 請求裝置必須與 Token 內部 userId 吻合 (前面已驗證)
+        // 3. Redis 主記錄必須為 active Pro 且最新到期日大於目前時間 (證明 Apple 官方已續訂)
+        //    或為 Lifetime 買斷方案
+        // 4. Token 逾期時間不得超過 30 天滾動窗口 (防範遠古 Token 重放)
+        const isEligibleForRenewalRotation =
+          record.status === 'active' &&
+          (record.tier === 'lifetime' || (record.expiresDate && record.expiresDate > now)) &&
+          now - expiresAt <= 30 * 86400 * 1000;
+
+        if (isEligibleForRenewalRotation) {
+          return {
+            valid: false, // 權杖本身確實已過期 (保持與既有單元測試相容)
+            userId,
+            originalTransactionId,
+            expiresAt,
+            reason: '權杖已逾期（符合續約換發條件）。',
+            isExpired: true,
+            isSignatureValid: true,
+            canRenew: true,
+            latestExpiresAt: record.expiresDate || undefined,
+          };
+        }
+
+        return {
+          valid: false,
+          userId,
+          originalTransactionId,
+          expiresAt,
+          reason: '權杖已逾期。',
+          isExpired: true,
+          isSignatureValid: true,
+          canRenew: false,
+        };
       }
+
+      if (record.status === 'expired' || (record.expiresDate && record.expiresDate < now)) {
+        return {
+          valid: false,
+          userId,
+          originalTransactionId,
+          expiresAt,
+          reason: '此訂閱已在 Apple 伺服端到期。',
+        };
+      }
+    } else if (isTokenExpired) {
+      return {
+        valid: false,
+        userId,
+        originalTransactionId,
+        expiresAt,
+        reason: '權杖已逾期。',
+        isExpired: true,
+        isSignatureValid: true,
+        canRenew: false,
+      };
     }
   } catch {
-    // Redis 暫時無法連線時，依憑證既有簽名與過期時間進行安全降級處理
+    if (isTokenExpired) {
+      return {
+        valid: false,
+        userId,
+        originalTransactionId,
+        expiresAt,
+        reason: '權杖已逾期。',
+        isExpired: true,
+        isSignatureValid: true,
+        canRenew: false,
+      };
+    }
   }
 
   return { valid: true, userId, originalTransactionId, expiresAt };
@@ -157,6 +235,7 @@ export async function saveVerifiedEntitlement(
   effectiveStatus: 'active' | 'expired' | 'revoked';
   effectiveTier: 'free' | 'pro' | 'lifetime';
   effectiveWillRenew?: boolean;
+  effectiveExpiresDate?: number | null;
 }> {
   const originalTransactionId = verification.originalTransactionId || verification.transactionId;
   const productId = verification.productId;
@@ -330,6 +409,7 @@ export async function saveVerifiedEntitlement(
     effectiveStatus,
     effectiveTier,
     effectiveWillRenew: effectiveTier === 'lifetime' ? undefined : finalRecord?.willRenew,
+    effectiveExpiresDate: finalRecord?.expiresDate || effectiveExpiresDate,
   };
 }
 

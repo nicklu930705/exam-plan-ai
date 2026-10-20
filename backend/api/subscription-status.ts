@@ -147,7 +147,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (proofToken) {
       const proofValidation = await verifyEntitlementProofToken(proofToken, userId !== 'anonymous_visitor' ? userId : undefined);
 
-      if (proofValidation.valid && proofValidation.userId) {
+      if ((proofValidation.valid || proofValidation.canRenew) && proofValidation.userId) {
         const authenticatedUserId = proofValidation.userId;
         const boundOriginalTxId = proofValidation.originalTransactionId;
 
@@ -197,13 +197,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           responseStatus = 'none';
         }
 
-        // 權杖自我輪轉 (Token Refresh)：若剩餘有效期限小於閾值 (48 小時) 且狀態仍有效，主動發放新權杖
+        // 權杖自我輪轉 (Token Refresh)：若剩餘有效期限小於閾值 (48 小時) 或已標記為可續約換發 (canRenew)，主動發放新權杖
         let activeProofToken = proofToken;
         if (
           responseStatus === 'active' &&
           boundOriginalTxId &&
-          proofValidation.expiresAt &&
-          (proofValidation.expiresAt - now < PROOF_TOKEN_REFRESH_THRESHOLD_MS)
+          (proofValidation.canRenew ||
+            (proofValidation.expiresAt && proofValidation.expiresAt - now < PROOF_TOKEN_REFRESH_THRESHOLD_MS))
         ) {
           activeProofToken = generateEntitlementProofToken(
             authenticatedUserId,
@@ -238,11 +238,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // Proof Token 驗證未通過 (簽章無效、逾期或身分不符)
       // 若同時帶有 Apple JWS，讓其流向下方情境 3 進行憑證自我修復續期；否則直接安全回傳 Free
       if (!signedTransaction) {
-        const isExpired = proofValidation.reason?.includes('逾期') || (proofValidation.expiresAt && proofValidation.expiresAt < now);
+        const isRevoked = proofValidation.isRevoked || proofValidation.reason?.includes('撤銷') || proofValidation.reason?.includes('退款');
+        const isExpired = !isRevoked && (proofValidation.reason?.includes('逾期') || (proofValidation.expiresAt && proofValidation.expiresAt < now));
         return res.status(200).json({
           success: true,
           tier: 'free',
-          status: isExpired ? 'expired' : 'none',
+          status: isRevoked ? 'revoked' : isExpired ? 'expired' : 'none',
           isVerified: false,
           message: proofValidation.reason || '驗證權杖無效或已過期。',
           serverTime: now,
@@ -341,7 +342,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         });
       }
 
-      if (verifyResult.status === 'expired' || saveRes.effectiveStatus === 'expired') {
+      if (
+        saveRes.effectiveStatus === 'expired' ||
+        (verifyResult.status === 'expired' && saveRes.effectiveStatus !== 'active')
+      ) {
         return res.status(200).json({
           success: true,
           tier: 'free',
@@ -354,11 +358,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         });
       }
 
-      // 簽發全新有效 Proof Token
+      // 簽發全新有效 Proof Token (採用最新有效續約到期日)
+      const authoritativeExpiresDate =
+        saveRes.effectiveExpiresDate || existingRecord?.expiresDate || verifyResult.expiresDate;
       const freshProofToken = generateEntitlementProofToken(
         userId,
         verifyResult.originalTransactionId!,
-        verifyResult.expiresDate,
+        authoritativeExpiresDate,
       );
 
       const effectiveWillRenew =
@@ -370,16 +376,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           ? existingRecord.willRenew
           : undefined;
 
+      const effectiveTier = saveRes.effectiveTier !== 'free' ? saveRes.effectiveTier : verifyResult.tier;
+
       return res.status(200).json({
         success: true,
-        tier: verifyResult.tier,
+        tier: effectiveTier,
         status: 'active',
         productId: verifyResult.productId,
         originalTransactionId: verifyResult.originalTransactionId,
-        expiresAt: verifyResult.expiresDate || null,
+        expiresAt: authoritativeExpiresDate || null,
         willRenew: effectiveWillRenew,
         proofToken: freshProofToken,
-        isVerified: true,
+        isVerified: effectiveTier !== 'free',
         serverTime: now,
       });
     }
