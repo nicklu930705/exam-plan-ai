@@ -165,6 +165,7 @@ test('會員狀態查詢 API (subscription-status) 與 Redis OCC 安全測試套
       originalTransactionId,
       purchaseDate: Date.now() - 86400 * 1000,
       expiresDate: expiresAt,
+      willRenew: true,
       environment: 'Sandbox',
       bundleId: EXPECTED_BUNDLE_ID,
     });

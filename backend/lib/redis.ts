@@ -225,8 +225,8 @@ return 'OK'
 export const SAVE_ENTITLEMENT_OCC_LUA = `
 local mainKey = KEYS[1]
 local recordStr = ARGV[1]
-local incomingTimestamp = tonumber(ARGV[2])
-local ttlSeconds = tonumber(ARGV[3])
+local incomingTimestamp = tonumber(ARGV[2] or 0)
+local ttlSeconds = tonumber(ARGV[3] or 0)
 
 local existing = redis.call('GET', mainKey)
 if existing then
@@ -234,54 +234,103 @@ if existing then
   local okIncoming, incomingData = pcall(cjson.decode, recordStr)
 
   if okExisting and existingData and okIncoming and incomingData then
+    -- 0. 終身方案保護 (Lifetime Protection):
+    -- 若既有記錄為 Lifetime active，且傳入記錄並非同商品退款，不可被一般訂閱或過期通知降級
+    if existingData.tier == 'lifetime' and existingData.status == 'active' and incomingData.status ~= 'revoked' then
+      if incomingData.tier ~= 'lifetime' then
+        return {'LIFETIME_PROTECTED', '既有終身方案不可被一般訂閱或過期通知降級'}
+      end
+    end
+
     -- 1. 退款撤銷鎖定防護 (Revocation Lock)：
     -- 若既有記錄已被撤銷/退款，新寫入者若非更晚購買的全新合法交易，嚴禁逆向覆蓋為 active
     if existingData.status == 'revoked' and incomingData.status ~= 'revoked' then
       local existingRevocation = tonumber(existingData.revocationDate or existingData.lastAppleSignedDate or 0)
       local incomingPurchase = tonumber(incomingData.purchaseDate or 0)
-      if incomingPurchase <= existingRevocation then
+      local isNewPurchaseAfterRevoke = (incomingPurchase > existingRevocation) and (not incomingData.revocationDate)
+      if not isNewPurchaseAfterRevoke then
         return {'REVOKED_LOCK', tostring(existingRevocation)}
       end
     end
 
-    -- 2. 權威 Apple 事件時間戳記比對 (優先採用 Apple 簽署時間 lastAppleSignedDate，次為 purchaseDate，絕不依賴伺服器本機時鐘 verifiedAt)
-    local existingEventTime = tonumber(existingData.lastAppleSignedDate or existingData.purchaseDate or 0)
-    local incomingEventTime = tonumber(incomingData.lastAppleSignedDate or incomingTimestamp or 0)
+    -- 2. 交易生命週期時間戳記 (Apple Transaction Signed Date / Purchase Date)
+    local existingTxTime = tonumber(existingData.lastAppleSignedDate or existingData.purchaseDate or 0)
+    local incomingTxTime = tonumber(incomingData.lastAppleSignedDate or incomingTimestamp or incomingData.purchaseDate or 0)
 
-    -- A. 既有記錄明確更新於傳入事件：
-    if existingEventTime > incomingEventTime then
-      -- 特例：若傳入為退款 (revoked) 且其 revocationDate >= existingEventTime，退款具最高優先級，允許覆蓋
-      local incomingRevocation = tonumber(incomingData.revocationDate or 0)
-      if incomingData.status == 'revoked' and incomingRevocation >= existingEventTime then
-        -- 允許寫入退款
-      else
-        return {'STALE', tostring(existingEventTime)}
-      end
-    end
+    -- 3. 續約偏好時間戳記 (Apple Renewal Signed Date)
+    local existingRenewalTime = tonumber(existingData.lastRenewalSignedDate or 0)
+    local incomingRenewalTime = tonumber(incomingData.lastRenewalSignedDate or 0)
 
-    -- 3. 亂序過期保護 (Out-of-order Expired Protection)：
-    -- 若既有記錄為有效續訂，且既有到期日大於傳入過期通知之到期日，絕不允許將會員降級為 expired
-    if existingData.status == 'active' and incomingData.status == 'expired' then
-      local existingExpires = tonumber(existingData.expiresDate or 0)
-      local incomingExpires = tonumber(incomingData.expiresDate or 0)
-      if existingExpires > 0 and incomingExpires > 0 and existingExpires > incomingExpires then
-        return {'OUT_OF_ORDER_EXPIRED', tostring(existingExpires)}
-      end
-    end
+    -- 4. 判斷是否為「續約偏好獨立更新」事件 (如 DID_CHANGE_RENEWAL_STATUS，交易時間戳記未推進但續約時間戳記更新)
+    local isRenewalUpdateOnly = (incomingRenewalTime > 0 and incomingRenewalTime >= existingRenewalTime and incomingData.willRenew ~= nil and incomingTxTime <= existingTxTime)
 
-    -- 4. 時間戳記完全相同 (incomingEventTime == existingEventTime) 但狀態不同衝突防護：
-    if incomingEventTime == existingEventTime then
-      -- 退款優先於有效或過期：若現有為 revoked，不可被 active 覆蓋
-      if existingData.status == 'revoked' and incomingData.status ~= 'revoked' then
-        return {'REVOKED_LOCK', tostring(existingEventTime)}
+    -- 5. 處理退款/撤銷寫入 (最高優先級)
+    if incomingData.status == 'revoked' then
+      -- 允許寫入退款撤銷
+    elseif isRenewalUpdateOnly then
+      -- 續約狀態明確更新：保留既有交易生命週期資料 (status, expiresDate, tier 等)，僅更新 willRenew 與 lastRenewalSignedDate
+      existingData.willRenew = incomingData.willRenew
+      existingData.lastRenewalSignedDate = incomingRenewalTime
+      if incomingData.verifiedAt then
+        existingData.verifiedAt = incomingData.verifiedAt
       end
-      -- 若現有為 active 且尚未逾期，相同時間戳記之 expired 不得覆蓋 active
+      incomingData = existingData
+      recordStr = cjson.encode(incomingData)
+    else
+      -- 6. 一般交易生命週期比較：
+      -- A. 既有交易時間明確晚於傳入交易時間：
+      if existingTxTime > incomingTxTime and incomingTxTime > 0 then
+        return {'STALE', tostring(existingTxTime)}
+      end
+
+      -- B. 亂序過期保護 (Out-of-order Expired Protection)：
       if existingData.status == 'active' and incomingData.status == 'expired' then
         local existingExpires = tonumber(existingData.expiresDate or 0)
-        if existingExpires > 0 and incomingData.expiresDate and existingExpires >= tonumber(incomingData.expiresDate) then
+        local incomingExpires = tonumber(incomingData.expiresDate or 0)
+        if existingExpires > 0 and incomingExpires > 0 and existingExpires > incomingExpires then
           return {'OUT_OF_ORDER_EXPIRED', tostring(existingExpires)}
         end
       end
+
+      -- C. 時間戳記完全相同但狀態不同衝突防護：
+      if incomingTxTime == existingTxTime then
+        if existingData.status == 'revoked' and incomingData.status ~= 'revoked' then
+          return {'REVOKED_LOCK', tostring(existingTxTime)}
+        end
+        if existingData.status == 'active' and incomingData.status == 'expired' then
+          local existingExpires = tonumber(existingData.expiresDate or 0)
+          if existingExpires > 0 and incomingData.expiresDate and existingExpires >= tonumber(incomingData.expiresDate) then
+            return {'OUT_OF_ORDER_EXPIRED', tostring(existingExpires)}
+          end
+        end
+      end
+
+      -- D. 續約欄位 willRenew 與 lastRenewalSignedDate 合併保護：
+      if incomingData.tier == 'lifetime' then
+        incomingData.willRenew = nil
+        incomingData.lastRenewalSignedDate = nil
+      elseif incomingData.willRenew == nil then
+        if existingData.willRenew ~= nil then
+          incomingData.willRenew = existingData.willRenew
+          incomingData.lastRenewalSignedDate = existingData.lastRenewalSignedDate
+        end
+      else
+        if existingData.willRenew ~= nil and existingRenewalTime > incomingRenewalTime and incomingRenewalTime > 0 then
+          incomingData.willRenew = existingData.willRenew
+          incomingData.lastRenewalSignedDate = existingData.lastRenewalSignedDate
+        end
+      end
+
+      -- E. 到期日逆向縮短保護 (若既有為 active 且到期日更長，不允許被較短的 active 縮短)
+      if existingData.status == 'active' and incomingData.status == 'active' then
+        local existingExpires = tonumber(existingData.expiresDate or 0)
+        local incomingExpires = tonumber(incomingData.expiresDate or 0)
+        if existingExpires > 0 and incomingExpires > 0 and existingExpires > incomingExpires then
+          incomingData.expiresDate = existingExpires
+        end
+      end
+
+      recordStr = cjson.encode(incomingData)
     end
   end
 end
@@ -446,57 +495,110 @@ class InMemoryRedisMock {
     if (script === SAVE_ENTITLEMENT_OCC_LUA) {
       const [mainKey] = keys;
       const [recordStr, incomingTimestampStr, ttlSecondsStr] = args;
-      const incomingTimestamp = Number(incomingTimestampStr);
-      const ttlSeconds = Number(ttlSecondsStr);
+      const incomingTimestamp = Number(incomingTimestampStr || 0);
+      const ttlSeconds = Number(ttlSecondsStr || 0);
 
       const existingRaw = this.getCleanKey(mainKey);
+      let recordToStore = String(recordStr);
+
       if (existingRaw) {
         try {
           const existingData = JSON.parse(existingRaw);
-          const incomingData = JSON.parse(String(recordStr));
+          let incomingData = JSON.parse(String(recordStr));
+
+          // 0. 終身方案保護 (Lifetime Protection)
+          if (existingData.tier === 'lifetime' && existingData.status === 'active' && incomingData.status !== 'revoked') {
+            if (incomingData.tier !== 'lifetime') {
+              return ['LIFETIME_PROTECTED', '既有終身方案不可被一般訂閱或過期通知降級'];
+            }
+          }
 
           // 1. 退款撤銷鎖定防護
           if (existingData.status === 'revoked' && incomingData.status !== 'revoked') {
             const existingRevocation = Number(existingData.revocationDate || existingData.lastAppleSignedDate || 0);
             const incomingPurchase = Number(incomingData.purchaseDate || 0);
-            if (incomingPurchase <= existingRevocation) {
+            const isNewPurchaseAfterRevoke = (incomingPurchase > existingRevocation) && !incomingData.revocationDate;
+            if (!isNewPurchaseAfterRevoke) {
               return ['REVOKED_LOCK', String(existingRevocation)];
             }
           }
 
-          // 2. Apple 事件時間戳記比對
-          let existingEventTime = Number(existingData.lastAppleSignedDate || existingData.purchaseDate || 0);
-          const incomingEventTime = Number(incomingData.lastAppleSignedDate || incomingTimestamp || 0);
+          // 2. 交易時間戳記比對
+          const existingTxTime = Number(existingData.lastAppleSignedDate || existingData.purchaseDate || 0);
+          const incomingTxTime = Number(incomingData.lastAppleSignedDate || incomingTimestamp || incomingData.purchaseDate || 0);
 
-          if (existingEventTime > incomingEventTime) {
-            const incomingRevocation = Number(incomingData.revocationDate || 0);
-            if (incomingData.status === 'revoked' && incomingRevocation >= existingEventTime) {
-              // 允許寫入退款
-            } else {
-              return ['STALE', String(existingEventTime)];
-            }
-          }
+          // 3. 續約時間戳記比對
+          const existingRenewalTime = Number(existingData.lastRenewalSignedDate || 0);
+          const incomingRenewalTime = Number(incomingData.lastRenewalSignedDate || 0);
 
-          // 3. 亂序過期保護
-          if (existingData.status === 'active' && incomingData.status === 'expired') {
-            const existingExpires = Number(existingData.expiresDate || 0);
-            const incomingExpires = Number(incomingData.expiresDate || 0);
-            if (existingExpires > 0 && incomingExpires > 0 && existingExpires > incomingExpires) {
-              return ['OUT_OF_ORDER_EXPIRED', String(existingExpires)];
-            }
-          }
+          // 4. 判斷是否為續約偏好獨立更新 (交易時間戳記未推進但續約時間戳記更新)
+          const isRenewalUpdateOnly = (incomingRenewalTime > 0 && incomingRenewalTime >= existingRenewalTime && incomingData.willRenew !== undefined && incomingTxTime <= existingTxTime);
 
-          // 4. 時間戳記完全相同衝突防護
-          if (incomingEventTime === existingEventTime) {
-            if (existingData.status === 'revoked' && incomingData.status !== 'revoked') {
-              return ['REVOKED_LOCK', String(existingEventTime)];
+          // 5. 處理退款/撤銷
+          if (incomingData.status === 'revoked') {
+            // 允許寫入退款
+            recordToStore = JSON.stringify(incomingData);
+          } else if (isRenewalUpdateOnly) {
+            existingData.willRenew = incomingData.willRenew;
+            existingData.lastRenewalSignedDate = incomingRenewalTime;
+            if (incomingData.verifiedAt) {
+              existingData.verifiedAt = incomingData.verifiedAt;
             }
+            recordToStore = JSON.stringify(existingData);
+          } else {
+            // 6. 一般交易生命週期比較
+            if (existingTxTime > incomingTxTime && incomingTxTime > 0) {
+              return ['STALE', String(existingTxTime)];
+            }
+
+            // 亂序過期保護
             if (existingData.status === 'active' && incomingData.status === 'expired') {
               const existingExpires = Number(existingData.expiresDate || 0);
-              if (existingExpires > 0 && incomingData.expiresDate && existingExpires >= Number(incomingData.expiresDate)) {
+              const incomingExpires = Number(incomingData.expiresDate || 0);
+              if (existingExpires > 0 && incomingExpires > 0 && existingExpires > incomingExpires) {
                 return ['OUT_OF_ORDER_EXPIRED', String(existingExpires)];
               }
             }
+
+            // 時間戳記完全相同衝突防護
+            if (incomingTxTime === existingTxTime) {
+              if (existingData.status === 'revoked' && incomingData.status !== 'revoked') {
+                return ['REVOKED_LOCK', String(existingTxTime)];
+              }
+              if (existingData.status === 'active' && incomingData.status === 'expired') {
+                const existingExpires = Number(existingData.expiresDate || 0);
+                if (existingExpires > 0 && incomingData.expiresDate && existingExpires >= Number(incomingData.expiresDate)) {
+                  return ['OUT_OF_ORDER_EXPIRED', String(existingExpires)];
+                }
+              }
+            }
+
+            // 續約欄位 willRenew 與 lastRenewalSignedDate 合併保護
+            if (incomingData.tier === 'lifetime') {
+              delete incomingData.willRenew;
+              delete incomingData.lastRenewalSignedDate;
+            } else if (incomingData.willRenew === undefined) {
+              if (existingData.willRenew !== undefined) {
+                incomingData.willRenew = existingData.willRenew;
+                incomingData.lastRenewalSignedDate = existingData.lastRenewalSignedDate;
+              }
+            } else {
+              if (existingData.willRenew !== undefined && existingRenewalTime > incomingRenewalTime && incomingRenewalTime > 0) {
+                incomingData.willRenew = existingData.willRenew;
+                incomingData.lastRenewalSignedDate = existingData.lastRenewalSignedDate;
+              }
+            }
+
+            // 到期日逆向縮短保護
+            if (existingData.status === 'active' && incomingData.status === 'active') {
+              const existingExpires = Number(existingData.expiresDate || 0);
+              const incomingExpires = Number(incomingData.expiresDate || 0);
+              if (existingExpires > 0 && incomingExpires > 0 && existingExpires > incomingExpires) {
+                incomingData.expiresDate = existingExpires;
+              }
+            }
+
+            recordToStore = JSON.stringify(incomingData);
           }
         } catch {
           // 忽略格式解析例外
@@ -505,12 +607,12 @@ class InMemoryRedisMock {
 
       if (ttlSeconds > 0) {
         this.store.set(mainKey, {
-          value: String(recordStr),
+          value: recordToStore,
           expireAt: Date.now() + ttlSeconds * 1000,
         });
       } else {
         this.store.set(mainKey, {
-          value: String(recordStr),
+          value: recordToStore,
         });
       }
       return ['OK'];
@@ -572,8 +674,15 @@ class InMemoryRedisMock {
   }
 
   async sadd(key: string, ...members: any[]): Promise<number> {
-    const existing = (await this.get<string[]>(key)) || [];
-    const set = new Set(Array.isArray(existing) ? existing : []);
+    const raw = this.getCleanKey(key);
+    let existing: string[] = [];
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) existing = parsed;
+      } catch {}
+    }
+    const set = new Set(existing);
     let added = 0;
     for (const m of members) {
       const sm = String(m);
@@ -587,8 +696,14 @@ class InMemoryRedisMock {
   }
 
   async smembers(key: string): Promise<string[]> {
-    const existing = await this.get<string[]>(key);
-    return Array.isArray(existing) ? existing : [];
+    const raw = this.getCleanKey(key);
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
   }
 
   async zadd(key: string, scoreOrObj: any, maybeMember?: string): Promise<number> {
@@ -596,16 +711,29 @@ class InMemoryRedisMock {
       typeof scoreOrObj === 'object' && scoreOrObj !== null
         ? scoreOrObj
         : { score: Number(scoreOrObj), member: String(maybeMember) };
-    const existing = (await this.get<Array<{ score: number; member: string }>>(key)) || [];
-    const list = Array.isArray(existing) ? existing.filter((x) => x.member !== scoreMember.member) : [];
+    const raw = this.getCleanKey(key);
+    let existing: Array<{ score: number; member: string }> = [];
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) existing = parsed;
+      } catch {}
+    }
+    const list = existing.filter((x) => x.member !== scoreMember.member);
     list.push(scoreMember);
     this.store.set(key, { value: JSON.stringify(list) });
     return 1;
   }
 
   async zcard(key: string): Promise<number> {
-    const existing = (await this.get<Array<{ score: number; member: string }>>(key)) || [];
-    return Array.isArray(existing) ? existing.length : 0;
+    const raw = this.getCleanKey(key);
+    if (!raw) return 0;
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.length : 0;
+    } catch {
+      return 0;
+    }
   }
 
   async zrange(key: string, min: number, max: number): Promise<string[]> {
@@ -625,6 +753,10 @@ class InMemoryRedisMock {
   }
 
   clear() {
+    this.store.clear();
+  }
+
+  clearAll() {
     this.store.clear();
   }
 }

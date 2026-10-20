@@ -142,38 +142,53 @@ export async function applySubscriptionStateToRedis(params: {
       ? transition.effectiveRevocationDate
       : existingRecord?.revocationDate || null;
 
+  // 取得 Apple 密碼學簽署時間戳記 (若未傳入通知則以傳入之 now 為基準)
+  const txSignedDate =
+    verifiedNotification?.transaction?.signedDate ||
+    verifiedNotification?.signedDate ||
+    verifiedNotification?.purchaseDate ||
+    now;
+
+  const renewalSignedDate =
+    verifiedNotification?.renewalInfo?.signedDate ||
+    (verifiedNotification?.notificationType === 'DID_CHANGE_RENEWAL_STATUS' ? (verifiedNotification?.signedDate || now) : 0) ||
+    0;
+
   const updatedRecord: AppleEntitlementRecord = {
     originalTransactionId,
     lastTransactionId:
+      verifiedNotification?.transaction?.transactionId ||
       verifiedNotification?.transactionId ||
       existingRecord?.lastTransactionId ||
       originalTransactionId,
     productId:
+      verifiedNotification?.transaction?.productId ||
       verifiedNotification?.productId ||
       existingRecord?.productId ||
       'exampro_monthly',
     tier: targetTier,
     status: targetStatus,
     purchaseDate:
+      verifiedNotification?.transaction?.purchaseDate ||
       verifiedNotification?.purchaseDate ||
       existingRecord?.purchaseDate ||
       now,
     originalPurchaseDate:
+      verifiedNotification?.transaction?.originalPurchaseDate ||
       verifiedNotification?.originalPurchaseDate ||
       existingRecord?.originalPurchaseDate ||
       now,
     expiresDate: effectiveExpiresDate,
     revocationDate: effectiveRevocationDate,
     willRenew:
-      transition.willRenew !== undefined
+      targetTier === 'lifetime'
+        ? undefined
+        : transition.willRenew !== undefined
         ? transition.willRenew
         : existingRecord?.willRenew,
     verifiedAt: now,
-    lastAppleSignedDate:
-      verifiedNotification?.signedDate ||
-      verifiedNotification?.transaction?.signedDate ||
-      verifiedNotification?.purchaseDate ||
-      now,
+    lastAppleSignedDate: txSignedDate > 0 ? txSignedDate : existingRecord?.lastAppleSignedDate,
+    lastRenewalSignedDate: renewalSignedDate > 0 ? renewalSignedDate : existingRecord?.lastRenewalSignedDate,
     environment:
       verifiedNotification?.environment ||
       existingRecord?.environment ||
@@ -191,11 +206,7 @@ export async function applySubscriptionStateToRedis(params: {
     }
   }
 
-  const incomingTimestamp =
-    verifiedNotification?.signedDate ||
-    verifiedNotification?.transaction?.signedDate ||
-    verifiedNotification?.purchaseDate ||
-    now;
+  const incomingTimestamp = txSignedDate > 0 ? txSignedDate : (renewalSignedDate > 0 ? renewalSignedDate : 0);
   const mainKey = `exam_ai:apple:entitlement:${originalTransactionId}`;
 
   try {
@@ -242,6 +253,19 @@ export async function applySubscriptionStateToRedis(params: {
           devicesUpdatedCount: compensatedDevicesCount,
           dryRun: false,
           reason: `Redis OCC 阻擋：此交易已被 Apple 撤銷或退款 (鎖定時間戳: ${detail})，拒絕以舊收據覆蓋。已補償確認關聯裝置 (${compensatedDevicesCount} 台)。`,
+        };
+      }
+
+      if (occCode === 'LIFETIME_PROTECTED') {
+        return {
+          success: true,
+          action: 'IGNORE_LOWER_TIER_OVERWRITE',
+          originalTransactionId,
+          status: 'active',
+          tier: 'lifetime',
+          devicesUpdatedCount: compensatedDevicesCount,
+          dryRun: false,
+          reason: `Redis OCC 阻擋：既有終身買斷版 (Lifetime) 方案具備最高優先權，拒絕由一般訂閱或通知降級。已補償確認關聯裝置 (${compensatedDevicesCount} 台)。`,
         };
       }
 

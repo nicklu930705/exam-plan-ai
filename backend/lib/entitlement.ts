@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import type { AppleVerificationResult } from './appleIap';
-import { getRedisClient } from './redis';
+import { getRedisClient, SAVE_ENTITLEMENT_OCC_LUA } from './redis';
 
 /**
  * 考試計畫 AI - 會員權限與 Apple 交易資料持久化管理模組 (Upstash Redis)
@@ -35,6 +35,7 @@ export interface AppleEntitlementRecord {
   willRenew?: boolean;
   verifiedAt: number;
   lastAppleSignedDate?: number;
+  lastRenewalSignedDate?: number;
   environment: string;
 }
 
@@ -44,6 +45,7 @@ export interface UserEntitlementCache {
   productId: string;
   originalTransactionId: string;
   expiresAt?: number | null;
+  willRenew?: boolean;
   verifiedAt: number;
   environment: string;
 }
@@ -55,6 +57,7 @@ export interface UserEntitlementInfo {
   productId?: string;
   originalTransactionId?: string;
   expiresAt?: number | null;
+  willRenew?: boolean;
 }
 
 const SERVER_SECRET = process.env.APP_SERVER_SECRET || 'exam_plan_ai_signing_secret_2026';
@@ -153,6 +156,7 @@ export async function saveVerifiedEntitlement(
 ): Promise<{
   effectiveStatus: 'active' | 'expired' | 'revoked';
   effectiveTier: 'free' | 'pro' | 'lifetime';
+  effectiveWillRenew?: boolean;
 }> {
   const originalTransactionId = verification.originalTransactionId || verification.transactionId;
   const productId = verification.productId;
@@ -170,16 +174,28 @@ export async function saveVerifiedEntitlement(
   let effectiveTier: 'free' | 'pro' | 'lifetime' = verification.tier;
   let effectiveRevocationDate = verification.revocationDate || null;
 
-  // 1. 檢查現有記錄，防止舊 JWS 覆蓋已退款撤銷紀錄或縮短已續約到期日
+  // 1. 讀取現有記錄評估初步狀態
+  let existing: AppleEntitlementRecord | null = null;
   try {
-    const existing = (await redis.get(`exam_ai:apple:entitlement:${originalTransactionId}`)) as AppleEntitlementRecord | null;
+    existing = (await redis.get(`exam_ai:apple:entitlement:${originalTransactionId}`)) as AppleEntitlementRecord | null;
     if (existing) {
+      // 安全關鍵防護 0：Lifetime 方案不可被一般訂閱或過期通知降級
+      if (existing.tier === 'lifetime' && existing.status === 'active' && effectiveStatus !== 'revoked') {
+        effectiveTier = 'lifetime';
+        effectiveStatus = 'active';
+        effectiveExpiresDate = null;
+      }
       // 安全關鍵防護 A：若既有記錄已被標記為撤銷/退款，舊 JWS (active) 絕不能覆蓋回 active
-      if (existing.status === 'revoked' && effectiveStatus !== 'revoked') {
-        console.warn(`[退款安全] 交易 ${originalTransactionId} 在伺服端已確認為撤銷/退款狀態，拒絕以舊 JWS 覆蓋回 active。`);
-        effectiveStatus = 'revoked';
-        effectiveTier = 'free';
-        effectiveRevocationDate = existing.revocationDate || now;
+      else if (existing.status === 'revoked' && effectiveStatus !== 'revoked') {
+        const existingRevocation = Number(existing.revocationDate || existing.lastAppleSignedDate || 0);
+        const incomingPurchase = Number(verification.purchaseDate || 0);
+        const isNewPurchaseAfterRevoke = (incomingPurchase > existingRevocation) && !verification.revocationDate;
+        if (!isNewPurchaseAfterRevoke) {
+          console.warn(`[退款安全] 交易 ${originalTransactionId} 在伺服端已確認為撤銷/退款狀態，拒絕以舊 JWS 覆蓋回 active。`);
+          effectiveStatus = 'revoked';
+          effectiveTier = 'free';
+          effectiveRevocationDate = existing.revocationDate || now;
+        }
       }
       // 安全關鍵防護 B：若既有記錄為有效續訂，且既有到期日更晚，略過舊 JWS 的短到期日
       else if (existing.status === 'active' && effectiveStatus === 'active') {
@@ -200,6 +216,22 @@ export async function saveVerifiedEntitlement(
     // 忽略檢查錯誤
   }
 
+  // 決定 willRenew 偏好：
+  // 1. 若為 Lifetime 終身版，一律為 undefined (不應具有自動續訂屬性)
+  // 2. 若傳入驗證結果有明確 willRenew (如帶有 renewalInfo)，採用之
+  // 3. 若既有記錄已有 willRenew，一律保留既有權威值 (無論 true 或 false)
+  // 4. 若為未知狀態，保留 undefined，絕不擅自預設為 true
+  const effectiveWillRenew =
+    effectiveTier === 'lifetime'
+      ? undefined
+      : verification.willRenew !== undefined
+      ? verification.willRenew
+      : existing?.willRenew !== undefined
+      ? existing.willRenew
+      : undefined;
+
+  const txSignedDate = verification.signedDate || verification.purchaseDate || 0;
+
   const entitlementRecord: AppleEntitlementRecord = {
     originalTransactionId,
     lastTransactionId: verification.transactionId || originalTransactionId,
@@ -210,25 +242,62 @@ export async function saveVerifiedEntitlement(
     originalPurchaseDate: verification.originalPurchaseDate,
     expiresDate: effectiveExpiresDate,
     revocationDate: effectiveRevocationDate,
+    willRenew: effectiveWillRenew,
     verifiedAt: now,
-    lastAppleSignedDate: verification.signedDate || verification.purchaseDate || now,
+    lastAppleSignedDate: txSignedDate > 0 ? txSignedDate : existing?.lastAppleSignedDate,
+    lastRenewalSignedDate: existing?.lastRenewalSignedDate,
     environment: verification.environment || 'Sandbox',
   };
 
-  // 2. 寫入交易主記錄 (apple:entitlement:{originalTransactionId})
-  // Lifetime 終身買斷：不設定 TTL (真正永久持久保存)；訂閱型：保留到期後 30 天
-  if (effectiveTier === 'lifetime') {
-    await redis.set(`exam_ai:apple:entitlement:${originalTransactionId}`, entitlementRecord);
-  } else if (effectiveExpiresDate) {
-    const diffSec = Math.ceil((effectiveExpiresDate - now) / 1000);
-    const recordTtlSeconds = Math.max(86400, diffSec + 30 * 86400);
-    await redis.set(`exam_ai:apple:entitlement:${originalTransactionId}`, entitlementRecord, { ex: recordTtlSeconds });
-  } else {
-    await redis.set(`exam_ai:apple:entitlement:${originalTransactionId}`, entitlementRecord, { ex: 30 * 86400 });
+  // 2. 透過 Redis OCC 原子寫入主記錄 (apple:entitlement:{originalTransactionId})
+  let recordTtlSeconds = 0;
+  if (effectiveTier !== 'lifetime') {
+    if (effectiveExpiresDate && effectiveStatus === 'active') {
+      const diffSec = Math.ceil((effectiveExpiresDate - now) / 1000);
+      recordTtlSeconds = Math.max(86400, diffSec + 30 * 86400);
+    } else {
+      recordTtlSeconds = 30 * 86400;
+    }
+  }
+
+  const mainKey = `exam_ai:apple:entitlement:${originalTransactionId}`;
+  try {
+    const occRes = (await redis.eval(
+      SAVE_ENTITLEMENT_OCC_LUA,
+      [mainKey],
+      [JSON.stringify(entitlementRecord), String(txSignedDate), String(recordTtlSeconds)],
+    )) as string[];
+
+    if (occRes && occRes[0] !== 'OK') {
+      const occCode = occRes[0];
+      if (occCode === 'REVOKED_LOCK') {
+        effectiveStatus = 'revoked';
+        effectiveTier = 'free';
+      } else if (occCode === 'LIFETIME_PROTECTED') {
+        effectiveStatus = 'active';
+        effectiveTier = 'lifetime';
+      } else if (occCode === 'STALE') {
+        // 既有記錄已有更新的 Apple 狀態，讀取最新記錄確認狀態
+        const latestRecord = (await redis.get(mainKey)) as AppleEntitlementRecord | null;
+        if (latestRecord) {
+          effectiveStatus = latestRecord.status;
+          effectiveTier = latestRecord.tier;
+        }
+      } else if (occCode === 'OUT_OF_ORDER_EXPIRED') {
+        effectiveStatus = 'active';
+      }
+    }
+  } catch (occErr) {
+    console.warn(`[OCC寫入警示] 主記錄寫入異常 (交易 ${originalTransactionId}):`, occErr);
+    // 降級寫入保證服務可用性
+    if (effectiveTier === 'lifetime') {
+      await redis.set(mainKey, entitlementRecord);
+    } else {
+      await redis.set(mainKey, entitlementRecord, { ex: recordTtlSeconds || 86400 });
+    }
   }
 
   // 3. 跨裝置關聯 (apple:devices_z:{originalTransactionId})
-  // 異常流量監控：記錄活躍裝置數量，但絕不設硬性上限阻斷正常使用者恢復購買 (遵循 Apple App Store 規範)
   const currentDevicesCount = await redis.zcard(`exam_ai:apple:devices_z:${originalTransactionId}`);
   if (currentDevicesCount >= ANOMALOUS_DEVICE_THRESHOLD_PER_PURCHASE) {
     console.warn(`[異常流量監控] 交易 ${originalTransactionId} 關聯裝置數已達 ${currentDevicesCount} 台，請留意收據外流情況。`);
@@ -239,7 +308,7 @@ export async function saveVerifiedEntitlement(
   await redis.sadd(`exam_ai:user:${userId}:apple_txns`, originalTransactionId);
 
   // 4. 跨交易綜合評估並更新使用者的即時權限快取 (user:{userId}:entitlement)
-  await syncUserDeviceEffectiveEntitlement(userId, originalTransactionId, entitlementRecord);
+  await syncUserDeviceEffectiveEntitlement(userId, originalTransactionId, null, now);
 
   // 若被 Apple 撤銷或退款，聯防同步所有關聯裝置 (確保不誤殺其他有效交易)
   if (effectiveStatus === 'revoked') {
@@ -247,7 +316,7 @@ export async function saveVerifiedEntitlement(
       const associatedDevices = (await redis.zrange(`exam_ai:apple:devices_z:${originalTransactionId}`, 0, -1)) as string[];
       for (const devId of associatedDevices) {
         if (devId !== userId) {
-          await syncUserDeviceEffectiveEntitlement(devId, originalTransactionId, entitlementRecord);
+          await syncUserDeviceEffectiveEntitlement(devId, originalTransactionId, null, now);
         }
       }
     } catch (revErr) {
@@ -255,7 +324,13 @@ export async function saveVerifiedEntitlement(
     }
   }
 
-  return { effectiveStatus, effectiveTier };
+  const finalRecord = (await redis.get(mainKey)) as AppleEntitlementRecord | null;
+
+  return {
+    effectiveStatus,
+    effectiveTier,
+    effectiveWillRenew: effectiveTier === 'lifetime' ? undefined : finalRecord?.willRenew,
+  };
 }
 
 /**
@@ -333,6 +408,7 @@ export async function syncUserDeviceEffectiveEntitlement(
       productId: activeRecord.productId,
       originalTransactionId: activeRecord.originalTransactionId,
       expiresAt: activeRecord.expiresDate,
+      willRenew: activeRecord.tier === 'lifetime' ? undefined : activeRecord.willRenew,
       verifiedAt: currentNow,
       environment: activeRecord.environment,
     };
@@ -410,6 +486,7 @@ export async function getUserEntitlement(userId: string): Promise<UserEntitlemen
     productId: cached.productId,
     originalTransactionId: cached.originalTransactionId,
     expiresAt: cached.expiresAt,
+    willRenew: cached.tier === 'lifetime' ? undefined : cached.willRenew,
   };
 }
 

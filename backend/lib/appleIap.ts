@@ -63,6 +63,7 @@ export interface AppleVerificationResult {
   revocationDate?: number;
   signedDate?: number;
   environment?: string;
+  willRenew?: boolean;
   isExpired: boolean;
   isRevoked: boolean;
   errorMessage?: string;

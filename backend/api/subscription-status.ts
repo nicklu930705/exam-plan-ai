@@ -212,6 +212,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           );
         }
 
+        const effectiveWillRenew =
+          responseTier === 'lifetime'
+            ? undefined
+            : userEntitlement.willRenew !== undefined
+            ? userEntitlement.willRenew
+            : mainRecord?.willRenew !== undefined
+            ? mainRecord.willRenew
+            : undefined;
+
         return res.status(200).json({
           success: true,
           tier: responseTier,
@@ -219,7 +228,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           productId: userEntitlement.productId || mainRecord?.productId,
           originalTransactionId: effectiveTxId,
           expiresAt: userEntitlement.expiresAt || mainRecord?.expiresDate || null,
-          willRenew: responseTier === 'pro' && responseStatus === 'active',
+          willRenew: effectiveWillRenew,
           proofToken: responseStatus === 'active' ? activeProofToken : undefined,
           isVerified: responseTier !== 'free' && responseStatus === 'active',
           serverTime: now,
@@ -352,6 +361,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         verifyResult.expiresDate,
       );
 
+      const effectiveWillRenew =
+        verifyResult.tier === 'lifetime'
+          ? undefined
+          : saveRes.effectiveWillRenew !== undefined
+          ? saveRes.effectiveWillRenew
+          : existingRecord?.willRenew !== undefined
+          ? existingRecord.willRenew
+          : undefined;
+
       return res.status(200).json({
         success: true,
         tier: verifyResult.tier,
@@ -359,7 +377,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         productId: verifyResult.productId,
         originalTransactionId: verifyResult.originalTransactionId,
         expiresAt: verifyResult.expiresDate || null,
-        willRenew: verifyResult.tier === 'pro',
+        willRenew: effectiveWillRenew,
         proofToken: freshProofToken,
         isVerified: true,
         serverTime: now,
