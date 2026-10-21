@@ -9,7 +9,7 @@ import {
   isIapSandboxConfigured,
   saveStoredProofToken,
 } from '../storage';
-import { getEffectiveTier } from './entitlements';
+import { getEffectiveTier, inspectProofToken } from './entitlements';
 import type { PlanTier, UserSubscription } from './types';
 
 /**
@@ -26,6 +26,21 @@ import type { PlanTier, UserSubscription } from './types';
  */
 
 export const FOREGROUND_THROTTLE_MS = 5 * 60 * 1000; // 5 分鐘節流冷卻
+export const PROOF_TOKEN_MAX_EXPIRED_RETENTION_MS = 30 * 86400 * 1000; // 30 天續訂自癒窗口，與後端相容
+export const STOREKIT_FALLBACK_THROTTLE_MS = 15 * 60 * 1000; // 15 分鐘 StoreKit 本機快取備援節流
+
+/**
+ * 檢查 Proof Token 是否仍處於 30 天續約自癒窗口內
+ */
+export function isProofTokenWithinRenewalWindow(token?: string | null, now = Date.now()): boolean {
+  if (!token || typeof token !== 'string' || token.trim() === '') return false;
+  const inspected = inspectProofToken(token);
+  if (!inspected.expiresAt || isNaN(inspected.expiresAt) || inspected.expiresAt <= 0) {
+    return false;
+  }
+  // 若未逾期 (expiresAt >= now) 或逾期在 30 天之內
+  return now - inspected.expiresAt <= PROOF_TOKEN_MAX_EXPIRED_RETENTION_MS;
+}
 
 export interface SubscriptionSyncOptions {
   currentSubscription?: UserSubscription;
@@ -34,6 +49,7 @@ export interface SubscriptionSyncOptions {
   force?: boolean;
   customApiEndpoint?: string;
   timeoutMs?: number;
+  enableStoreKitFallback?: boolean;
 }
 
 export interface SubscriptionSyncResult {
@@ -49,11 +65,14 @@ export interface SubscriptionSyncResult {
     | 'skipped_free';
   tier: PlanTier;
   message: string;
+  recoveredViaStoreKit?: boolean;
 }
 
 // 模組狀態 (跨生命週期共享)
 let lastSyncTimestamp = 0;
 let latestSyncRequestId = 0;
+let lastStoreKitFallbackTimestamp = 0;
+let isStoreKitFallbackRunning = false;
 
 /**
  * 使所有目前進行中的背景同步請求立即失效
@@ -69,6 +88,8 @@ export function invalidateInflightSyncRequests(): void {
 export function resetSyncServiceForTesting() {
   lastSyncTimestamp = 0;
   latestSyncRequestId = 0;
+  lastStoreKitFallbackTimestamp = 0;
+  isStoreKitFallbackRunning = false;
 }
 
 /**
@@ -76,6 +97,64 @@ export function resetSyncServiceForTesting() {
  */
 export function setLastSyncTimestampForTesting(ts: number) {
   lastSyncTimestamp = ts;
+}
+
+/**
+ * 測試專用：設定 StoreKit 備援時間
+ */
+export function setLastStoreKitFallbackTimestampForTesting(ts: number) {
+  lastStoreKitFallbackTimestamp = ts;
+}
+
+/**
+ * 當本地無 Proof Token 且處於 Free 狀態時，嘗試以 StoreKit 2 本機快取靜默自癒
+ * 嚴格規範：
+ * 1. 僅調用 syncWithAppStore: false (純讀取 iOS 本機快取，絕不彈出 Apple ID 密碼提示)
+ * 2. 15 分鐘節流與並行互斥鎖，避免循環調用
+ * 3. 遇到任何異常一律安全捕捉並維持現狀，不阻擋使用者操作
+ */
+export async function attemptSilentStoreKitRecovery(params: {
+  setSubscription: (sub: UserSubscription) => void;
+  getCurrentSubscription?: () => UserSubscription | undefined;
+  customApiEndpoint?: string;
+}): Promise<boolean> {
+  const now = Date.now();
+  if (isStoreKitFallbackRunning) return false;
+  if (
+    lastStoreKitFallbackTimestamp > 0 &&
+    now - lastStoreKitFallbackTimestamp < STOREKIT_FALLBACK_THROTTLE_MS
+  ) {
+    return false;
+  }
+
+  isStoreKitFallbackRunning = true;
+  lastStoreKitFallbackTimestamp = now;
+
+  try {
+    // 延遲引入避免模組循環參照
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { storeKitService } = require('./storeKitService');
+    if (!storeKitService || typeof storeKitService.restorePurchases !== 'function') {
+      return false;
+    }
+
+    const result = await storeKitService.restorePurchases({ syncWithAppStore: false });
+    if (result.status === 'success' && result.subscription) {
+      // 競態安全防護：若當前已為 active Lifetime，絕不以訂閱覆蓋
+      const currentSub = params.getCurrentSubscription?.();
+      if (currentSub && currentSub.plan === 'lifetime' && currentSub.status === 'active') {
+        return false;
+      }
+      params.setSubscription(result.subscription);
+      return true;
+    }
+    return false;
+  } catch (err) {
+    console.warn('[StoreKit 靜默自癒] 本機快取備援查詢失敗 (安全略過):', err);
+    return false;
+  } finally {
+    isStoreKitFallbackRunning = false;
+  }
 }
 
 /**
@@ -98,7 +177,12 @@ export async function syncSubscriptionStatus(
   }
 
   // 2. 檢查本地付費憑證
-  const storedProofToken = await getStoredProofToken();
+  let storedProofToken = await getStoredProofToken();
+  if (storedProofToken && !isProofTokenWithinRenewalWindow(storedProofToken, now)) {
+    // 超過 30 天安全換發窗口，主動清理遠古逾期權杖
+    await clearStoredProofToken();
+    storedProofToken = null;
+  }
   const proofToken = storedProofToken || options.currentSubscription?.proofToken;
   const storedJws = await getStoredLatestAppleJws();
   const latestJws = storedJws || options.currentSubscription?.signedTransaction;
@@ -106,12 +190,30 @@ export async function syncSubscriptionStatus(
     options.currentSubscription?.originalTransactionId ||
     options.currentSubscription?.transactionId;
 
+  // 3. 若本地完全無 Proof Token 與 JWS 憑據：嘗試 StoreKit 2 本機快取靜默備援自癒
+  if (!proofToken && !latestJws && options.enableStoreKitFallback !== false) {
+    const recovered = await attemptSilentStoreKitRecovery({
+      setSubscription: options.setSubscription,
+      getCurrentSubscription: options.getCurrentSubscription,
+      customApiEndpoint: options.customApiEndpoint,
+    });
+    if (recovered) {
+      lastSyncTimestamp = now;
+      return {
+        success: true,
+        status: 'active',
+        tier: 'pro',
+        message: '透過 StoreKit 本機快取成功安全自癒恢復 Pro 訂閱。',
+        recoveredViaStoreKit: true,
+      };
+    }
+  }
+
   // 若使用者從未購買且完全無任何付費憑證，靜默保留 Free，不造成無謂網路負擔
   const isFreeNoCredentials =
     (!options.currentSubscription || options.currentSubscription.plan === 'free') &&
     !proofToken &&
-    !latestJws &&
-    !origTxId;
+    !latestJws;
 
   if (isFreeNoCredentials) {
     lastSyncTimestamp = now;
@@ -304,8 +406,12 @@ export async function syncSubscriptionStatus(
       };
     }
 
-    await clearStoredProofToken();
-    await clearStoredLatestAppleJws();
+    // 檢查既有 Proof Token 是否在 30 天續約換發窗口內
+    const isRetainable = isProofTokenWithinRenewalWindow(proofToken || storedProofToken, now);
+    if (!isRetainable) {
+      await clearStoredProofToken();
+      await clearStoredLatestAppleJws();
+    }
 
     const downgraded: UserSubscription = {
       plan: 'free',
@@ -316,6 +422,7 @@ export async function syncSubscriptionStatus(
       transactionId: options.currentSubscription?.transactionId,
       purchaseDate: options.currentSubscription?.purchaseDate,
       expiresAt: json.expiresAt ? new Date(json.expiresAt).toISOString() : options.currentSubscription?.expiresAt,
+      isAutoRenewing: false,
       proofToken: undefined,
       signedTransaction: undefined,
     };

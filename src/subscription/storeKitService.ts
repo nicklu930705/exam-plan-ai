@@ -4,6 +4,7 @@ import {
   clearStoredProofToken,
   getBackendUrlFromStorage,
   getOrCreateClientDeviceId,
+  getStoredProofToken,
   isIapSandboxConfigured,
   saveStoredLatestAppleJws,
   saveStoredProofToken,
@@ -15,7 +16,7 @@ import {
   STOREKIT_PRODUCT_IDS,
 } from './storeKitConfig';
 import { SUBSCRIPTION_PRODUCTS } from './products';
-import { invalidateInflightSyncRequests } from './subscriptionSyncService';
+import { invalidateInflightSyncRequests, isProofTokenWithinRenewalWindow } from './subscriptionSyncService';
 import type { PlanTier, ProductDefinition, UserSubscription } from './types';
 
 export interface PurchaseResult {
@@ -182,8 +183,11 @@ export class ServerSideTransactionValidator implements ITransactionValidator {
           return { valid: false, tier: 'free', status: 'revoked', reason: json.error || '此交易已被 Apple 撤銷或退款。' };
         }
         if (json?.status === 'expired' || json?.code === 'SUBSCRIPTION_EXPIRED') {
-          await clearStoredProofToken();
-          await clearStoredLatestAppleJws();
+          const currentToken = await getStoredProofToken();
+          if (!isProofTokenWithinRenewalWindow(currentToken)) {
+            await clearStoredProofToken();
+            await clearStoredLatestAppleJws();
+          }
           return { valid: false, tier: 'free', status: 'expired', reason: json.error || '此訂閱方案已到期。' };
         }
         return { valid: false, reason: json?.error || `Apple 交易伺服端驗證失敗 (HTTP ${response.status})。` };
