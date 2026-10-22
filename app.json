@@ -10,7 +10,7 @@
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.examplanai.app",
-      "buildNumber": "7",
+      "buildNumber": "8",
       "infoPlist": {
         "CFBundleDevelopmentRegion": "zh_TW",
         "ITSAppUsesNonExemptEncryption": false
