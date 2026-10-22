@@ -374,6 +374,81 @@ export async function fetchFromBackendApi(
 }
 
 /**
+ * 唯讀向後端查詢當前使用者當日的 AI 額度狀態 (GET /api/ai-quota)
+ *
+ * 具備安全防護：
+ * 1. 唯讀查詢，絕不消耗額度、不扣除費用、不發起推論。
+ * 2. 失敗時（如離線、後端尚未部署該端點或逾時）安靜返回 null，絕不拋出例外中斷 App。
+ */
+export async function fetchAiQuotaFromBackend(
+  customBackendUrl?: string | null,
+  timeoutMs = 8000,
+): Promise<QuotaInfo | null> {
+  try {
+    let backendUrl = customBackendUrl;
+    if (!backendUrl) {
+      backendUrl = await getBackendUrlFromStorage();
+    }
+    if (!backendUrl) return null;
+
+    let cleanBase = backendUrl.trim().replace(/\/+$/, '');
+    if (!/^https?:\/\//i.test(cleanBase)) {
+      cleanBase = `https://${cleanBase}`;
+    }
+    if (cleanBase.endsWith('/api/ai-quota')) {
+      // 已經包含完整路徑
+    } else if (cleanBase.endsWith('/api')) {
+      cleanBase = `${cleanBase}/ai-quota`;
+    } else {
+      cleanBase = `${cleanBase}/api/ai-quota`;
+    }
+
+    const deviceId = await getOrCreateClientDeviceId();
+    const proofToken = await getStoredProofToken();
+
+    const headers: Record<string, string> = {
+      Accept: 'application/json',
+      'X-Client-Device-Id': deviceId,
+    };
+    if (proofToken) {
+      headers['X-Apple-Proof-Token'] = proofToken;
+    }
+
+    const controller = new AbortController();
+    let timerId: ReturnType<typeof setTimeout> | null = null;
+    try {
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timerId = setTimeout(() => {
+          try {
+            controller.abort();
+          } catch {}
+          reject(new Error('TIMEOUT'));
+        }, timeoutMs);
+      });
+
+      const fetchPromise = fetch(cleanBase, {
+        method: 'GET',
+        headers,
+        signal: controller.signal,
+      });
+
+      const res = await Promise.race([fetchPromise, timeoutPromise]);
+      if (!res.ok) return null;
+      const json = await res.json();
+      if (json?.success && json?.quota) {
+        return json.quota as QuotaInfo;
+      }
+      return null;
+    } finally {
+      if (timerId) clearTimeout(timerId);
+    }
+  } catch {
+    // 網路失敗或離線時安全返回 null
+    return null;
+  }
+}
+
+/**
  * 智慧讀書建議請求主函式
  * 完整整合會員等級檢查、用量額度防護、後端呼叫與本機無縫降級
  */

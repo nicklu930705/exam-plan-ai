@@ -130,8 +130,11 @@ export async function verifyEntitlementProofToken(
   }
 
   const expiresAt = parseInt(expStr || '0', 10);
+  if (isNaN(expiresAt) || expiresAt <= 0) {
+    return { valid: false, reason: '權杖到期時間戳無效。' };
+  }
   const now = Date.now();
-  const isTokenExpired = expiresAt > 0 && expiresAt < now;
+  const isTokenExpired = expiresAt < now;
 
   // 安全核心聯防：比對 Redis 中該 Apple 交易的最新狀態（防止退款後繼續持有舊 Token、並支援雲端續約自動輪轉）
   try {

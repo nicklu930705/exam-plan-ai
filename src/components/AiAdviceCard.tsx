@@ -3,7 +3,7 @@ import React from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, View } from 'react-native';
 
 import type { AiAdviceStatus, QuotaInfo, StructuredAdvice } from '../services/aiAdviceService';
-import type { AiQuotaStatus } from '../subscription/types';
+import type { AiQuotaStatus, PlanTier } from '../subscription/types';
 import { colors, radius, shadow, spacing } from '../theme';
 import { AppText } from './AppText';
 
@@ -12,6 +12,7 @@ interface Props {
   source?: 'openai_ai' | 'gemini_ai' | 'fallback_rule_engine';
   disclaimer?: string;
   note?: string;
+  tier?: PlanTier;
   quotaStatus?: AiQuotaStatus;
   quota?: QuotaInfo;
   status?: AiAdviceStatus;
@@ -19,6 +20,9 @@ interface Props {
   error?: string | null;
   errorCode?: string;
   examName?: string;
+  generatedAt?: string | null;
+  isOutdatedProgress?: boolean;
+  isQuotaStale?: boolean;
   onRefresh?: () => void;
   onRetry?: () => void;
   onDismiss?: () => void;
@@ -29,6 +33,7 @@ export const AiAdviceCard: React.FC<Props> = ({
   source = 'openai_ai',
   disclaimer,
   note,
+  tier,
   quotaStatus,
   quota,
   status,
@@ -36,6 +41,9 @@ export const AiAdviceCard: React.FC<Props> = ({
   error,
   errorCode,
   examName,
+  generatedAt,
+  isOutdatedProgress = false,
+  isQuotaStale = false,
   onRefresh,
   onRetry,
   onDismiss,
@@ -49,6 +57,19 @@ export const AiAdviceCard: React.FC<Props> = ({
     (Boolean(error) ||
       (status !== undefined && status !== 'idle' && status !== 'loading' && status !== 'success') ||
       (!advice && Boolean(status) && status !== 'idle'));
+
+  const formattedGeneratedTime = React.useMemo(() => {
+    if (!generatedAt) return null;
+    try {
+      const d = new Date(generatedAt);
+      if (isNaN(d.getTime())) return null;
+      const hours = String(d.getHours()).padStart(2, '0');
+      const mins = String(d.getMinutes()).padStart(2, '0');
+      return `今日 ${hours}:${mins}`;
+    } catch {
+      return null;
+    }
+  }, [generatedAt]);
 
   // ───── 1. 載入中狀態 (Loading State) ─────
   if (isBusy) {
@@ -227,6 +248,11 @@ export const AiAdviceCard: React.FC<Props> = ({
               ? '✦ AI 讀書教練深度建議'
               : '智慧讀書教練 (本機引擎)'}
           </AppText>
+          {formattedGeneratedTime ? (
+            <AppText variant="caption" secondary style={styles.generatedTimeBadge}>
+              · {formattedGeneratedTime}
+            </AppText>
+          ) : null}
         </View>
 
         <View style={styles.headerActions}>
@@ -236,7 +262,7 @@ export const AiAdviceCard: React.FC<Props> = ({
               disabled={isLoading}
               hitSlop={8}
               accessibilityRole="button"
-              accessibilityLabel="重新取得 AI 建議"
+              accessibilityLabel="重新取得 AI 建議（將消耗 1 次本日配額）"
               style={({ pressed }) => [styles.actionIconBtn, pressed && { opacity: 0.6 }]}
             >
               <Ionicons name="refresh" size={16} color={colors.primary} />
@@ -256,6 +282,16 @@ export const AiAdviceCard: React.FC<Props> = ({
           ) : null}
         </View>
       </View>
+
+      {/* 進度已變更提示 */}
+      {isOutdatedProgress ? (
+        <View style={styles.outdatedNoticeBox}>
+          <Ionicons name="information-circle-outline" size={14} color={colors.warning} />
+          <AppText variant="caption" color={colors.warning} style={{ flex: 1, fontWeight: '600', lineHeight: 16 }}>
+            今日進度已有新更新 · 可點擊右上角重新整理以產生最新分析（將消耗 1 次配額）
+          </AppText>
+        </View>
+      ) : null}
 
       {/* 總結核心重點 */}
       <AppText variant="headline" style={styles.summaryTitle}>
@@ -330,14 +366,31 @@ export const AiAdviceCard: React.FC<Props> = ({
 
       {/* 配額與免責說明 */}
       <View style={styles.footer}>
-        {quota ? (
-          <View style={styles.quotaRow}>
-            <Ionicons name="sparkles" size={12} color={colors.primary} />
-            <AppText variant="caption" color={colors.primary} style={styles.quotaHighlightText}>
-              {quota.tier === 'pro' ? '✦ Pro 會員' : '免費版'}今日已用 {quota.usedToday}/{quota.dailyLimit} 次（剩餘 {quota.remainingToday} 次 · 每日 00:00 重設）
-            </AppText>
-          </View>
-        ) : !isAi ? (
+        {quota || quotaStatus ? (() => {
+          const resolvedTier = tier || (quota?.tier as PlanTier | undefined);
+          let tierPrefix = '今日 AI 使用額度 · ';
+          if (resolvedTier === 'lifetime') {
+            tierPrefix = '✦ 終身版會員 · ';
+          } else if (resolvedTier === 'pro') {
+            tierPrefix = '✦ Pro 會員 · ';
+          } else if (resolvedTier === 'free') {
+            tierPrefix = '免費版 · ';
+          }
+
+          const usedCount = quota?.usedToday ?? quotaStatus?.used ?? 0;
+          const limitCount = quota?.dailyLimit ?? quotaStatus?.limit ?? 0;
+          const remainingCount = quota?.remainingToday ?? quotaStatus?.remaining ?? 0;
+          const syncSuffix = isQuotaStale ? ' · 上次同步' : ' · 每日 00:00 重設';
+
+          return (
+            <View style={styles.quotaRow}>
+              <Ionicons name="sparkles" size={12} color={colors.primary} />
+              <AppText variant="caption" color={colors.primary} style={styles.quotaHighlightText}>
+                {`${tierPrefix}今日已用 ${usedCount}/${limitCount} 次（剩餘 ${remainingCount} 次${syncSuffix}）`}
+              </AppText>
+            </View>
+          );
+        })() : !isAi ? (
           <AppText variant="caption" secondary style={styles.quotaText}>
             本機排程分析引擎（不消耗雲端每日 AI 額度）
           </AppText>
@@ -437,6 +490,22 @@ const styles = StyleSheet.create({
     backgroundColor: colors.primarySoft,
   },
   localBadge: {
+    backgroundColor: colors.warningSoft,
+  },
+  generatedTimeBadge: {
+    marginLeft: 4,
+    fontWeight: '500',
+    fontSize: 11,
+  },
+  outdatedNoticeBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 2,
+    marginBottom: spacing.xs,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: spacing.xs,
+    borderRadius: radius.sm,
     backgroundColor: colors.warningSoft,
   },
   headerActions: {

@@ -1,6 +1,7 @@
 import { Redis } from '@upstash/redis';
 import { getAiConfig } from './config';
 import {
+  getNextTaipeiResetIso,
   getSecondsUntilTaipeiMidnight,
   getSecondsUntilTaipeiMonthEnd,
   getTaipeiDateParts,
@@ -937,4 +938,47 @@ export async function postCallSettleFailure(params: PostCallSettleFailureParams)
   } catch (err: any) {
     console.error('[Redis 錯誤] 執行失敗退款 Lua 失敗：', err?.message || err);
   }
+}
+
+/**
+ * 唯讀查詢特定使用者當前每日 AI 配額與剩餘次數（不扣額、不鎖定、不發起推論）
+ */
+export async function getDailyQuotaStatus(
+  userId: string,
+  tier: 'free' | 'pro',
+): Promise<{
+  usedToday: number;
+  dailyLimit: number;
+  remainingToday: number;
+  resetsAt: string;
+  tier: 'free' | 'pro';
+}> {
+  const config = getAiConfig();
+  const { dateKey } = getTaipeiDateParts();
+  const dailyQuotaKey = `exam_ai:usage:day:${dateKey}:${userId}`;
+  const client = getRedisClient();
+
+  let usedToday = 0;
+  try {
+    const raw = await client.get(dailyQuotaKey);
+    if (typeof raw === 'number') {
+      usedToday = raw;
+    } else if (raw) {
+      usedToday = parseInt(String(raw), 10) || 0;
+    }
+  } catch (err: any) {
+    console.error('[Redis] 讀取每日 AI 用量失敗：', err?.message || err);
+  }
+
+  const dailyLimit = tier === 'pro' ? config.PRO_DAILY_LIMIT : config.FREE_DAILY_LIMIT;
+  const remainingToday = Math.max(0, dailyLimit - usedToday);
+  const resetsAt = getNextTaipeiResetIso();
+
+  return {
+    usedToday,
+    dailyLimit,
+    remainingToday,
+    resetsAt,
+    tier,
+  };
 }

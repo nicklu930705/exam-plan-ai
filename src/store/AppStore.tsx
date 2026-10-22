@@ -2,6 +2,7 @@ import React, { createContext, useContext, useEffect, useMemo, useReducer, useRe
 
 import { createDemoData } from '../data/demo';
 import { clearAppDataFromStorage, loadAppDataFromStorage, safeRestoreAppDataToStorage, saveAppDataToStorage } from '../storage';
+import { clearAllAiAdviceCache, removeCachedAiAdviceForExam } from '../services/aiAdviceCacheService';
 import { getEffectiveTier, getPlanEntitlements, normalizeSubscriptionOnLoad } from '../subscription/entitlements';
 import {
   invalidateInflightSyncRequests,
@@ -711,7 +712,10 @@ export function AppStoreProvider({
       },
       applyRescheduledTasks: (examId, updatedTasks) =>
         dispatch({ type: 'applyRescheduledTasks', examId, updatedTasks }),
-      deleteExam: (examId) => dispatch({ type: 'deleteExam', examId }),
+      deleteExam: (examId) => {
+        dispatch({ type: 'deleteExam', examId });
+        removeCachedAiAdviceForExam(examId).catch(() => {});
+      },
       updatePreferences: (patch) => dispatch({ type: 'updatePreferences', patch }),
       setSubscription: (subscription) => dispatch({ type: 'setSubscription', subscription }),
       recordAiUsage: (increment) => dispatch({ type: 'recordAiUsage', increment }),
@@ -752,6 +756,7 @@ export function AppStoreProvider({
       clearAll: () => {
         dispatch({ type: 'clearAll' });
         clearAppDataFromStorage();
+        clearAllAiAdviceCache().catch(() => {});
       },
     }),
     [data, isLoaded],

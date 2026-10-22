@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
 
 import { ActiveTimerBanner } from '../../components/ActiveTimerBanner';
@@ -19,11 +19,21 @@ import { useToday } from '../../hooks/useToday';
 import { prioritizeTasks, TaskPriorityResult } from '../../scheduler/priority';
 import { generateStudyRecommendations } from '../../scheduler/recommendations';
 import {
+  createTaskProgressSnapshot,
+  getCachedAiAdvice,
+  isProgressChanged,
+  saveCachedAiAdvice,
+  saveLatestQuotaCache,
+  type TaskProgressSnapshot,
+} from '../../services/aiAdviceCacheService';
+import {
+  fetchAiQuotaFromBackend,
   logDiagnostic,
   requestAiStudyAdvice,
   type AiAdviceServiceResult,
 } from '../../services/aiAdviceService';
 import { useAppStore } from '../../store/AppStore';
+import { getEffectiveTier } from '../../subscription/entitlements';
 
 import {
   computeProgress,
@@ -59,6 +69,11 @@ export default function HomeScreen() {
   const [aiAdviceResult, setAiAdviceResult] = useState<AiAdviceServiceResult | null>(null);
   const [isLoadingAi, setIsLoadingAi] = useState<boolean>(false);
   const [showAiCard, setShowAiCard] = useState<boolean>(false);
+  const [aiAdviceCreatedAt, setAiAdviceCreatedAt] = useState<string | null>(null);
+  const [savedTaskSnapshot, setSavedTaskSnapshot] = useState<TaskProgressSnapshot | null>(null);
+  const [isQuotaStale, setIsQuotaStale] = useState<boolean>(false);
+
+  const effectiveTier = useMemo(() => getEffectiveTier(data.subscription), [data.subscription]);
 
   const activeExams = useMemo(() => data.exams.filter((e) => !e.archived), [data.exams]);
   const activeExamIds = useMemo(() => new Set(activeExams.map((e) => e.id)), [activeExams]);
@@ -143,6 +158,99 @@ export default function HomeScreen() {
   const nextTask = todayTasks.find((t) => t.status !== 'done');
   const isRestDay = data.preferences.restDays.includes(weekdayOf(today));
 
+  // 當學習進度改變時，自動判定快取的 AI 建議是否落後於最新進度
+  const isOutdatedProgress = useMemo(() => {
+    if (!savedTaskSnapshot || !exam) return false;
+    const currentExamTasks = tasksForExam(data.tasks, exam.id);
+    return isProgressChanged(savedTaskSnapshot, currentExamTasks);
+  }, [savedTaskSnapshot, data.tasks, exam]);
+
+  // 冷啟動或切換考試 / 跨日 / 會員方案變動時：還原 AI 建議快取與即時額度
+  useEffect(() => {
+    let isCancelled = false;
+
+    async function restoreAdviceAndQuota() {
+      if (!exam?.id) {
+        setShowAiCard(false);
+        setAiAdviceResult(null);
+        setSavedTaskSnapshot(null);
+        setAiAdviceCreatedAt(null);
+        return;
+      }
+
+      // 1. 查詢該考試、今日與該會員等級的本機快取
+      const { cachedAdvice } = await getCachedAiAdvice(exam.id, today, effectiveTier);
+      if (isCancelled) return;
+
+      if (cachedAdvice) {
+        setSavedTaskSnapshot(cachedAdvice.taskSnapshot ?? null);
+        setAiAdviceCreatedAt(cachedAdvice.createdAt);
+        setShowAiCard(true);
+        setIsQuotaStale(true); // 從本機快取恢復，後端尚未回應前標記為上次同步
+
+        const restoredResult: AiAdviceServiceResult = {
+          success: true,
+          status: 'success',
+          source: cachedAdvice.source,
+          advice: cachedAdvice.advice,
+          disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
+          cached: true,
+          quota: cachedAdvice.quotaSnapshot,
+          quotaStatus: cachedAdvice.quotaSnapshot
+            ? {
+                used: cachedAdvice.quotaSnapshot.usedToday,
+                limit: cachedAdvice.quotaSnapshot.dailyLimit,
+                remaining: cachedAdvice.quotaSnapshot.remainingToday,
+                isExceeded: cachedAdvice.quotaSnapshot.remainingToday <= 0,
+                resetsAt: cachedAdvice.quotaSnapshot.resetsAt,
+              }
+            : undefined,
+        };
+        setAiAdviceResult(restoredResult);
+      } else {
+        setShowAiCard(false);
+        setAiAdviceResult(null);
+        setSavedTaskSnapshot(null);
+        setAiAdviceCreatedAt(null);
+      }
+
+      // 2. 背景唯讀查詢最新真實額度（不發起 AI 推論，不消耗額度）
+      try {
+        const freshQuota = await fetchAiQuotaFromBackend();
+        if (!isCancelled && freshQuota) {
+          await saveLatestQuotaCache(freshQuota);
+          setIsQuotaStale(false); // 成功取得後端即時額度，更新為即時狀態
+
+          setAiAdviceResult((prev) => {
+            if (!prev) return prev;
+            return {
+              ...prev,
+              quota: freshQuota,
+              quotaStatus: {
+                used: freshQuota.usedToday,
+                limit: freshQuota.dailyLimit,
+                remaining: freshQuota.remainingToday,
+                isExceeded: freshQuota.remainingToday <= 0,
+                resetsAt: freshQuota.resetsAt,
+              },
+            };
+          });
+        } else if (!isCancelled && !freshQuota) {
+          setIsQuotaStale(true);
+        }
+      } catch {
+        // 唯讀查詢離線時安全略過，維持上次同步標記
+        setIsQuotaStale(true);
+      }
+    }
+
+    restoreAdviceAndQuota();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [exam?.id, today, effectiveTier]);
+
   const handleRequestAiAdvice = async () => {
     logDiagnostic('AI_BUTTON_PRESSED', { examName: exam?.name, screen: 'index' });
     if (!exam || isLoadingAi) return;
@@ -197,6 +305,30 @@ export default function HomeScreen() {
       }
 
       setAiAdviceResult(result);
+
+      if (result.success && result.advice) {
+        setIsQuotaStale(false);
+        const nowIso = new Date().toISOString();
+        const currentExamTasks = tasksForExam(data.tasks, exam.id);
+        const snapshot = createTaskProgressSnapshot(currentExamTasks);
+        setSavedTaskSnapshot(snapshot);
+        setAiAdviceCreatedAt(nowIso);
+
+        await saveCachedAiAdvice({
+          examId: exam.id,
+          date: today,
+          tier: effectiveTier,
+          createdAt: nowIso,
+          advice: result.advice,
+          source: result.source || 'openai_ai',
+          taskSnapshot: snapshot,
+          quotaSnapshot: result.quota,
+        });
+
+        if (result.quota) {
+          await saveLatestQuotaCache(result.quota);
+        }
+      }
     } catch (err: any) {
       logDiagnostic('AI_REQUEST_FAILED', {
         screen: 'index',
@@ -213,6 +345,14 @@ export default function HomeScreen() {
       setIsLoadingAi(false);
       logDiagnostic('AI_LOADING_FINISHED', { screen: 'index' });
     }
+  };
+
+  const handleOpenOrRequestAiAdvice = () => {
+    if (aiAdviceResult?.advice) {
+      setShowAiCard(true);
+      return;
+    }
+    handleRequestAiAdvice();
   };
 
   const createButton = (
@@ -400,8 +540,12 @@ export default function HomeScreen() {
             error={aiAdviceResult?.error}
             errorCode={aiAdviceResult?.errorCode}
             examName={exam?.name}
+            tier={effectiveTier}
             quotaStatus={aiAdviceResult?.quotaStatus}
             quota={aiAdviceResult?.quota}
+            generatedAt={aiAdviceCreatedAt}
+            isOutdatedProgress={isOutdatedProgress}
+            isQuotaStale={isQuotaStale}
             isLoading={isLoadingAi}
             onRefresh={handleRequestAiAdvice}
             onRetry={handleRequestAiAdvice}
@@ -418,7 +562,7 @@ export default function HomeScreen() {
               </AppText>
             </View>
             <Pressable
-              onPress={handleRequestAiAdvice}
+              onPress={handleOpenOrRequestAiAdvice}
               disabled={isLoadingAi}
               style={({ pressed }) => [styles.aiHeaderPill, pressed && { opacity: 0.7 }]}
               hitSlop={8}
@@ -450,7 +594,7 @@ export default function HomeScreen() {
       ) : (
         <View style={styles.recommendationSection}>
           <Pressable
-            onPress={handleRequestAiAdvice}
+            onPress={handleOpenOrRequestAiAdvice}
             disabled={isLoadingAi}
             style={({ pressed }) => [styles.aiStandaloneBtn, pressed && { opacity: 0.8 }]}
             hitSlop={8}
