@@ -1,4 +1,4 @@
-import { Linking, Platform } from 'react-native';
+import { Platform } from 'react-native';
 import {
   clearStoredLatestAppleJws,
   clearStoredProofToken,
@@ -11,7 +11,6 @@ import {
 } from '../storage';
 import {
   ALL_STOREKIT_PRODUCT_IDS,
-  APPLE_MANAGE_SUBSCRIPTIONS_URL,
   isValidProductId,
   STOREKIT_PRODUCT_IDS,
 } from './storeKitConfig';
@@ -34,6 +33,12 @@ export interface RestoreOptions {
    * 預設為 false，優先以安全模式讀取裝置端現有憑證快取，避免不必要的密碼提示與 Code 14 錯誤。
    */
   syncWithAppStore?: boolean;
+}
+
+export interface ManageSubscriptionsResult {
+  success: boolean;
+  status: 'sheet_presented' | 'unsupported_platform' | 'dev_preview' | 'failed';
+  error?: string;
 }
 
 export interface RestoreResult {
@@ -418,7 +423,7 @@ export interface IStoreKitService {
   purchase(productId: string): Promise<PurchaseResult>;
   restorePurchases(options?: RestoreOptions): Promise<RestoreResult>;
   getStoreStatus(): StoreStatus;
-  manageSubscriptions(): Promise<void>;
+  manageSubscriptions(): Promise<ManageSubscriptionsResult>;
   setDevPreviewMode(enabled: boolean): void;
   isDevPreviewMode(): boolean;
 }
@@ -539,12 +544,12 @@ export class DevStoreKitService implements IStoreKitService {
     };
   }
 
-  async manageSubscriptions(): Promise<void> {
-    try {
-      await Linking.openURL(APPLE_MANAGE_SUBSCRIPTIONS_URL);
-    } catch {
-      // 瀏覽器無法開啟時靜默忽略
-    }
+  async manageSubscriptions(): Promise<ManageSubscriptionsResult> {
+    return {
+      success: false,
+      status: 'dev_preview',
+      error: '開發測試模式下無真實 Apple 訂閱。',
+    };
   }
 
   setDevPreviewMode(enabled: boolean): void {
@@ -1117,22 +1122,41 @@ export class ProductionStoreKitService implements IStoreKitService {
     };
   }
 
-  async manageSubscriptions(): Promise<void> {
-    if (!this.isDevPreviewMode()) {
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const { deepLinkToSubscriptions } = require('expo-iap');
-        await deepLinkToSubscriptions();
-        return;
-      } catch {
-        // deepLinkToSubscriptions 失敗時平滑回退至官方網址
-      }
+  async manageSubscriptions(): Promise<ManageSubscriptionsResult> {
+    if (Platform.OS !== 'ios') {
+      return {
+        success: false,
+        status: 'unsupported_platform',
+        error: '目前僅支援 iOS 裝置管理 Apple 訂閱項目。',
+      };
+    }
+
+    if (this.isDevPreviewMode()) {
+      return {
+        success: false,
+        status: 'dev_preview',
+        error: '目前處於開發預覽模式，未連接 Apple StoreKit 2。',
+      };
     }
 
     try {
-      await Linking.openURL(APPLE_MANAGE_SUBSCRIPTIONS_URL);
-    } catch {
-      // 忽略開啟失敗
+      // 優先調用 StoreKit 2 原生 App 內管理工作表 (AppStore.showManageSubscriptions)
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { showManageSubscriptionsIOS } = require('expo-iap');
+      if (typeof showManageSubscriptionsIOS === 'function') {
+        await showManageSubscriptionsIOS();
+        return {
+          success: true,
+          status: 'sheet_presented',
+        };
+      }
+      throw new Error('StoreKit 2 管理訂閱功能不可用');
+    } catch (err: any) {
+      return {
+        success: false,
+        status: 'failed',
+        error: err?.message || '未能開啟 Apple 原生訂閱管理視窗。',
+      };
     }
   }
 }

@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
 
 import { ActiveTimerBanner } from '../../components/ActiveTimerBanner';
@@ -73,6 +73,11 @@ export default function HomeScreen() {
   const [savedTaskSnapshot, setSavedTaskSnapshot] = useState<TaskProgressSnapshot | null>(null);
   const [isQuotaStale, setIsQuotaStale] = useState<boolean>(false);
 
+  // 同步防重入鎖與當前考試識別，避免連擊穿透與非同步切換競態
+  const isRequestingAiRef = useRef<boolean>(false);
+  const activeRequestIdRef = useRef<number>(0);
+  const currentExamIdRef = useRef<string | undefined>(undefined);
+
   const effectiveTier = useMemo(() => getEffectiveTier(data.subscription), [data.subscription]);
 
   const activeExams = useMemo(() => data.exams.filter((e) => !e.archived), [data.exams]);
@@ -85,6 +90,10 @@ export default function HomeScreen() {
     examWithTasks ??
     getUpcomingExam(data, today) ??
     activeExams[0];
+
+  useEffect(() => {
+    currentExamIdRef.current = exam?.id;
+  }, [exam?.id]);
 
   // 依選取的考試過濾（僅計算進行中考試的任務，嚴格排除已封存考試）
   const relevantTasks = useMemo(() => {
@@ -253,8 +262,12 @@ export default function HomeScreen() {
 
   const handleRequestAiAdvice = async () => {
     logDiagnostic('AI_BUTTON_PRESSED', { examName: exam?.name, screen: 'index' });
-    if (!exam || isLoadingAi) return;
+    // 同步防重入鎖定：React setState 非同步期間若有極速連點，立即同步攔截
+    if (!exam || isRequestingAiRef.current || isLoadingAi) return;
 
+    isRequestingAiRef.current = true;
+    const requestedExamId = exam.id;
+    const requestId = ++activeRequestIdRef.current;
     setIsLoadingAi(true);
     setShowAiCard(true);
     setAiAdviceResult(null);
@@ -304,18 +317,18 @@ export default function HomeScreen() {
         recordAiUsage();
       }
 
-      setAiAdviceResult(result);
+      // 檢查非同步回應競態：避免使用者快速切換考試或舊請求延遲返回時覆蓋目前畫面
+      const isCurrentExam =
+        activeRequestIdRef.current === requestId && currentExamIdRef.current === requestedExamId;
 
       if (result.success && result.advice) {
-        setIsQuotaStale(false);
         const nowIso = new Date().toISOString();
-        const currentExamTasks = tasksForExam(data.tasks, exam.id);
+        const currentExamTasks = tasksForExam(data.tasks, requestedExamId);
         const snapshot = createTaskProgressSnapshot(currentExamTasks);
-        setSavedTaskSnapshot(snapshot);
-        setAiAdviceCreatedAt(nowIso);
 
+        // 無論當前畫面是否切換，成功結果一律安全寫入該考試的專屬快取中，避免浪費已扣之額度
         await saveCachedAiAdvice({
-          examId: exam.id,
+          examId: requestedExamId,
           date: today,
           tier: effectiveTier,
           createdAt: nowIso,
@@ -328,26 +341,42 @@ export default function HomeScreen() {
         if (result.quota) {
           await saveLatestQuotaCache(result.quota);
         }
+
+        if (isCurrentExam) {
+          setIsQuotaStale(false);
+          setSavedTaskSnapshot(snapshot);
+          setAiAdviceCreatedAt(nowIso);
+          setAiAdviceResult(result);
+        }
+      } else if (isCurrentExam) {
+        setAiAdviceResult(result);
       }
     } catch (err: any) {
       logDiagnostic('AI_REQUEST_FAILED', {
         screen: 'index',
         error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
       });
-      setAiAdviceResult({
-        success: false,
-        status: 'network_error',
-        source: 'fallback_rule_engine',
-        disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
-        error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
-      });
+      if (activeRequestIdRef.current === requestId && currentExamIdRef.current === requestedExamId) {
+        setAiAdviceResult({
+          success: false,
+          status: 'network_error',
+          source: 'fallback_rule_engine',
+          disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
+          error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
+        });
+      }
     } finally {
-      setIsLoadingAi(false);
-      logDiagnostic('AI_LOADING_FINISHED', { screen: 'index' });
+      // 確保在成功、失敗、逾時所有情況下均同步釋放鎖；舊請求完成不得錯誤解除新請求之鎖
+      if (activeRequestIdRef.current === requestId) {
+        isRequestingAiRef.current = false;
+        setIsLoadingAi(false);
+        logDiagnostic('AI_LOADING_FINISHED', { screen: 'index' });
+      }
     }
   };
 
   const handleOpenOrRequestAiAdvice = () => {
+    if (isRequestingAiRef.current || isLoadingAi) return;
     if (aiAdviceResult?.advice) {
       setShowAiCard(true);
       return;

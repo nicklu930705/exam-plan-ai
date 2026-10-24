@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router, useLocalSearchParams } from 'expo-router';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
 
 import { ActiveTimerBanner } from '../../components/ActiveTimerBanner';
@@ -97,10 +97,21 @@ export default function PlanScreen() {
   const defaultWeek = firstFutureTask ? startOfWeek(firstFutureTask.date) : thisWeek;
   const weekStart = customWeekStart ?? defaultWeek;
 
+  // 避免極速連擊重複請求與非同步切換競態
+  const isRequestingAiRef = useRef<boolean>(false);
+  const activeRequestIdRef = useRef<number>(0);
+  const currentExamIdRef = useRef<string | undefined>(selectedExam?.id);
+  useEffect(() => {
+    currentExamIdRef.current = selectedExam?.id;
+  }, [selectedExam?.id]);
+
   const handleFetchAiAdvice = async () => {
     logDiagnostic('AI_BUTTON_PRESSED', { examName: selectedExam?.name, screen: 'plan' });
-    if (!selectedExam || isLoadingAi) return;
+    if (!selectedExam || isRequestingAiRef.current || isLoadingAi) return;
 
+    isRequestingAiRef.current = true;
+    const requestedExamId = selectedExam.id;
+    const requestId = ++activeRequestIdRef.current;
     setIsLoadingAi(true);
     setShowAiSection(true);
     setAiAdviceResult(null);
@@ -152,22 +163,31 @@ export default function PlanScreen() {
         recordAiUsage();
       }
 
-      setAiAdviceResult(result);
+      // 檢查非同步回應競態：避免使用者切換考試時舊回應覆蓋畫面
+      if (activeRequestIdRef.current === requestId && currentExamIdRef.current === requestedExamId) {
+        setAiAdviceResult(result);
+      }
     } catch (err: any) {
       logDiagnostic('AI_REQUEST_FAILED', {
         screen: 'plan',
         error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
       });
-      setAiAdviceResult({
-        success: false,
-        status: 'network_error',
-        source: 'fallback_rule_engine',
-        disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
-        error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
-      });
+      if (activeRequestIdRef.current === requestId && currentExamIdRef.current === requestedExamId) {
+        setAiAdviceResult({
+          success: false,
+          status: 'network_error',
+          source: 'fallback_rule_engine',
+          disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
+          error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
+        });
+      }
     } finally {
-      setIsLoadingAi(false);
-      logDiagnostic('AI_LOADING_FINISHED', { screen: 'plan' });
+      // 確保在成功、失敗、逾時所有情況下均同步釋放鎖；舊請求完成不得錯誤解除新請求之鎖
+      if (activeRequestIdRef.current === requestId) {
+        isRequestingAiRef.current = false;
+        setIsLoadingAi(false);
+        logDiagnostic('AI_LOADING_FINISHED', { screen: 'plan' });
+      }
     }
   };
 

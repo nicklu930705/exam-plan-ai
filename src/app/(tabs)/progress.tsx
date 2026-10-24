@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
 
 import { ActiveTimerBanner } from '../../components/ActiveTimerBanner';
@@ -59,6 +59,10 @@ export default function ProgressScreen() {
 
   const [aiAdviceResult, setAiAdviceResult] = useState<AiAdviceServiceResult | null>(null);
   const [isLoadingAi, setIsLoadingAi] = useState<boolean>(false);
+  // 同步防重入鎖與非同步切換競態防護，避免極速連擊重複請求
+  const isRequestingAiRef = useRef<boolean>(false);
+  const activeRequestIdRef = useRef<number>(0);
+  const currentExamIdRef = useRef<string | undefined>(undefined);
   const [showAiCard, setShowAiCard] = useState<boolean>(false);
 
   const upcomingExam = useMemo(() => getUpcomingExam(data, today), [data, today]);
@@ -66,6 +70,11 @@ export default function ProgressScreen() {
     if (selectedFilter === 'all') return null;
     return getActiveExamById(data, selectedFilter) ?? null;
   }, [data, selectedFilter]);
+
+  const targetExam = activeExam ?? upcomingExam ?? activeExams[0];
+  useEffect(() => {
+    currentExamIdRef.current = targetExam?.id;
+  }, [targetExam?.id]);
 
   // 當前儀表板聚焦的任務集合（嚴格排除已封存考試之任務）
   const activeTasks = useMemo(() => {
@@ -154,24 +163,27 @@ export default function ProgressScreen() {
       : null;
 
   const handleRequestAiAdvice = async () => {
-    const targetExam = activeExam ?? upcomingExam ?? activeExams[0];
-    logDiagnostic('AI_BUTTON_PRESSED', { examName: targetExam?.name, screen: 'progress' });
-    if (!targetExam || isLoadingAi) return;
+    const currentTarget = activeExam ?? upcomingExam ?? activeExams[0];
+    logDiagnostic('AI_BUTTON_PRESSED', { examName: currentTarget?.name, screen: 'progress' });
+    if (!currentTarget || isRequestingAiRef.current || isLoadingAi) return;
 
+    isRequestingAiRef.current = true;
+    const requestedExamId = currentTarget.id;
+    const requestId = ++activeRequestIdRef.current;
     setIsLoadingAi(true);
     setShowAiCard(true);
     setAiAdviceResult(null);
     logDiagnostic('AI_LOADING_STARTED', { screen: 'progress' });
 
     try {
-      const targetTasks = tasksForExam(data.tasks, targetExam.id);
+      const targetTasks = tasksForExam(data.tasks, currentTarget.id);
       const completedTasks = targetTasks.filter((t) => t.status === 'done');
       const completionRate =
         targetTasks.length > 0
           ? Math.round((completedTasks.length / targetTasks.length) * 100)
           : 0;
 
-      const subjectsInput = targetExam.subjects.map((s) => {
+      const subjectsInput = currentTarget.subjects.map((s) => {
         const sTasks = targetTasks.filter((t) => t.subjectId === s.id);
         const completedChapIds = new Set(
           sTasks.filter((t) => t.status === 'done' && t.chapterId).map((t) => t.chapterId),
@@ -186,8 +198,8 @@ export default function ProgressScreen() {
 
       const result = await requestAiStudyAdvice({
         request: {
-          examName: targetExam.name,
-          examDate: targetExam.examDate,
+          examName: currentTarget.name,
+          examDate: currentTarget.examDate,
           dailyAvailableMinutes: data.preferences.dailyMinutes,
           intensity: data.preferences.intensity,
           subjects: subjectsInput,
@@ -207,22 +219,31 @@ export default function ProgressScreen() {
         recordAiUsage();
       }
 
-      setAiAdviceResult(result);
+      // 檢查非同步回應競態：避免使用者切換考試時舊回應覆蓋畫面
+      if (activeRequestIdRef.current === requestId && currentExamIdRef.current === requestedExamId) {
+        setAiAdviceResult(result);
+      }
     } catch (err: any) {
       logDiagnostic('AI_REQUEST_FAILED', {
         screen: 'progress',
         error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
       });
-      setAiAdviceResult({
-        success: false,
-        status: 'network_error',
-        source: 'fallback_rule_engine',
-        disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
-        error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
-      });
+      if (activeRequestIdRef.current === requestId && currentExamIdRef.current === requestedExamId) {
+        setAiAdviceResult({
+          success: false,
+          status: 'network_error',
+          source: 'fallback_rule_engine',
+          disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
+          error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
+        });
+      }
     } finally {
-      setIsLoadingAi(false);
-      logDiagnostic('AI_LOADING_FINISHED', { screen: 'progress' });
+      // 確保在成功、失敗、逾時所有情況下均同步釋放鎖；舊請求完成不得錯誤解除新請求之鎖
+      if (activeRequestIdRef.current === requestId) {
+        isRequestingAiRef.current = false;
+        setIsLoadingAi(false);
+        logDiagnostic('AI_LOADING_FINISHED', { screen: 'progress' });
+      }
     }
   };
 
@@ -259,7 +280,11 @@ export default function ProgressScreen() {
           contentContainerStyle={styles.examTabs}
         >
           <Pressable
-            onPress={() => setSelectedFilter('all')}
+            onPress={() => {
+              setSelectedFilter('all');
+              setAiAdviceResult(null);
+              setShowAiCard(false);
+            }}
             style={[styles.examChip, selectedFilter === 'all' && styles.examChipSelected]}
             accessibilityRole="button"
             accessibilityState={{ selected: selectedFilter === 'all' }}
@@ -284,6 +309,8 @@ export default function ProgressScreen() {
                 onPress={() => {
                   setSelectedFilter(exam.id);
                   setSelectedExamId(exam.id);
+                  setAiAdviceResult(null);
+                  setShowAiCard(false);
                 }}
                 style={[styles.examChip, isSelected && styles.examChipSelected]}
                 accessibilityRole="button"
@@ -761,6 +788,8 @@ export default function ProgressScreen() {
               onPress={() => {
                 setSelectedFilter(examItem.id);
                 setSelectedExamId(examItem.id);
+                setAiAdviceResult(null);
+                setShowAiCard(false);
               }}
               style={({ pressed }) => [
                 styles.examItemRow,

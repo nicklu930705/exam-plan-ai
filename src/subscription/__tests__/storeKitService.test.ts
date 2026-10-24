@@ -1,3 +1,4 @@
+import { Platform } from 'react-native';
 import {
   ALL_STOREKIT_PRODUCT_IDS,
   APPLE_MANAGE_SUBSCRIPTIONS_URL,
@@ -23,6 +24,7 @@ jest.mock('@react-native-async-storage/async-storage', () =>
 export const mockGetAvailablePurchases = jest.fn();
 export const mockRestorePurchases = jest.fn();
 export const mockFinishTransaction = jest.fn().mockResolvedValue(true);
+export const mockShowManageSubscriptionsIOS = jest.fn();
 
 jest.mock('expo-iap', () => ({
   initConnection: jest.fn().mockResolvedValue(true),
@@ -33,7 +35,7 @@ jest.mock('expo-iap', () => ({
   purchaseUpdatedListener: jest.fn(() => ({ remove: jest.fn() })),
   purchaseErrorListener: jest.fn(() => ({ remove: jest.fn() })),
   fetchProducts: jest.fn().mockResolvedValue([]),
-  deepLinkToSubscriptions: jest.fn(),
+  showManageSubscriptionsIOS: (...args: any[]) => mockShowManageSubscriptionsIOS(...args),
   isUserCancelledError: (err: any) =>
     err?.code === 'user-cancelled' ||
     err?.code === 'E_USER_CANCELLED' ||
@@ -733,6 +735,88 @@ describe('StoreKit 2 與 Apple 內購系統核心邏輯', () => {
       expect(result.subscription?.productId).toBe('exampro_yearly');
       // 確保 proofToken 絕對是勝出年繳方案的 proofToken，絕不被月繳覆蓋
       expect(result.subscription?.proofToken).toBe('proof-token-YEARLY-CORRECT');
+    });
+  });
+
+  describe('11. Apple 官方訂閱管理 (manageSubscriptions) 原生工作表與安全防護', () => {
+    let originalPlatform: string;
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      originalPlatform = Platform.OS;
+    });
+
+    afterEach(() => {
+      Platform.OS = originalPlatform as any;
+    });
+
+    test('1. 在 iOS 原生環境成功開啟 StoreKit 2 工作表，回傳 sheet_presented', async () => {
+      Platform.OS = 'ios';
+      mockShowManageSubscriptionsIOS.mockResolvedValueOnce([]);
+
+      const prod = new ProductionStoreKitService();
+      prod.setNativeModeForTesting(true);
+      prod.setDevPreviewMode(false);
+
+      const result = await prod.manageSubscriptions();
+
+      expect(mockShowManageSubscriptionsIOS).toHaveBeenCalledTimes(1);
+      expect(result.success).toBe(true);
+      expect(result.status).toBe('sheet_presented');
+    });
+
+    test('2. 當 showManageSubscriptionsIOS 拋出錯誤時，安全回傳 failed，不無提示跳轉外部網址', async () => {
+      Platform.OS = 'ios';
+      mockShowManageSubscriptionsIOS.mockRejectedValueOnce(
+        new Error('StoreKit sheet presentation failed'),
+      );
+
+      const prod = new ProductionStoreKitService();
+      prod.setNativeModeForTesting(true);
+      prod.setDevPreviewMode(false);
+
+      const result = await prod.manageSubscriptions();
+
+      expect(mockShowManageSubscriptionsIOS).toHaveBeenCalledTimes(1);
+      expect(result.success).toBe(false);
+      expect(result.status).toBe('failed');
+      expect(result.error).toContain('StoreKit sheet presentation failed');
+    });
+
+    test('3. 在非 iOS 平台 (如 Android) 調用時，安全攔截並回傳 unsupported_platform', async () => {
+      Platform.OS = 'android';
+
+      const prod = new ProductionStoreKitService();
+      prod.setDevPreviewMode(false);
+
+      const result = await prod.manageSubscriptions();
+
+      expect(mockShowManageSubscriptionsIOS).not.toHaveBeenCalled();
+      expect(result.success).toBe(false);
+      expect(result.status).toBe('unsupported_platform');
+      expect(result.error).toContain('僅支援 iOS');
+    });
+
+    test('4. 當處於開發預覽模式 (isDevPreviewMode = true) 時，安全回傳 dev_preview', async () => {
+      Platform.OS = 'ios';
+
+      const prod = new ProductionStoreKitService();
+      prod.setDevPreviewMode(true);
+
+      const result = await prod.manageSubscriptions();
+
+      expect(mockShowManageSubscriptionsIOS).not.toHaveBeenCalled();
+      expect(result.success).toBe(false);
+      expect(result.status).toBe('dev_preview');
+    });
+
+    test('5. DevStoreKitService 一致回傳 dev_preview 狀態', async () => {
+      const dev = new DevStoreKitService();
+      const result = await dev.manageSubscriptions();
+
+      expect(result.success).toBe(false);
+      expect(result.status).toBe('dev_preview');
+      expect(result.error).toContain('開發測試模式下無真實 Apple 訂閱');
     });
   });
 });

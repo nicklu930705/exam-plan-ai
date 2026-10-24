@@ -3,6 +3,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import {
   Alert,
+  Linking,
   Pressable,
   StyleSheet,
   View,
@@ -16,6 +17,7 @@ import { useAppStore } from '../../store/AppStore';
 import { getEffectiveTier, getPlanEntitlements } from '../../subscription/entitlements';
 import { SUBSCRIPTION_PRODUCTS } from '../../subscription/products';
 import {
+  APPLE_MANAGE_SUBSCRIPTIONS_URL,
   isIapSandboxConfigured,
   isSandboxIapAllowed,
   STOREKIT_PRODUCT_IDS,
@@ -237,7 +239,28 @@ export default function SubscriptionScreen() {
 
   // 開啟 Apple 官方訂閱管理頁面
   const handleManageSubscriptions = async () => {
-    await storeKitService.manageSubscriptions();
+    const res = await storeKitService.manageSubscriptions();
+    if (!res.success) {
+      if (res.status === 'dev_preview') {
+        Alert.alert('開發預覽模式', res.error || '開發測試模式下無真實 Apple 訂閱。');
+      } else if (res.status === 'unsupported_platform') {
+        Alert.alert('不支援的平台', res.error || '目前僅支援 iOS 裝置管理 Apple 訂閱。');
+      } else {
+        Alert.alert(
+          '無法直接開啟訂閱管理',
+          '未能直接開啟 Apple 原生訂閱管理視窗。\n\n【TestFlight 沙盒測試者】\n請前往 iPhone「設定 → App Store → 沙盒帳號」檢視或取消測試訂閱。\n\n【正式帳號用戶】\n若為正式 App Store 購買，可開啟系統訂閱頁。（注意：該頁僅顯示正式 Apple ID 訂閱，不包含沙盒測試項目）',
+          [
+            { text: '知道了', style: 'cancel' },
+            {
+              text: '開啟正式訂閱頁',
+              onPress: () => {
+                Linking.openURL(APPLE_MANAGE_SUBSCRIPTIONS_URL).catch(() => {});
+              },
+            },
+          ],
+        );
+      }
+    }
   };
 
   // 開發者測試用：一鍵切換方案狀態（僅在開發環境有效）
