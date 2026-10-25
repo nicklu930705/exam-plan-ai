@@ -78,6 +78,7 @@ export default function HomeScreen() {
   const isRequestingAiRef = useRef<boolean>(false);
   const activeRequestIdRef = useRef<number>(0);
   const currentExamIdRef = useRef<string | undefined>(undefined);
+  const lastValidAdviceRef = useRef<AiAdviceServiceResult | null>(null);
 
   const effectiveTier = useMemo(() => getEffectiveTier(data.subscription), [data.subscription]);
 
@@ -186,6 +187,7 @@ export default function HomeScreen() {
         setSavedTaskSnapshot(null);
         setAiAdviceCreatedAt(null);
         setIsHistoricalAdvice(false);
+        lastValidAdviceRef.current = null;
         return;
       }
 
@@ -200,6 +202,8 @@ export default function HomeScreen() {
         setShowAiCard(true);
         setIsQuotaStale(true); // 從本機快取恢復，後端尚未回應前標記為上次同步
 
+        const isHistoricalProToFree = effectiveTier === 'free' && cachedAdvice.tier !== 'free';
+
         const restoredResult: AiAdviceServiceResult = {
           success: true,
           status: 'success',
@@ -207,8 +211,10 @@ export default function HomeScreen() {
           advice: cachedAdvice.advice,
           disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
           cached: true,
-          quota: cachedAdvice.quotaSnapshot,
-          quotaStatus: cachedAdvice.quotaSnapshot
+          quota: isHistoricalProToFree ? undefined : cachedAdvice.quotaSnapshot,
+          quotaStatus: isHistoricalProToFree
+            ? undefined
+            : cachedAdvice.quotaSnapshot
             ? {
                 used: cachedAdvice.quotaSnapshot.usedToday,
                 limit: cachedAdvice.quotaSnapshot.dailyLimit,
@@ -219,12 +225,14 @@ export default function HomeScreen() {
             : undefined,
         };
         setAiAdviceResult(restoredResult);
+        lastValidAdviceRef.current = restoredResult;
       } else {
         setShowAiCard(false);
         setAiAdviceResult(null);
         setSavedTaskSnapshot(null);
         setAiAdviceCreatedAt(null);
         setIsHistoricalAdvice(false);
+        lastValidAdviceRef.current = null;
       }
 
       // 2. 背景唯讀查詢最新真實額度（不發起 AI 推論，不消耗額度）
@@ -352,6 +360,7 @@ export default function HomeScreen() {
           setSavedTaskSnapshot(snapshot);
           setAiAdviceCreatedAt(nowIso);
           setAiAdviceResult(result);
+          lastValidAdviceRef.current = result;
         }
       } else if (isCurrentExam) {
         setAiAdviceResult(result);
@@ -386,7 +395,19 @@ export default function HomeScreen() {
       setShowAiCard(true);
       return;
     }
+    if (lastValidAdviceRef.current?.advice) {
+      setAiAdviceResult(lastValidAdviceRef.current);
+      setShowAiCard(true);
+      return;
+    }
     handleRequestAiAdvice();
+  };
+
+  const handleDismissAiCard = () => {
+    setShowAiCard(false);
+    if (!aiAdviceResult?.advice && lastValidAdviceRef.current) {
+      setAiAdviceResult(lastValidAdviceRef.current);
+    }
   };
 
   const createButton = (
@@ -584,7 +605,7 @@ export default function HomeScreen() {
             isLoading={isLoadingAi}
             onRefresh={handleRequestAiAdvice}
             onRetry={handleRequestAiAdvice}
-            onDismiss={() => setShowAiCard(false)}
+            onDismiss={handleDismissAiCard}
           />
         </View>
       ) : activeRecommendations.length > 0 ? (

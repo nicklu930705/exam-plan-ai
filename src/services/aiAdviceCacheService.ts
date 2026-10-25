@@ -29,6 +29,7 @@ export interface CachedAiAdviceItem {
   disclaimer: string;
   note?: string;
   createdAt: string; // ISO 日期時間字串
+  deviceId?: string; // 產權識別（本機裝置識別碼，可選）
   quota?: QuotaInfo;
   quotaSnapshot?: QuotaInfo;
   taskStats?: TaskProgressSnapshot;
@@ -128,6 +129,7 @@ export async function saveCachedAiAdvice(item: {
   disclaimer?: string;
   note?: string;
   createdAt: string;
+  deviceId?: string;
   quota?: QuotaInfo;
   quotaSnapshot?: QuotaInfo;
   taskStats?: TaskProgressSnapshot;
@@ -145,6 +147,7 @@ export async function saveCachedAiAdvice(item: {
     disclaimer: item.disclaimer || 'AI 建議僅供學習策略與心理激勵參考。',
     note: item.note,
     createdAt: item.createdAt,
+    deviceId: item.deviceId,
     quota: item.quota || item.quotaSnapshot,
     quotaSnapshot: item.quota || item.quotaSnapshot,
     taskStats: item.taskStats || item.taskSnapshot,
@@ -164,21 +167,25 @@ export interface GetCachedAiAdviceResult {
   isExpiredDay: boolean;
   isHistorical: boolean;
   isTierMismatch: boolean;
+  isHistoricalProAdvice?: boolean;
 }
 
 /**
- * 取得指定考試、今日日期與會員等級相符的有效快取建議
+ * 取得指定考試、今日日期與會員等級相符（或符合方案 A 歷史閱讀權限）的有效快取建議
  *
- * 跨日平滑策略：
- * 1. 同一考試且會員等級相符之建議，在 7 天保留期內即使跨日仍可被安全讀取 (cachedAdvice 不為 null)。
- * 2. 跨日項目明確標記 isExpiredDay = true 與 isHistorical = true，首頁據此標示「歷史建議」。
- * 3. 超過 7 天之紀錄自動被視為失效。
- * 4. 會員等級不符（如 Pro 降為 Free）依然嚴格隔離，阻斷舊等級建議倒灌 (isTierMismatch = true, cachedAdvice = null)。
+ * 權限分離與跨日平滑策略（方案 A）：
+ * 1. 讀取與生成權限分離：使用者從 Pro 到期降級為 Free 時，過去 7 天內所產生之 Pro 深度建議
+ *    仍允許免費閱讀（cachedAdvice 不為 null），但明確標記 isHistorical = true 與 isHistoricalProAdvice = true。
+ * 2. 升級隔離：若使用者由 Free 升級為 Pro，舊 Free 確定性建議不予呈現（isTierMismatch = true），引導生成 Pro 建議。
+ * 3. 同一考試且等級相符之建議，在 7 天保留期內即使跨日仍可被安全讀取，標記 isHistorical = true。
+ * 4. 超過 7 天保留期之紀錄一律視為失效（cachedAdvice = null）。
+ * 5. 跨帳號/跨身分保護：若指定 expectedDeviceId 且紀錄存有不同 deviceId，阻斷跨身分讀取。
  */
 export async function getCachedAiAdvice(
   examId: string,
   today: string,
   currentTier?: PlanTier,
+  expectedDeviceId?: string,
 ): Promise<GetCachedAiAdviceResult> {
   if (!examId || !today) {
     return {
@@ -187,6 +194,7 @@ export async function getCachedAiAdvice(
       isExpiredDay: false,
       isHistorical: false,
       isTierMismatch: false,
+      isHistoricalProAdvice: false,
     };
   }
 
@@ -200,17 +208,19 @@ export async function getCachedAiAdvice(
       isExpiredDay: false,
       isHistorical: false,
       isTierMismatch: false,
+      isHistoricalProAdvice: false,
     };
   }
 
-  // 1. 會員等級檢查（若當前方案改變，嚴格避免呈現不符合新權限之等級建議）
-  if (currentTier && item.tier !== currentTier) {
+  // 1. 跨帳號/跨身分檢查（若兩者皆有值且不相符時阻斷，相容 Build 8/9/10 無 deviceId 紀錄）
+  if (expectedDeviceId && item.deviceId && item.deviceId !== expectedDeviceId) {
     return {
       cachedAdvice: null,
       item: null,
       isExpiredDay: false,
       isHistorical: false,
-      isTierMismatch: true,
+      isTierMismatch: false,
+      isHistoricalProAdvice: false,
     };
   }
 
@@ -225,10 +235,40 @@ export async function getCachedAiAdvice(
       isExpiredDay: true,
       isHistorical: true,
       isTierMismatch: false,
+      isHistoricalProAdvice: false,
     };
   }
 
-  // 3. 跨日檢查（日曆日不符即標記為歷史過期建議，但仍回傳以利使用者免費閱讀）
+  // 3. 會員等級檢查與方案 A 閱讀/生成權限分離
+  // 方案 A：當 Pro/Lifetime 到期降為 Free 時，7 天內產生的 Pro 深度建議仍可供 Free 使用者閱讀，但標記為歷史建議
+  const isProToFreeDowngrade =
+    (item.tier === 'pro' || item.tier === 'lifetime') && currentTier === 'free';
+
+  if (isProToFreeDowngrade) {
+    const isExpiredDay = item.date !== today;
+    return {
+      cachedAdvice: item,
+      item,
+      isExpiredDay,
+      isHistorical: true, // 降級為 Free 後一律視為歷史建議，不可視為今日全新生成
+      isTierMismatch: false,
+      isHistoricalProAdvice: true,
+    };
+  }
+
+  // 若使用者升級至 Pro，或其它不相容等級變更，嚴格隔離舊等級快取
+  if (currentTier && item.tier !== currentTier) {
+    return {
+      cachedAdvice: null,
+      item: null,
+      isExpiredDay: false,
+      isHistorical: false,
+      isTierMismatch: true,
+      isHistoricalProAdvice: false,
+    };
+  }
+
+  // 4. 等級相符之一般跨日檢查（日曆日不符即標記為歷史過期建議，但仍回傳以利使用者免費閱讀）
   const isExpiredDay = item.date !== today;
 
   return {
@@ -237,6 +277,7 @@ export async function getCachedAiAdvice(
     isExpiredDay,
     isHistorical: isExpiredDay,
     isTierMismatch: false,
+    isHistoricalProAdvice: false,
   };
 }
 

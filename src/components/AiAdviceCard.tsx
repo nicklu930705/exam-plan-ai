@@ -264,7 +264,7 @@ export const AiAdviceCard: React.FC<Props> = ({
           </AppText>
           {formattedGeneratedTime ? (
             <AppText variant="caption" secondary style={styles.generatedTimeBadge}>
-              · {isHistorical ? `前次分析：${formattedGeneratedTime}` : formattedGeneratedTime}
+              · {isHistorical ? (tier === 'free' ? `前次分析（原始分析時間：${formattedGeneratedTime}）` : `前次分析：${formattedGeneratedTime}`) : formattedGeneratedTime}
             </AppText>
           ) : null}
         </View>
@@ -302,9 +302,13 @@ export const AiAdviceCard: React.FC<Props> = ({
         <View style={styles.historicalNoticeBox}>
           <Ionicons name="time-outline" size={14} color={colors.primary} />
           <AppText variant="caption" color={colors.primary} style={{ flex: 1, fontWeight: '600', lineHeight: 16 }}>
-            {isOutdatedProgress
-              ? '此為前次分析建議（已跨日且進度已有更新）· 可免費閱讀，點擊右上角可消耗 1 次本日配額重新產生今日分析'
-              : '此為前次分析建議（已跨日）· 可免費閱讀，若需今日最新分析可點擊右上角重新整理（將消耗 1 次本日配額）'}
+            {tier === 'free'
+              ? isOutdatedProgress
+                ? `此為歷史建議（進度已有更新${formattedGeneratedTime ? `，原始分析時間：${formattedGeneratedTime}` : ''}）· 目前會員為免費版，舊內容可免費閱讀，重新產生新分析遵守目前免費版會員權益`
+                : `此為歷史 AI 建議${formattedGeneratedTime ? `（原始分析時間：${formattedGeneratedTime}）` : ''} · 目前會員為免費版，舊內容可免費閱讀，重新產生新分析遵守目前免費版會員權益`
+              : isOutdatedProgress
+                ? '此為前次分析建議（已跨日且進度已有更新）· 可免費閱讀，點擊右上角可消耗 1 次本日配額重新產生今日分析'
+                : '此為前次分析建議（已跨日）· 可免費閱讀，若需今日最新分析可點擊右上角重新整理（將消耗 1 次本日配額）'}
           </AppText>
         </View>
       ) : isOutdatedProgress ? (
@@ -413,7 +417,14 @@ export const AiAdviceCard: React.FC<Props> = ({
               </AppText>
             </View>
           );
-        })() : !isAi ? (
+        })() : isHistorical && tier === 'free' ? (
+          <View style={styles.quotaRow}>
+            <Ionicons name="sparkles" size={12} color={colors.primary} />
+            <AppText variant="caption" color={colors.primary} style={styles.quotaHighlightText}>
+              免費版 · 舊內容可免費閱讀（新分析遵守目前免費版會員權益）
+            </AppText>
+          </View>
+        ) : !isAi ? (
           <AppText variant="caption" secondary style={styles.quotaText}>
             本機排程分析引擎（不消耗雲端每日 AI 額度）
           </AppText>

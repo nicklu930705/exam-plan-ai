@@ -233,7 +233,7 @@ describe('Phase 3.4c-37B 首頁 AI 歷史建議跨日顯示與隔離回歸測試
     expect(str).not.toContain('考試 B 多益聽力建議');
   });
 
-  it('5. 會員層級變更隔離：用戶由 Pro 降為 Free 時，不得呈現不符合權限之 Pro 歷史建議', async () => {
+  it('5. 方案 A 權限分離：用戶由 Pro 降為 Free 時，7 天內產生的 Pro 深度建議允許在 Free 模式免費閱讀，並清楚標記歷史與 Free 狀態', async () => {
     await saveCachedAiAdvice({
       examId: 'exam_arch_test',
       date: '2026-10-22',
@@ -265,8 +265,17 @@ describe('Phase 3.4c-37B 首頁 AI 歷史建議跨日顯示與隔離回歸測試
     });
 
     const str = JSON.stringify(tree.toJSON());
-    expect(str).not.toContain('Pro 專屬深度建議');
-    expect(str).toContain('取得 AI 讀書教練建議');
+    // 方案 A：允許閱讀 7 天內 Pro 歷史建議
+    expect(str).toContain('Pro 專屬深度建議');
+    expect(str).toContain('✦ 歷史 AI 讀書建議');
+    expect(str).toContain('目前會員為免費版');
+    expect(str).toContain('舊內容可免費閱讀');
+    expect(str).toContain('新分析遵守目前免費版會員權益');
+    expect(str).toContain('原始分析時間：');
+
+    // 驗證未觸發任何付費 AI 呼叫或額度扣除
+    expect(mockRequestAiStudyAdvice).not.toHaveBeenCalled();
+    expect(mockRecordAiUsage).not.toHaveBeenCalled();
   });
 
   it('6. 手動重新產生成功：歷史內容即時更新為最新建議，且標記轉為非歷史', async () => {

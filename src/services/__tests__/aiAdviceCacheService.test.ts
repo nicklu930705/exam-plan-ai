@@ -1,5 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
+  AI_ADVICE_CACHE_STORAGE_KEY,
   clearAllAiAdviceCache,
   createTaskProgressSnapshot,
   getCachedAiAdvice,
@@ -113,7 +114,62 @@ describe('aiAdviceCacheService', () => {
       expect(res.cachedAdvice).toBeNull();
     });
 
-    it('會員等級變更時（如 Pro 降為 Free）應標記方案不符且不倒灌舊等級建議', async () => {
+    it('方案 A：Pro 降為 Free 時，7 天內產生的 Pro 建議允許免費閱讀並標記為歷史建議', async () => {
+      const twoDaysAgoIso = new Date(Date.now() - 2 * 86400 * 1000).toISOString();
+      await saveCachedAiAdvice({
+        examId: 'exam-1',
+        date: '2026-10-22',
+        tier: 'pro',
+        advice: sampleAdvice,
+        source: 'openai_ai',
+        disclaimer: 'AI 建議僅供參考',
+        createdAt: twoDaysAgoIso,
+      });
+
+      const res = await getCachedAiAdvice('exam-1', today, 'free');
+      expect(res.item).not.toBeNull();
+      expect(res.cachedAdvice).not.toBeNull();
+      expect(res.cachedAdvice?.advice.summary).toBe(sampleAdvice.summary);
+      expect(res.isHistorical).toBe(true);
+      expect(res.isHistoricalProAdvice).toBe(true);
+      expect(res.isTierMismatch).toBe(false);
+    });
+
+    it('會員升級（Free 升為 Pro）：舊 Free 確定性建議不予呈現，引導生成 Pro 建議', async () => {
+      await saveCachedAiAdvice({
+        examId: 'exam-1',
+        date: today,
+        tier: 'free',
+        advice: sampleAdvice,
+        source: 'fallback_rule_engine',
+        disclaimer: '本機排程建議',
+        createdAt: new Date().toISOString(),
+      });
+
+      const res = await getCachedAiAdvice('exam-1', today, 'pro');
+      expect(res.item).toBeNull();
+      expect(res.cachedAdvice).toBeNull();
+      expect(res.isTierMismatch).toBe(true);
+    });
+
+    it('超過 7 天的 Pro 建議即使在 Free 模式下亦過期清理不予回傳', async () => {
+      const eightDaysAgoIso = new Date(Date.now() - 8 * 86400 * 1000).toISOString();
+      await saveCachedAiAdvice({
+        examId: 'exam-1',
+        date: '2026-10-10',
+        tier: 'pro',
+        advice: sampleAdvice,
+        source: 'openai_ai',
+        disclaimer: 'AI 建議僅供參考',
+        createdAt: eightDaysAgoIso,
+      });
+
+      const res = await getCachedAiAdvice('exam-1', today, 'free');
+      expect(res.item).toBeNull();
+      expect(res.cachedAdvice).toBeNull();
+    });
+
+    it('跨身分/裝置保護：若紀錄標註不同 deviceId，阻斷跨身分讀取', async () => {
       await saveCachedAiAdvice({
         examId: 'exam-1',
         date: today,
@@ -121,14 +177,43 @@ describe('aiAdviceCacheService', () => {
         advice: sampleAdvice,
         source: 'openai_ai',
         disclaimer: 'AI 建議僅供參考',
-        createdAt: '2026-10-22T08:30:00.000Z',
+        createdAt: new Date().toISOString(),
+        deviceId: 'device_user_A',
       });
 
-      const res = await getCachedAiAdvice('exam-1', today, 'free');
+      const res = await getCachedAiAdvice('exam-1', today, 'pro', 'device_user_B');
       expect(res.item).toBeNull();
       expect(res.cachedAdvice).toBeNull();
-      expect(res.isExpiredDay).toBe(false);
-      expect(res.isTierMismatch).toBe(true);
+
+      // 相同身分可正常讀取
+      const matchRes = await getCachedAiAdvice('exam-1', today, 'pro', 'device_user_A');
+      expect(matchRes.cachedAdvice).not.toBeNull();
+    });
+
+    it('向後相容：Build 8/9/10 無 deviceId 之歷史快取 JSON 仍可無縫相容讀取', async () => {
+      // 模擬 Build 8/9/10 的 JSON
+      const legacyJson = JSON.stringify({
+        version: 1,
+        items: {
+          'exam-legacy': {
+            examId: 'exam-legacy',
+            date: today,
+            tier: 'pro',
+            advice: sampleAdvice,
+            source: 'openai_ai',
+            disclaimer: 'AI 建議僅供參考',
+            createdAt: new Date().toISOString(),
+            // 刻意無 deviceId
+          },
+        },
+        updatedAt: new Date().toISOString(),
+      });
+      await AsyncStorage.setItem(AI_ADVICE_CACHE_STORAGE_KEY, legacyJson);
+
+      const res = await getCachedAiAdvice('exam-legacy', today, 'free', 'device_user_current');
+      expect(res.cachedAdvice).not.toBeNull();
+      expect(res.cachedAdvice?.advice.summary).toBe(sampleAdvice.summary);
+      expect(res.isHistorical).toBe(true);
     });
   });
 
