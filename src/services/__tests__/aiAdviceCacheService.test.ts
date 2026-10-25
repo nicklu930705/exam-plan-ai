@@ -357,6 +357,39 @@ describe('aiAdviceCacheService', () => {
       expect(cached?.dailyLimit).toBe(15);
       expect(cached?.remainingToday).toBe(14);
     });
+
+    it('跨日舊額度不得冒充今日額度：昨天存入的額度，今日查詢應自動失效回傳 null', async () => {
+      await saveLatestQuotaCache(sampleQuota, yesterday);
+      const cached = await getLatestQuotaCache(today);
+      expect(cached).toBeNull();
+    });
+
+    it('Pro 1/15 舊額度不得顯示成 Free 額度：當降級為 Free 時，快取中的 Pro 額度不得回傳', async () => {
+      await saveLatestQuotaCache(sampleQuota, today);
+      const freeQuota = await getLatestQuotaCache(today, 'free');
+      expect(freeQuota).toBeNull();
+
+      const proQuota = await getLatestQuotaCache(today, 'pro');
+      expect(proQuota).not.toBeNull();
+      expect(proQuota?.dailyLimit).toBe(15);
+    });
+
+    it('Free 額度在會員升級為 Pro 時不得冒用 Free 額度', async () => {
+      const freeQuotaSample: QuotaInfo = {
+        usedToday: 2,
+        dailyLimit: 3,
+        remainingToday: 1,
+        resetsAt: '2026-10-23T00:00:00+08:00',
+        tier: 'free',
+      };
+      await saveLatestQuotaCache(freeQuotaSample, today);
+      const proQueried = await getLatestQuotaCache(today, 'pro');
+      expect(proQueried).toBeNull();
+
+      const freeQueried = await getLatestQuotaCache(today, 'free');
+      expect(freeQueried).not.toBeNull();
+      expect(freeQueried?.dailyLimit).toBe(3);
+    });
   });
 
   describe('fetchAiQuotaFromBackend 唯讀額度 API 查詢', () => {

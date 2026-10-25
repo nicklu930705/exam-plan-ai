@@ -24,6 +24,8 @@ interface Props {
   isOutdatedProgress?: boolean;
   isQuotaStale?: boolean;
   isHistorical?: boolean;
+  isQuotaSyncing?: boolean;
+  isQuotaFetchFailed?: boolean;
   onRefresh?: () => void;
   onRetry?: () => void;
   onDismiss?: () => void;
@@ -46,6 +48,8 @@ export const AiAdviceCard: React.FC<Props> = ({
   isOutdatedProgress = false,
   isQuotaStale = false,
   isHistorical = false,
+  isQuotaSyncing = false,
+  isQuotaFetchFailed = false,
   onRefresh,
   onRetry,
   onDismiss,
@@ -393,7 +397,18 @@ export const AiAdviceCard: React.FC<Props> = ({
 
       {/* 配額與免責說明 */}
       <View style={styles.footer}>
-        {quota || quotaStatus ? (() => {
+        {/* 1. 歷史建議免責／免費閱讀提示（當為 Free 且為歷史建議時必定顯示） */}
+        {isHistorical && tier === 'free' ? (
+          <View style={styles.historicalNoticeBox}>
+            <Ionicons name="information-circle-outline" size={12} color={colors.primary} />
+            <AppText variant="caption" color={colors.primary} style={styles.quotaHighlightText}>
+              免費版 · 舊內容可免費閱讀（新分析遵守目前免費版會員權益）
+            </AppText>
+          </View>
+        ) : null}
+
+        {/* 2. 當前額度狀態行 */}
+        {(() => {
           const resolvedTier = tier || (quota?.tier as PlanTier | undefined);
           let tierPrefix = '今日 AI 使用額度 · ';
           if (resolvedTier === 'lifetime') {
@@ -404,31 +419,69 @@ export const AiAdviceCard: React.FC<Props> = ({
             tierPrefix = '免費版 · ';
           }
 
-          const usedCount = quota?.usedToday ?? quotaStatus?.used ?? 0;
-          const limitCount = quota?.dailyLimit ?? quotaStatus?.limit ?? 0;
-          const remainingCount = quota?.remainingToday ?? quotaStatus?.remaining ?? 0;
-          const syncSuffix = isQuotaStale ? ' · 上次同步' : ' · 每日 00:00 重設';
+          // A. 查詢中狀態
+          if (isQuotaSyncing) {
+            return (
+              <View style={styles.quotaRow}>
+                <Ionicons name="sync-outline" size={12} color={colors.textSecondary} />
+                <AppText variant="caption" color={colors.textSecondary} style={styles.quotaHighlightText}>
+                  {`${tierPrefix}額度同步中…`}
+                </AppText>
+              </View>
+            );
+          }
 
-          return (
-            <View style={styles.quotaRow}>
-              <Ionicons name="sparkles" size={12} color={colors.primary} />
-              <AppText variant="caption" color={colors.primary} style={styles.quotaHighlightText}>
-                {`${tierPrefix}今日已用 ${usedCount}/${limitCount} 次（剩餘 ${remainingCount} 次${syncSuffix}）`}
+          // B. 查詢失敗且無有效同日快取
+          if (isQuotaFetchFailed) {
+            return (
+              <View style={styles.quotaRow}>
+                <Ionicons name="alert-circle-outline" size={12} color={colors.textSecondary} />
+                <AppText variant="caption" color={colors.textSecondary} style={styles.quotaHighlightText}>
+                  {`${tierPrefix}目前無法取得額度`}
+                </AppText>
+              </View>
+            );
+          }
+
+          // C. 具有額度（查詢成功 或 離線同日快取）
+          if (quota || quotaStatus) {
+            const usedCount = quota?.usedToday ?? quotaStatus?.used ?? 0;
+            const limitCount = quota?.dailyLimit ?? quotaStatus?.limit ?? 0;
+            const remainingCount = quota?.remainingToday ?? quotaStatus?.remaining ?? 0;
+
+            if (isQuotaStale) {
+              return (
+                <View style={styles.quotaRow}>
+                  <Ionicons name="cloud-offline-outline" size={12} color={colors.textSecondary} />
+                  <AppText variant="caption" color={colors.textSecondary} style={styles.quotaHighlightText}>
+                    {`${tierPrefix}上次同步 ${usedCount}/${limitCount} 次（剩餘 ${remainingCount} 次）`}
+                  </AppText>
+                </View>
+              );
+            }
+
+            return (
+              <View style={styles.quotaRow}>
+                <Ionicons name="sparkles" size={12} color={colors.primary} />
+                <AppText variant="caption" color={colors.primary} style={styles.quotaHighlightText}>
+                  {`${tierPrefix}今日已用 ${usedCount}/${limitCount} 次（剩餘 ${remainingCount} 次 · 每日 00:00 重設）`}
+                </AppText>
+              </View>
+            );
+          }
+
+          // D. 本機排程分析引擎（無 quota 物件且非 AI）
+          if (!isAi) {
+            return (
+              <AppText variant="caption" secondary style={styles.quotaText}>
+                本機排程分析引擎（不消耗雲端每日 AI 額度）
               </AppText>
-            </View>
-          );
-        })() : isHistorical && tier === 'free' ? (
-          <View style={styles.quotaRow}>
-            <Ionicons name="sparkles" size={12} color={colors.primary} />
-            <AppText variant="caption" color={colors.primary} style={styles.quotaHighlightText}>
-              免費版 · 舊內容可免費閱讀（新分析遵守目前免費版會員權益）
-            </AppText>
-          </View>
-        ) : !isAi ? (
-          <AppText variant="caption" secondary style={styles.quotaText}>
-            本機排程分析引擎（不消耗雲端每日 AI 額度）
-          </AppText>
-        ) : null}
+            );
+          }
+
+          return null;
+        })()}
+
         {disclaimer ? (
           <AppText variant="caption" secondary style={styles.disclaimerText}>
             {disclaimer}

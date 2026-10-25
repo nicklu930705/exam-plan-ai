@@ -40,6 +40,7 @@ export interface StoredAiAdviceCache {
   version: 1;
   items: Record<string, CachedAiAdviceItem>; // 以 examId 為 key
   latestQuota?: QuotaInfo;
+  latestQuotaDate?: string; // 記錄額度寫入之日期（YYYY-MM-DD）
   updatedAt: string;
 }
 
@@ -297,20 +298,50 @@ export async function removeCachedAiAdviceForExam(examId: string): Promise<boole
 /**
  * 儲存最新的每日配額快照
  */
-export async function saveLatestQuotaCache(quota: QuotaInfo): Promise<boolean> {
+export async function saveLatestQuotaCache(quota: QuotaInfo, date?: string): Promise<boolean> {
   if (!quota) return false;
   const cache = await loadFullCache();
   cache.latestQuota = quota;
+  if (date) {
+    cache.latestQuotaDate = date;
+  }
   return await saveFullCache(cache);
 }
 
 /**
- * 取得最新的每日配額快照（若為今日則回傳，隔日自動失效）
+ * 取得最新的每日配額快照（若為今日且會員方案相符則回傳，跨日或方案不符自動失效）
  */
-export async function getLatestQuotaCache(today: string): Promise<QuotaInfo | null> {
+export async function getLatestQuotaCache(
+  today: string,
+  expectedTier?: 'free' | 'pro' | 'lifetime',
+): Promise<QuotaInfo | null> {
   const cache = await loadFullCache();
   if (!cache.latestQuota) return null;
-  // 若配額快照中附有重置時間或日期檢查
+
+  // 1. 會員方案嚴格隔離：舊 Pro 額度（例如每日 15 次）絕不得冒充 Free 額度
+  if (expectedTier) {
+    const quotaTier = cache.latestQuota.tier;
+    if (expectedTier === 'free' && quotaTier !== 'free') {
+      return null;
+    }
+    if ((expectedTier === 'pro' || expectedTier === 'lifetime') && quotaTier === 'free') {
+      return null;
+    }
+  }
+
+  // 2. 日期檢查：若有記錄儲存日期且與今日不同，則為跨日舊額度，自動失效
+  if (cache.latestQuotaDate) {
+    if (cache.latestQuotaDate !== today) {
+      return null;
+    }
+  } else if (cache.latestQuota.resetsAt) {
+    // 若無記錄日期但有重設時間戳記，若重設日期已在今日或過去，代表跨日失效
+    const resetDate = cache.latestQuota.resetsAt.slice(0, 10);
+    if (resetDate <= today) {
+      return null;
+    }
+  }
+
   return cache.latestQuota;
 }
 

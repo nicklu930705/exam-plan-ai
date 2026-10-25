@@ -103,7 +103,7 @@ describe('AiAdviceCard 會員標籤與額度顯示測試', () => {
       isQuotaStale: true,
     });
     expect(json).toContain('✦ Pro 會員 · ');
-    expect(json).toContain('今日已用 1/15 次（剩餘 14 次 · 上次同步）');
+    expect(json).toContain('上次同步 1/15 次（剩餘 14 次）');
     expect(json).not.toContain('每日 00:00 重設');
   });
 
@@ -159,5 +159,67 @@ describe('AiAdviceCard 會員標籤與額度顯示測試', () => {
     });
     expect(json).toContain('✦ 歷史 AI 讀書建議');
     expect(json).toContain('此為前次分析建議（已跨日且進度已有更新）· 可免費閱讀');
+  });
+
+  it('10. Free 會員閱讀歷史建議 + 成功取得額度：應同時顯示免費閱讀提示與今日即時額度', () => {
+    const json = renderCard({
+      advice: sampleAdvice,
+      tier: 'free',
+      quota: sampleFreeQuota,
+      isHistorical: true,
+      isQuotaSyncing: false,
+      isQuotaStale: false,
+      isQuotaFetchFailed: false,
+    });
+    // 同時具備兩種資訊
+    expect(json).toContain('免費版 · 舊內容可免費閱讀（新分析遵守目前免費版會員權益）');
+    expect(json).toContain('免費版 · 今日已用 0/3 次（剩餘 3 次 · 每日 00:00 重設）');
+  });
+
+  it('11. Free 會員額度查詢中：應顯示「額度同步中…」且保留歷史免費閱讀提示', () => {
+    const json = renderCard({
+      advice: sampleAdvice,
+      tier: 'free',
+      quota: undefined,
+      isHistorical: true,
+      isQuotaSyncing: true,
+      isQuotaFetchFailed: false,
+    });
+    expect(json).toContain('免費版 · 舊內容可免費閱讀（新分析遵守目前免費版會員權益）');
+    expect(json).toContain('免費版 · 額度同步中…');
+  });
+
+  it('12. Free 會員額度查詢失敗且無快取：應顯示「目前無法取得額度」且保留歷史免費閱讀提示與內容', () => {
+    const json = renderCard({
+      advice: sampleAdvice,
+      tier: 'free',
+      quota: undefined,
+      isHistorical: true,
+      isQuotaSyncing: false,
+      isQuotaFetchFailed: true,
+    });
+    expect(json).toContain('免費版 · 舊內容可免費閱讀（新分析遵守目前免費版會員權益）');
+    expect(json).toContain('免費版 · 目前無法取得額度');
+    expect(json).toContain('備考策略重點'); // 核心建議內容依然存在
+  });
+
+  it('13. Free 會員離線且有同日快取：應顯示「上次同步 X/3 次」且保留歷史免費閱讀提示', () => {
+    const json = renderCard({
+      advice: sampleAdvice,
+      tier: 'free',
+      quota: {
+        usedToday: 1,
+        dailyLimit: 3,
+        remainingToday: 2,
+        resetsAt: '2026-10-23T00:00:00+08:00',
+        tier: 'free',
+      },
+      isHistorical: true,
+      isQuotaSyncing: false,
+      isQuotaStale: true,
+      isQuotaFetchFailed: false,
+    });
+    expect(json).toContain('免費版 · 舊內容可免費閱讀（新分析遵守目前免費版會員權益）');
+    expect(json).toContain('免費版 · 上次同步 1/3 次（剩餘 2 次）');
   });
 });

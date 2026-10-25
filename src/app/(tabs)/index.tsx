@@ -21,6 +21,7 @@ import { generateStudyRecommendations } from '../../scheduler/recommendations';
 import {
   createTaskProgressSnapshot,
   getCachedAiAdvice,
+  getLatestQuotaCache,
   isProgressChanged,
   saveCachedAiAdvice,
   saveLatestQuotaCache,
@@ -72,6 +73,8 @@ export default function HomeScreen() {
   const [aiAdviceCreatedAt, setAiAdviceCreatedAt] = useState<string | null>(null);
   const [savedTaskSnapshot, setSavedTaskSnapshot] = useState<TaskProgressSnapshot | null>(null);
   const [isQuotaStale, setIsQuotaStale] = useState<boolean>(false);
+  const [isQuotaSyncing, setIsQuotaSyncing] = useState<boolean>(false);
+  const [isQuotaFetchFailed, setIsQuotaFetchFailed] = useState<boolean>(false);
   const [isHistoricalAdvice, setIsHistoricalAdvice] = useState<boolean>(false);
 
   // 同步防重入鎖與當前考試識別，避免連擊穿透與非同步切換競態
@@ -188,6 +191,9 @@ export default function HomeScreen() {
         setAiAdviceCreatedAt(null);
         setIsHistoricalAdvice(false);
         lastValidAdviceRef.current = null;
+        setIsQuotaSyncing(false);
+        setIsQuotaFetchFailed(false);
+        setIsQuotaStale(false);
         return;
       }
 
@@ -195,14 +201,23 @@ export default function HomeScreen() {
       const { cachedAdvice, isHistorical } = await getCachedAiAdvice(exam.id, today, effectiveTier);
       if (isCancelled) return;
 
+      const isHistoricalProToFree = effectiveTier === 'free' && cachedAdvice?.tier !== 'free';
+
+      // 檢查本機是否有同日、同方案之有效額度快取
+      const sameDayQuota = await getLatestQuotaCache(today, effectiveTier);
+      if (isCancelled) return;
+
+      const validLocalQuota = isHistoricalProToFree
+        ? sameDayQuota
+        : (sameDayQuota ?? cachedAdvice?.quotaSnapshot);
+
       if (cachedAdvice) {
         setSavedTaskSnapshot(cachedAdvice.taskSnapshot ?? null);
         setAiAdviceCreatedAt(cachedAdvice.createdAt);
         setIsHistoricalAdvice(Boolean(isHistorical));
         setShowAiCard(true);
-        setIsQuotaStale(true); // 從本機快取恢復，後端尚未回應前標記為上次同步
-
-        const isHistoricalProToFree = effectiveTier === 'free' && cachedAdvice.tier !== 'free';
+        setIsQuotaStale(Boolean(validLocalQuota)); // 若有同日有效快取，標記為 stale 直到後端即時更新
+        setIsQuotaFetchFailed(false);
 
         const restoredResult: AiAdviceServiceResult = {
           success: true,
@@ -211,16 +226,14 @@ export default function HomeScreen() {
           advice: cachedAdvice.advice,
           disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
           cached: true,
-          quota: isHistoricalProToFree ? undefined : cachedAdvice.quotaSnapshot,
-          quotaStatus: isHistoricalProToFree
-            ? undefined
-            : cachedAdvice.quotaSnapshot
+          quota: validLocalQuota ?? undefined,
+          quotaStatus: validLocalQuota
             ? {
-                used: cachedAdvice.quotaSnapshot.usedToday,
-                limit: cachedAdvice.quotaSnapshot.dailyLimit,
-                remaining: cachedAdvice.quotaSnapshot.remainingToday,
-                isExceeded: cachedAdvice.quotaSnapshot.remainingToday <= 0,
-                resetsAt: cachedAdvice.quotaSnapshot.resetsAt,
+                used: validLocalQuota.usedToday,
+                limit: validLocalQuota.dailyLimit,
+                remaining: validLocalQuota.remainingToday,
+                isExceeded: validLocalQuota.remainingToday <= 0,
+                resetsAt: validLocalQuota.resetsAt,
               }
             : undefined,
         };
@@ -236,32 +249,65 @@ export default function HomeScreen() {
       }
 
       // 2. 背景唯讀查詢最新真實額度（不發起 AI 推論，不消耗額度）
+      setIsQuotaSyncing(true);
       try {
         const freshQuota = await fetchAiQuotaFromBackend();
-        if (!isCancelled && freshQuota) {
-          await saveLatestQuotaCache(freshQuota);
-          setIsQuotaStale(false); // 成功取得後端即時額度，更新為即時狀態
+        if (isCancelled) return;
 
-          setAiAdviceResult((prev) => {
-            if (!prev) return prev;
-            return {
-              ...prev,
-              quota: freshQuota,
-              quotaStatus: {
-                used: freshQuota.usedToday,
-                limit: freshQuota.dailyLimit,
-                remaining: freshQuota.remainingToday,
-                isExceeded: freshQuota.remainingToday <= 0,
-                resetsAt: freshQuota.resetsAt,
-              },
-            };
-          });
-        } else if (!isCancelled && !freshQuota) {
-          setIsQuotaStale(true);
+        if (freshQuota) {
+          const isTierMatched =
+            effectiveTier === 'free'
+              ? freshQuota.tier === 'free'
+              : freshQuota.tier === 'pro';
+
+          if (isTierMatched || !freshQuota.tier) {
+            await saveLatestQuotaCache(freshQuota, today);
+            setIsQuotaSyncing(false);
+            setIsQuotaStale(false);
+            setIsQuotaFetchFailed(false);
+
+            setAiAdviceResult((prev) => {
+              if (!prev) return prev;
+              const updated = {
+                ...prev,
+                quota: freshQuota,
+                quotaStatus: {
+                  used: freshQuota.usedToday,
+                  limit: freshQuota.dailyLimit,
+                  remaining: freshQuota.remainingToday,
+                  isExceeded: freshQuota.remainingToday <= 0,
+                  resetsAt: freshQuota.resetsAt,
+                },
+              };
+              lastValidAdviceRef.current = updated;
+              return updated;
+            });
+          } else {
+            setIsQuotaSyncing(false);
+            if (!validLocalQuota) {
+              setIsQuotaFetchFailed(true);
+            } else {
+              setIsQuotaStale(true);
+            }
+          }
+        } else {
+          // freshQuota 為 null（離線或伺服器未回應）
+          setIsQuotaSyncing(false);
+          if (!validLocalQuota) {
+            setIsQuotaFetchFailed(true);
+          } else {
+            setIsQuotaStale(true);
+          }
         }
       } catch {
-        // 唯讀查詢離線時安全略過，維持上次同步標記
-        setIsQuotaStale(true);
+        if (!isCancelled) {
+          setIsQuotaSyncing(false);
+          if (!validLocalQuota) {
+            setIsQuotaFetchFailed(true);
+          } else {
+            setIsQuotaStale(true);
+          }
+        }
       }
     }
 
@@ -351,10 +397,12 @@ export default function HomeScreen() {
         });
 
         if (result.quota) {
-          await saveLatestQuotaCache(result.quota);
+          await saveLatestQuotaCache(result.quota, today);
         }
 
         if (isCurrentExam) {
+          setIsQuotaSyncing(false);
+          setIsQuotaFetchFailed(false);
           setIsQuotaStale(false);
           setIsHistoricalAdvice(false);
           setSavedTaskSnapshot(snapshot);
@@ -602,6 +650,8 @@ export default function HomeScreen() {
             isOutdatedProgress={isOutdatedProgress}
             isQuotaStale={isQuotaStale}
             isHistorical={isHistoricalAdvice}
+            isQuotaSyncing={isQuotaSyncing}
+            isQuotaFetchFailed={isQuotaFetchFailed}
             isLoading={isLoadingAi}
             onRefresh={handleRequestAiAdvice}
             onRetry={handleRequestAiAdvice}
