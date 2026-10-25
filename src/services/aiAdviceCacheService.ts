@@ -162,11 +162,18 @@ export interface GetCachedAiAdviceResult {
   cachedAdvice: CachedAiAdviceItem | null;
   item: CachedAiAdviceItem | null;
   isExpiredDay: boolean;
+  isHistorical: boolean;
   isTierMismatch: boolean;
 }
 
 /**
  * 取得指定考試、今日日期與會員等級相符的有效快取建議
+ *
+ * 跨日平滑策略：
+ * 1. 同一考試且會員等級相符之建議，在 7 天保留期內即使跨日仍可被安全讀取 (cachedAdvice 不為 null)。
+ * 2. 跨日項目明確標記 isExpiredDay = true 與 isHistorical = true，首頁據此標示「歷史建議」。
+ * 3. 超過 7 天之紀錄自動被視為失效。
+ * 4. 會員等級不符（如 Pro 降為 Free）依然嚴格隔離，阻斷舊等級建議倒灌 (isTierMismatch = true, cachedAdvice = null)。
  */
 export async function getCachedAiAdvice(
   examId: string,
@@ -174,27 +181,63 @@ export async function getCachedAiAdvice(
   currentTier?: PlanTier,
 ): Promise<GetCachedAiAdviceResult> {
   if (!examId || !today) {
-    return { cachedAdvice: null, item: null, isExpiredDay: false, isTierMismatch: false };
+    return {
+      cachedAdvice: null,
+      item: null,
+      isExpiredDay: false,
+      isHistorical: false,
+      isTierMismatch: false,
+    };
   }
 
   const cache = await loadFullCache();
   const item = cache.items[examId];
 
   if (!item) {
-    return { cachedAdvice: null, item: null, isExpiredDay: false, isTierMismatch: false };
+    return {
+      cachedAdvice: null,
+      item: null,
+      isExpiredDay: false,
+      isHistorical: false,
+      isTierMismatch: false,
+    };
   }
 
-  // 1. 跨日檢查（日曆日不符即視為過期）
-  if (item.date !== today) {
-    return { cachedAdvice: null, item: null, isExpiredDay: true, isTierMismatch: false };
-  }
-
-  // 2. 會員等級檢查（若當前方案改變，避免呈現不對稱的舊等級建議）
+  // 1. 會員等級檢查（若當前方案改變，嚴格避免呈現不符合新權限之等級建議）
   if (currentTier && item.tier !== currentTier) {
-    return { cachedAdvice: null, item: null, isExpiredDay: false, isTierMismatch: true };
+    return {
+      cachedAdvice: null,
+      item: null,
+      isExpiredDay: false,
+      isHistorical: false,
+      isTierMismatch: true,
+    };
   }
 
-  return { cachedAdvice: item, item, isExpiredDay: false, isTierMismatch: false };
+  // 2. 超過 7 天保留期的紀錄視為過期清理，不予回傳
+  const now = Date.now();
+  const maxAgeMs = 7 * 86400 * 1000;
+  const itemTime = Date.parse(item.createdAt);
+  if (!isNaN(itemTime) && now - itemTime > maxAgeMs) {
+    return {
+      cachedAdvice: null,
+      item: null,
+      isExpiredDay: true,
+      isHistorical: true,
+      isTierMismatch: false,
+    };
+  }
+
+  // 3. 跨日檢查（日曆日不符即標記為歷史過期建議，但仍回傳以利使用者免費閱讀）
+  const isExpiredDay = item.date !== today;
+
+  return {
+    cachedAdvice: item,
+    item,
+    isExpiredDay,
+    isHistorical: isExpiredDay,
+    isTierMismatch: false,
+  };
 }
 
 /**

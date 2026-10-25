@@ -72,6 +72,7 @@ export default function HomeScreen() {
   const [aiAdviceCreatedAt, setAiAdviceCreatedAt] = useState<string | null>(null);
   const [savedTaskSnapshot, setSavedTaskSnapshot] = useState<TaskProgressSnapshot | null>(null);
   const [isQuotaStale, setIsQuotaStale] = useState<boolean>(false);
+  const [isHistoricalAdvice, setIsHistoricalAdvice] = useState<boolean>(false);
 
   // 同步防重入鎖與當前考試識別，避免連擊穿透與非同步切換競態
   const isRequestingAiRef = useRef<boolean>(false);
@@ -184,16 +185,18 @@ export default function HomeScreen() {
         setAiAdviceResult(null);
         setSavedTaskSnapshot(null);
         setAiAdviceCreatedAt(null);
+        setIsHistoricalAdvice(false);
         return;
       }
 
-      // 1. 查詢該考試、今日與該會員等級的本機快取
-      const { cachedAdvice } = await getCachedAiAdvice(exam.id, today, effectiveTier);
+      // 1. 查詢該考試、今日與該會員等級的本機快取（支援保留期內之跨日歷史建議平滑查閱）
+      const { cachedAdvice, isHistorical } = await getCachedAiAdvice(exam.id, today, effectiveTier);
       if (isCancelled) return;
 
       if (cachedAdvice) {
         setSavedTaskSnapshot(cachedAdvice.taskSnapshot ?? null);
         setAiAdviceCreatedAt(cachedAdvice.createdAt);
+        setIsHistoricalAdvice(Boolean(isHistorical));
         setShowAiCard(true);
         setIsQuotaStale(true); // 從本機快取恢復，後端尚未回應前標記為上次同步
 
@@ -221,6 +224,7 @@ export default function HomeScreen() {
         setAiAdviceResult(null);
         setSavedTaskSnapshot(null);
         setAiAdviceCreatedAt(null);
+        setIsHistoricalAdvice(false);
       }
 
       // 2. 背景唯讀查詢最新真實額度（不發起 AI 推論，不消耗額度）
@@ -344,6 +348,7 @@ export default function HomeScreen() {
 
         if (isCurrentExam) {
           setIsQuotaStale(false);
+          setIsHistoricalAdvice(false);
           setSavedTaskSnapshot(snapshot);
           setAiAdviceCreatedAt(nowIso);
           setAiAdviceResult(result);
@@ -575,6 +580,7 @@ export default function HomeScreen() {
             generatedAt={aiAdviceCreatedAt}
             isOutdatedProgress={isOutdatedProgress}
             isQuotaStale={isQuotaStale}
+            isHistorical={isHistoricalAdvice}
             isLoading={isLoadingAi}
             onRefresh={handleRequestAiAdvice}
             onRetry={handleRequestAiAdvice}

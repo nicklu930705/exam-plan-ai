@@ -23,6 +23,7 @@ interface Props {
   generatedAt?: string | null;
   isOutdatedProgress?: boolean;
   isQuotaStale?: boolean;
+  isHistorical?: boolean;
   onRefresh?: () => void;
   onRetry?: () => void;
   onDismiss?: () => void;
@@ -44,6 +45,7 @@ export const AiAdviceCard: React.FC<Props> = ({
   generatedAt,
   isOutdatedProgress = false,
   isQuotaStale = false,
+  isHistorical = false,
   onRefresh,
   onRetry,
   onDismiss,
@@ -65,7 +67,17 @@ export const AiAdviceCard: React.FC<Props> = ({
       if (isNaN(d.getTime())) return null;
       const hours = String(d.getHours()).padStart(2, '0');
       const mins = String(d.getMinutes()).padStart(2, '0');
-      return `今日 ${hours}:${mins}`;
+      const now = new Date();
+      const isToday =
+        d.getFullYear() === now.getFullYear() &&
+        d.getMonth() === now.getMonth() &&
+        d.getDate() === now.getDate();
+      if (isToday) {
+        return `今日 ${hours}:${mins}`;
+      }
+      const month = d.getMonth() + 1;
+      const date = d.getDate();
+      return `${month}月${date}日 ${hours}:${mins}`;
     } catch {
       return null;
     }
@@ -245,12 +257,14 @@ export const AiAdviceCard: React.FC<Props> = ({
             style={{ fontWeight: '700' }}
           >
             {isAi
-              ? '✦ AI 讀書教練深度建議'
+              ? isHistorical
+                ? '✦ 歷史 AI 讀書建議'
+                : '✦ AI 讀書教練深度建議'
               : '智慧讀書教練 (本機引擎)'}
           </AppText>
           {formattedGeneratedTime ? (
             <AppText variant="caption" secondary style={styles.generatedTimeBadge}>
-              · {formattedGeneratedTime}
+              · {isHistorical ? `前次分析：${formattedGeneratedTime}` : formattedGeneratedTime}
             </AppText>
           ) : null}
         </View>
@@ -283,8 +297,17 @@ export const AiAdviceCard: React.FC<Props> = ({
         </View>
       </View>
 
-      {/* 進度已變更提示 */}
-      {isOutdatedProgress ? (
+      {/* 歷史建議或進度已變更提示 */}
+      {isHistorical ? (
+        <View style={styles.historicalNoticeBox}>
+          <Ionicons name="time-outline" size={14} color={colors.primary} />
+          <AppText variant="caption" color={colors.primary} style={{ flex: 1, fontWeight: '600', lineHeight: 16 }}>
+            {isOutdatedProgress
+              ? '此為前次分析建議（已跨日且進度已有更新）· 可免費閱讀，點擊右上角可消耗 1 次本日配額重新產生今日分析'
+              : '此為前次分析建議（已跨日）· 可免費閱讀，若需今日最新分析可點擊右上角重新整理（將消耗 1 次本日配額）'}
+          </AppText>
+        </View>
+      ) : isOutdatedProgress ? (
         <View style={styles.outdatedNoticeBox}>
           <Ionicons name="information-circle-outline" size={14} color={colors.warning} />
           <AppText variant="caption" color={colors.warning} style={{ flex: 1, fontWeight: '600', lineHeight: 16 }}>
@@ -507,6 +530,17 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.xs,
     borderRadius: radius.sm,
     backgroundColor: colors.warningSoft,
+  },
+  historicalNoticeBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 2,
+    marginBottom: spacing.xs,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: spacing.xs,
+    borderRadius: radius.sm,
+    backgroundColor: colors.primarySoft,
   },
   headerActions: {
     flexDirection: 'row',

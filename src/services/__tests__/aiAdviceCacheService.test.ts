@@ -76,7 +76,7 @@ describe('aiAdviceCacheService', () => {
       expect(res.isTierMismatch).toBe(false);
     });
 
-    it('跨日（非當日日曆日）應標記為過期且不回傳快取建議', async () => {
+    it('跨日（如前一天、前兩天）在 7 天保留期內應標記為歷史過期建議，但仍回傳供使用者免費閱讀', async () => {
       await saveCachedAiAdvice({
         examId: 'exam-1',
         date: yesterday,
@@ -88,10 +88,29 @@ describe('aiAdviceCacheService', () => {
       });
 
       const res = await getCachedAiAdvice('exam-1', today, 'pro');
+      expect(res.item).not.toBeNull();
+      expect(res.cachedAdvice).not.toBeNull();
+      expect(res.cachedAdvice?.advice.summary).toBe(sampleAdvice.summary);
+      expect(res.isExpiredDay).toBe(true);
+      expect(res.isHistorical).toBe(true);
+      expect(res.isTierMismatch).toBe(false);
+    });
+
+    it('跨日超過 7 天保留期之歷史紀錄應視為失效不予回傳', async () => {
+      const eightDaysAgoIso = new Date(Date.now() - 8 * 86400 * 1000).toISOString();
+      await saveCachedAiAdvice({
+        examId: 'exam-1',
+        date: '2026-10-10',
+        tier: 'pro',
+        advice: sampleAdvice,
+        source: 'openai_ai',
+        disclaimer: 'AI 建議僅供參考',
+        createdAt: eightDaysAgoIso,
+      });
+
+      const res = await getCachedAiAdvice('exam-1', today, 'pro');
       expect(res.item).toBeNull();
       expect(res.cachedAdvice).toBeNull();
-      expect(res.isExpiredDay).toBe(true);
-      expect(res.isTierMismatch).toBe(false);
     });
 
     it('會員等級變更時（如 Pro 降為 Free）應標記方案不符且不倒灌舊等級建議', async () => {

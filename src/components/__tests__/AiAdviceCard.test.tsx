@@ -134,4 +134,30 @@ describe('AiAdviceCard 會員標籤與額度顯示測試', () => {
     });
     expect(json).toContain('今日進度已有新更新 · 可點擊右上角重新整理以產生最新分析（將消耗 1 次配額）');
   });
+
+  it('8. 歷史建議（isHistorical: true）應明確標示「✦ 歷史 AI 讀書建議」與「此為前次分析建議（已跨日）」', () => {
+    const json = renderCard({
+      advice: sampleAdvice,
+      tier: 'pro',
+      quota: sampleProQuota,
+      isHistorical: true,
+      generatedAt: '2026-10-22T08:30:00.000Z',
+    });
+    expect(json).toContain('✦ 歷史 AI 讀書建議');
+    expect(json).toContain('此為前次分析建議（已跨日）· 可免費閱讀');
+    expect(json).toContain('前次分析：');
+  });
+
+  it('9. 歷史建議且進度已更新時，應合併顯示歷史與進度提醒', () => {
+    const json = renderCard({
+      advice: sampleAdvice,
+      tier: 'pro',
+      quota: sampleProQuota,
+      isHistorical: true,
+      isOutdatedProgress: true,
+      generatedAt: '2026-10-22T08:30:00.000Z',
+    });
+    expect(json).toContain('✦ 歷史 AI 讀書建議');
+    expect(json).toContain('此為前次分析建議（已跨日且進度已有更新）· 可免費閱讀');
+  });
 });
