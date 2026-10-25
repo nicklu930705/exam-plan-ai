@@ -170,6 +170,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       userId,
       result.originalTransactionId!,
       result.expiresDate,
+      result.environment,
     );
 
     const responsePayload = {
@@ -182,6 +183,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       purchaseDate: result.purchaseDate,
       expiresDate: result.expiresDate,
       environment: result.environment,
+      isSandbox: result.isSandbox ?? (result.environment?.toLowerCase() === 'sandbox'),
       proofToken,
       message: 'Apple 交易驗證成功，會員專屬權益已啟用。',
     };

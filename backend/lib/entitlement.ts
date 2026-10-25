@@ -37,6 +37,7 @@ export interface AppleEntitlementRecord {
   lastAppleSignedDate?: number;
   lastRenewalSignedDate?: number;
   environment: string;
+  isSandbox?: boolean;
 }
 
 export interface UserEntitlementCache {
@@ -48,6 +49,7 @@ export interface UserEntitlementCache {
   willRenew?: boolean;
   verifiedAt: number;
   environment: string;
+  isSandbox?: boolean;
 }
 
 export interface UserEntitlementInfo {
@@ -58,6 +60,8 @@ export interface UserEntitlementInfo {
   originalTransactionId?: string;
   expiresAt?: number | null;
   willRenew?: boolean;
+  environment?: string;
+  isSandbox?: boolean;
 }
 
 const SERVER_SECRET = process.env.APP_SERVER_SECRET || 'exam_plan_ai_signing_secret_2026';
@@ -71,6 +75,7 @@ export function generateEntitlementProofToken(
   userId: string,
   originalTransactionId: string,
   expiresAt?: number | null,
+  environment?: string,
 ): string {
   const now = Date.now();
   // 權杖有效期為「方案到期日」與「7 天」取較小值 (終身版預設 7 天滾動更新)
@@ -94,6 +99,8 @@ export async function verifyEntitlementProofToken(
   userId?: string;
   originalTransactionId?: string;
   expiresAt?: number;
+  environment?: string;
+  isSandbox?: boolean;
   reason?: string;
   isExpired?: boolean;
   isSignatureValid?: boolean;
@@ -140,12 +147,17 @@ export async function verifyEntitlementProofToken(
   try {
     const record = await getOriginalTransactionEntitlement(originalTransactionId);
     if (record) {
+      const recEnv = record.environment || 'Sandbox';
+      const isSandbox = recEnv.toLowerCase() === 'sandbox';
+
       if (record.status === 'revoked' || record.revocationDate) {
         return {
           valid: false,
           userId,
           originalTransactionId,
           expiresAt,
+          environment: recEnv,
+          isSandbox,
           reason: '此交易已被退款或撤銷。',
           isRevoked: true,
         };
@@ -169,6 +181,8 @@ export async function verifyEntitlementProofToken(
             userId,
             originalTransactionId,
             expiresAt,
+            environment: recEnv,
+            isSandbox,
             reason: '權杖已逾期（符合續約換發條件）。',
             isExpired: true,
             isSignatureValid: true,
@@ -182,6 +196,8 @@ export async function verifyEntitlementProofToken(
           userId,
           originalTransactionId,
           expiresAt,
+          environment: recEnv,
+          isSandbox,
           reason: '權杖已逾期。',
           isExpired: true,
           isSignatureValid: true,
@@ -195,9 +211,20 @@ export async function verifyEntitlementProofToken(
           userId,
           originalTransactionId,
           expiresAt,
+          environment: recEnv,
+          isSandbox,
           reason: '此訂閱已在 Apple 伺服端到期。',
         };
       }
+
+      return {
+        valid: true,
+        userId,
+        originalTransactionId,
+        expiresAt,
+        environment: recEnv,
+        isSandbox,
+      };
     } else if (isTokenExpired) {
       return {
         valid: false,
@@ -249,6 +276,9 @@ export async function saveVerifiedEntitlement(
 
   const redis = getRedisClient();
   const now = Date.now();
+  const normalizedEnv = (verification.environment || 'Sandbox').trim().toLowerCase();
+  const envScopedMainKey = `exam_ai:apple:entitlement:${normalizedEnv}:${originalTransactionId}`;
+  const legacyMainKey = `exam_ai:apple:entitlement:${originalTransactionId}`;
 
   let effectiveExpiresDate = verification.expiresDate || null;
   let effectiveStatus: 'active' | 'expired' | 'revoked' =
@@ -256,10 +286,16 @@ export async function saveVerifiedEntitlement(
   let effectiveTier: 'free' | 'pro' | 'lifetime' = verification.tier;
   let effectiveRevocationDate = verification.revocationDate || null;
 
-  // 1. 讀取現有記錄評估初步狀態
+  // 1. 讀取現有記錄評估初步狀態 (優先讀取隔離環境記錄，並相容舊版主記錄)
   let existing: AppleEntitlementRecord | null = null;
+  let legacyExisting: AppleEntitlementRecord | null = null;
   try {
-    existing = (await redis.get(`exam_ai:apple:entitlement:${originalTransactionId}`)) as AppleEntitlementRecord | null;
+    existing = await getOriginalTransactionEntitlement(originalTransactionId, normalizedEnv);
+    legacyExisting = (await redis.get(legacyMainKey)) as AppleEntitlementRecord | null;
+    if (!existing && legacyExisting) {
+      existing = legacyExisting;
+    }
+
     if (existing) {
       // 安全關鍵防護 0：Lifetime 方案不可被一般訂閱或過期通知降級
       if (existing.tier === 'lifetime' && existing.status === 'active' && effectiveStatus !== 'revoked') {
@@ -298,6 +334,13 @@ export async function saveVerifiedEntitlement(
     // 忽略檢查錯誤
   }
 
+  // 跨環境覆蓋嚴格防護：若 legacy 主記錄已由正式交易 (Production) 佔有，Sandbox 交易嚴禁覆蓋 legacy 主記錄
+  const legacyEnv = (legacyExisting?.environment || 'Sandbox').toLowerCase();
+  const isBlockedFromLegacy = Boolean(legacyExisting && legacyEnv === 'production' && normalizedEnv === 'sandbox');
+  if (isBlockedFromLegacy) {
+    console.warn(`[環境隔離安全] 交易 ${originalTransactionId} 於 Production 已有記錄，嚴禁 Sandbox 交易覆蓋 Production 主記錄！`);
+  }
+
   // 決定 willRenew 偏好：
   // 1. 若為 Lifetime 終身版，一律為 undefined (不應具有自動續訂屬性)
   // 2. 若傳入驗證結果有明確 willRenew (如帶有 renewalInfo)，採用之
@@ -329,9 +372,10 @@ export async function saveVerifiedEntitlement(
     lastAppleSignedDate: txSignedDate > 0 ? txSignedDate : existing?.lastAppleSignedDate,
     lastRenewalSignedDate: existing?.lastRenewalSignedDate,
     environment: verification.environment || 'Sandbox',
+    isSandbox: (verification.environment || 'Sandbox').toLowerCase() === 'sandbox',
   };
 
-  // 2. 透過 Redis OCC 原子寫入主記錄 (apple:entitlement:{originalTransactionId})
+  // 2. 透過 Redis OCC 原子寫入環境隔離主記錄 (apple:entitlement:{env}:{originalTransactionId})
   let recordTtlSeconds = 0;
   if (effectiveTier !== 'lifetime') {
     if (effectiveExpiresDate && effectiveStatus === 'active') {
@@ -342,11 +386,10 @@ export async function saveVerifiedEntitlement(
     }
   }
 
-  const mainKey = `exam_ai:apple:entitlement:${originalTransactionId}`;
   try {
     const occRes = (await redis.eval(
       SAVE_ENTITLEMENT_OCC_LUA,
-      [mainKey],
+      [envScopedMainKey],
       [JSON.stringify(entitlementRecord), String(txSignedDate), String(recordTtlSeconds)],
     )) as string[];
 
@@ -359,8 +402,7 @@ export async function saveVerifiedEntitlement(
         effectiveStatus = 'active';
         effectiveTier = 'lifetime';
       } else if (occCode === 'STALE') {
-        // 既有記錄已有更新的 Apple 狀態，讀取最新記錄確認狀態
-        const latestRecord = (await redis.get(mainKey)) as AppleEntitlementRecord | null;
+        const latestRecord = (await redis.get(envScopedMainKey)) as AppleEntitlementRecord | null;
         if (latestRecord) {
           effectiveStatus = latestRecord.status;
           effectiveTier = latestRecord.tier;
@@ -371,34 +413,49 @@ export async function saveVerifiedEntitlement(
     }
   } catch (occErr) {
     console.warn(`[OCC寫入警示] 主記錄寫入異常 (交易 ${originalTransactionId}):`, occErr);
-    // 降級寫入保證服務可用性
     if (effectiveTier === 'lifetime') {
-      await redis.set(mainKey, entitlementRecord);
+      await redis.set(envScopedMainKey, entitlementRecord);
     } else {
-      await redis.set(mainKey, entitlementRecord, { ex: recordTtlSeconds || 86400 });
+      await redis.set(envScopedMainKey, entitlementRecord, { ex: recordTtlSeconds || 86400 });
     }
   }
 
-  // 3. 跨裝置關聯 (apple:devices_z:{originalTransactionId})
-  const currentDevicesCount = await redis.zcard(`exam_ai:apple:devices_z:${originalTransactionId}`);
-  if (currentDevicesCount >= ANOMALOUS_DEVICE_THRESHOLD_PER_PURCHASE) {
-    console.warn(`[異常流量監控] 交易 ${originalTransactionId} 關聯裝置數已達 ${currentDevicesCount} 台，請留意收據外流情況。`);
+  // 若未被跨環境防護阻斷，同步更新 legacy 主記錄以確保向後相容
+  if (!isBlockedFromLegacy) {
+    try {
+      await redis.eval(
+        SAVE_ENTITLEMENT_OCC_LUA,
+        [legacyMainKey],
+        [JSON.stringify(entitlementRecord), String(txSignedDate), String(recordTtlSeconds)],
+      );
+    } catch {
+      if (effectiveTier === 'lifetime') {
+        await redis.set(legacyMainKey, entitlementRecord);
+      } else {
+        await redis.set(legacyMainKey, entitlementRecord, { ex: recordTtlSeconds || 86400 });
+      }
+    }
   }
 
-  // 記錄使用者裝置活動時間戳記
-  await redis.zadd(`exam_ai:apple:devices_z:${originalTransactionId}`, { score: now, member: userId });
+  // 3. 跨裝置關聯 (apple:devices_z:{env}:{originalTransactionId} 與相容 Key)
+  await redis.zadd(`exam_ai:apple:devices_z:${normalizedEnv}:${originalTransactionId}`, { score: now, member: userId });
+  if (!isBlockedFromLegacy) {
+    await redis.zadd(`exam_ai:apple:devices_z:${originalTransactionId}`, { score: now, member: userId });
+  }
+
+  await redis.sadd(`exam_ai:user:${userId}:apple_txns:${normalizedEnv}`, originalTransactionId);
   await redis.sadd(`exam_ai:user:${userId}:apple_txns`, originalTransactionId);
 
   // 4. 跨交易綜合評估並更新使用者的即時權限快取 (user:{userId}:entitlement)
-  await syncUserDeviceEffectiveEntitlement(userId, originalTransactionId, null, now);
+  await syncUserDeviceEffectiveEntitlement(userId, originalTransactionId, entitlementRecord, now);
 
   // 若被 Apple 撤銷或退款，聯防同步所有關聯裝置 (確保不誤殺其他有效交易)
   if (effectiveStatus === 'revoked') {
     try {
-      const associatedDevices = (await redis.zrange(`exam_ai:apple:devices_z:${originalTransactionId}`, 0, -1)) as string[];
+      const associatedDevices = (await redis.zrange(`exam_ai:apple:devices_z:${normalizedEnv}:${originalTransactionId}`, 0, -1)) as string[];
       for (const devId of associatedDevices) {
         if (devId !== userId) {
-          await syncUserDeviceEffectiveEntitlement(devId, originalTransactionId, null, now);
+          await syncUserDeviceEffectiveEntitlement(devId, originalTransactionId, entitlementRecord, now);
         }
       }
     } catch (revErr) {
@@ -406,7 +463,9 @@ export async function saveVerifiedEntitlement(
     }
   }
 
-  const finalRecord = (await redis.get(mainKey)) as AppleEntitlementRecord | null;
+  const finalRecord =
+    ((await redis.get(envScopedMainKey)) as AppleEntitlementRecord | null) ||
+    ((await redis.get(legacyMainKey)) as AppleEntitlementRecord | null);
 
   return {
     effectiveStatus,
@@ -434,24 +493,30 @@ export async function syncUserDeviceEffectiveEntitlement(
   if (!userId) return null;
   const currentNow = now || Date.now();
   const redis = getRedisClient();
-  const txnsKey = `exam_ai:user:${userId}:apple_txns`;
   const userCacheKey = `exam_ai:user:${userId}:entitlement`;
 
-  const allTxns = (await redis.smembers(txnsKey)) as string[];
-  const txnsSet = new Set(Array.isArray(allTxns) ? allTxns : []);
-  if (targetOriginalTxId) {
-    txnsSet.add(targetOriginalTxId);
-  }
+  // 1. 取得該使用者名下之所有交易識別碼（優先讀取隔離集合，並相容讀取舊版集合）
+  const prodTxns = (await redis.smembers(`exam_ai:user:${userId}:apple_txns:production`)) as string[];
+  const sandTxns = (await redis.smembers(`exam_ai:user:${userId}:apple_txns:sandbox`)) as string[];
+  const legacyTxns = (await redis.smembers(`exam_ai:user:${userId}:apple_txns`)) as string[];
 
-  if (txnsSet.size === 0) {
+  const allTxIds = new Set<string>();
+  if (Array.isArray(prodTxns)) prodTxns.forEach((id) => allTxIds.add(id));
+  if (Array.isArray(sandTxns)) sandTxns.forEach((id) => allTxIds.add(id));
+  if (Array.isArray(legacyTxns)) legacyTxns.forEach((id) => allTxIds.add(id));
+  if (targetOriginalTxId) allTxIds.add(targetOriginalTxId);
+
+  if (allTxIds.size === 0) {
     await redis.del(userCacheKey);
     return null;
   }
 
-  let bestLifetimeRecord: AppleEntitlementRecord | null = null;
-  let bestProRecord: AppleEntitlementRecord | null = null;
+  let bestProdLifetime: AppleEntitlementRecord | null = null;
+  let bestProdPro: AppleEntitlementRecord | null = null;
+  let bestSandLifetime: AppleEntitlementRecord | null = null;
+  let bestSandPro: AppleEntitlementRecord | null = null;
 
-  for (const txId of txnsSet) {
+  for (const txId of allTxIds) {
     if (!txId) continue;
     let record: AppleEntitlementRecord | null = null;
     if (txId === targetOriginalTxId && updatedTargetRecord !== undefined) {
@@ -460,29 +525,43 @@ export async function syncUserDeviceEffectiveEntitlement(
       record = await getOriginalTransactionEntitlement(txId);
     }
 
-    if (!record) continue;
+    if (!record || record.status === 'revoked') continue;
 
-    // 排除已撤銷/退款之交易
-    if (record.status === 'revoked') continue;
+    const isRecordSandbox = (record.environment || 'Sandbox').toLowerCase() === 'sandbox';
 
-    // 檢查 Lifetime (終身買斷版)
-    if (record.tier === 'lifetime' && record.status === 'active') {
-      bestLifetimeRecord = record;
-      break; // Lifetime 優先度最高，直接採用
-    }
-
-    // 檢查 Pro 訂閱型方案：必須為 active 且到期日大於目前時間
-    if (record.tier === 'pro' && record.status === 'active') {
-      const exp = record.expiresDate;
-      if (!exp || exp > currentNow) {
-        if (!bestProRecord || (exp && (!bestProRecord.expiresDate || exp > bestProRecord.expiresDate))) {
-          bestProRecord = record;
+    if (!isRecordSandbox) {
+      // Production 正式交易
+      if (record.tier === 'lifetime' && record.status === 'active') {
+        bestProdLifetime = record;
+        break; // Production Lifetime 具有最高優先權
+      }
+      if (record.tier === 'pro' && record.status === 'active') {
+        const exp = record.expiresDate;
+        if (!exp || exp > currentNow) {
+          if (!bestProdPro || (exp && (!bestProdPro.expiresDate || exp > bestProdPro.expiresDate))) {
+            bestProdPro = record;
+          }
+        }
+      }
+    } else {
+      // Sandbox 測試交易
+      if (record.tier === 'lifetime' && record.status === 'active') {
+        if (!bestSandLifetime) bestSandLifetime = record;
+      }
+      if (record.tier === 'pro' && record.status === 'active') {
+        const exp = record.expiresDate;
+        if (!exp || exp > currentNow) {
+          if (!bestSandPro || (exp && (!bestSandPro.expiresDate || exp > bestSandPro.expiresDate))) {
+            bestSandPro = record;
+          }
         }
       }
     }
   }
 
-  const activeRecord = bestLifetimeRecord || bestProRecord;
+  // 跨環境評估優先級：Production Lifetime > Production Pro > Sandbox Lifetime > Sandbox Pro
+  // 保證正式付費用戶絕對不被測試交易覆蓋或干擾，同時保證審查員在無正式購買時能順利以 Sandbox 體驗 Pro
+  const activeRecord = bestProdLifetime || bestProdPro || bestSandLifetime || bestSandPro;
 
   if (activeRecord) {
     const userCache: UserEntitlementCache = {
@@ -494,6 +573,7 @@ export async function syncUserDeviceEffectiveEntitlement(
       willRenew: activeRecord.tier === 'lifetime' ? undefined : activeRecord.willRenew,
       verifiedAt: currentNow,
       environment: activeRecord.environment,
+      isSandbox: activeRecord.isSandbox ?? (activeRecord.environment?.toLowerCase() === 'sandbox'),
     };
 
     if (activeRecord.tier === 'lifetime') {
@@ -570,18 +650,44 @@ export async function getUserEntitlement(userId: string): Promise<UserEntitlemen
     originalTransactionId: cached.originalTransactionId,
     expiresAt: cached.expiresAt,
     willRenew: cached.tier === 'lifetime' ? undefined : cached.willRenew,
+    environment: cached.environment,
+    isSandbox: cached.isSandbox ?? (cached.environment?.toLowerCase() === 'sandbox'),
   };
 }
 
 /**
- * 查詢原始交易的完整權限記錄
+ * 查詢原始交易的完整權限記錄 (支援環境隔離與向後相容)
  */
 export async function getOriginalTransactionEntitlement(
   originalTransactionId: string,
+  environment?: string,
 ): Promise<AppleEntitlementRecord | null> {
   if (!originalTransactionId) return null;
   const redis = getRedisClient();
-  return (await redis.get(`exam_ai:apple:entitlement:${originalTransactionId}`)) as AppleEntitlementRecord | null;
+  const normalizedEnv = (environment || '').trim().toLowerCase();
+
+  // 優先查詢主記錄
+  const legacyRecord = (await redis.get(`exam_ai:apple:entitlement:${originalTransactionId}`)) as AppleEntitlementRecord | null;
+
+  // 若指定環境，檢查主記錄環境是否相符
+  if (normalizedEnv === 'production' || normalizedEnv === 'sandbox') {
+    if (legacyRecord) {
+      const recEnv = (legacyRecord.environment || 'Sandbox').toLowerCase();
+      if (recEnv === normalizedEnv) return legacyRecord;
+    }
+
+    // 若主記錄不相符或不存在，查詢專屬隔離 Key
+    const envScopedKey = `exam_ai:apple:entitlement:${normalizedEnv}:${originalTransactionId}`;
+    return (await redis.get(envScopedKey)) as AppleEntitlementRecord | null;
+  }
+
+  if (legacyRecord) return legacyRecord;
+
+  // 未指定環境時，依序查詢正式環境 -> 沙盒環境隔離 Key
+  const prodRecord = (await redis.get(`exam_ai:apple:entitlement:production:${originalTransactionId}`)) as AppleEntitlementRecord | null;
+  if (prodRecord) return prodRecord;
+
+  return (await redis.get(`exam_ai:apple:entitlement:sandbox:${originalTransactionId}`)) as AppleEntitlementRecord | null;
 }
 
 /**

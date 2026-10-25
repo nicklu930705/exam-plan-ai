@@ -63,6 +63,7 @@ export interface AppleVerificationResult {
   revocationDate?: number;
   signedDate?: number;
   environment?: string;
+  isSandbox?: boolean;
   willRenew?: boolean;
   isExpired: boolean;
   isRevoked: boolean;
@@ -150,9 +151,9 @@ export class AppleStoreKitVerifier implements ITransactionVerifier {
         verifiersToTry.push({ verifier: this.productionVerifier, envName: 'Production' });
       }
     } else {
-      // 正式後端：嚴格僅掛載正式驗證器，絕對不允許 Sandbox
+      // 正式後端：優先掛載正式驗證器；同時掛載 Sandbox 驗證器以支援 Apple App Review 審查交易
       if (this.productionVerifier) verifiersToTry.push({ verifier: this.productionVerifier, envName: 'Production' });
-      if (allowSandbox && this.sandboxVerifier) {
+      if (this.sandboxVerifier) {
         verifiersToTry.push({ verifier: this.sandboxVerifier, envName: 'Sandbox' });
       }
     }
@@ -241,6 +242,7 @@ export class AppleStoreKitVerifier implements ITransactionVerifier {
         revocationDate: decoded.revocationDate,
         signedDate: decoded.signedDate,
         environment: verifiedEnv,
+        isSandbox: (verifiedEnv || '').toLowerCase() === 'sandbox',
         isExpired: false,
         isRevoked: true,
         errorMessage: '此交易已被 Apple 撤銷或退款。',
@@ -277,6 +279,7 @@ export class AppleStoreKitVerifier implements ITransactionVerifier {
           expiresDate,
           signedDate: decoded.signedDate,
           environment: verifiedEnv,
+          isSandbox: (verifiedEnv || '').toLowerCase() === 'sandbox',
           isExpired: true,
           isRevoked: false,
           errorMessage: '此訂閱方案已到期。',
@@ -297,6 +300,7 @@ export class AppleStoreKitVerifier implements ITransactionVerifier {
       expiresDate: decoded.expiresDate,
       signedDate: decoded.signedDate,
       environment: verifiedEnv,
+      isSandbox: (verifiedEnv || '').toLowerCase() === 'sandbox',
       isExpired: false,
       isRevoked: false,
     };

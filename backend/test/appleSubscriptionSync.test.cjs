@@ -67,7 +67,7 @@ test('Phase 3.2 Part 1 - Apple 環境隔離與嚴格校驗測試', async (t) => 
     assert.match(env.error, /正式後端 \(APPLE_IAP_ENVIRONMENT=production\) 嚴禁設定 APPLE_ALLOW_SANDBOX=true/);
   });
 
-  await t.test('3. 正式後端 (APPLE_IAP_ENVIRONMENT=production)：嚴格拒絕 Sandbox 交易憑證與 Webhook 通知', () => {
+  await t.test('3. 正式後端 (APPLE_IAP_ENVIRONMENT=production)：支援 Apple App Review Sandbox 憑證，並拒絕無效/非 Apple 環境', () => {
     process.env.NODE_ENV = 'production';
     process.env.APPLE_IAP_ENVIRONMENT = 'production';
     delete process.env.APPLE_ALLOW_SANDBOX;
@@ -76,12 +76,18 @@ test('Phase 3.2 Part 1 - Apple 環境隔離與嚴格校驗測試', async (t) => 
     assert.strictEqual(env.valid, true);
     assert.strictEqual(env.targetRole, 'production');
     assert.strictEqual(env.allowSandbox, false);
+    assert.strictEqual(env.allowAppReviewSandbox, true);
 
-    assert.strictEqual(isTransactionEnvironmentAllowed('Sandbox'), false);
-    assert.strictEqual(isNotificationEnvironmentAllowed('Sandbox'), false);
-
+    // 依 Apple 審查規範：正式後端必須允許 Apple 審查員合法 Sandbox 憑證與正式憑證
     assert.strictEqual(isTransactionEnvironmentAllowed('Production'), true);
+    assert.strictEqual(isTransactionEnvironmentAllowed('Sandbox'), true);
     assert.strictEqual(isNotificationEnvironmentAllowed('Production'), true);
+    assert.strictEqual(isNotificationEnvironmentAllowed('Sandbox'), true);
+
+    // 嚴格拒絕未經授權之其他環境
+    assert.strictEqual(isTransactionEnvironmentAllowed('Xcode'), false);
+    assert.strictEqual(isTransactionEnvironmentAllowed('staging'), false);
+    assert.strictEqual(isNotificationEnvironmentAllowed('staging'), false);
   });
 
   await t.test('4. 環境矛盾防呆：APPLE_IAP_ENVIRONMENT=sandbox 但 APPLE_ALLOW_SANDBOX=false 時安全回報矛盾', () => {

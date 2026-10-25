@@ -118,16 +118,40 @@ export async function applySubscriptionStateToRedis(params: {
 
   const redis = getRedisClient();
 
-  // 1. 取得既有記錄
+  // 1. 取得既有記錄 (優先查詢環境隔離記錄)
+  const incomingEnv = (verifiedNotification?.environment || 'Sandbox').trim().toLowerCase();
   let existingRecord: AppleEntitlementRecord | null = null;
+  let legacyRecord: AppleEntitlementRecord | null = null;
   try {
-    existingRecord = await getOriginalTransactionEntitlement(originalTransactionId);
+    existingRecord = await getOriginalTransactionEntitlement(originalTransactionId, incomingEnv);
+    legacyRecord = (await redis.get(`exam_ai:apple:entitlement:${originalTransactionId}`)) as AppleEntitlementRecord | null;
+    if (!existingRecord && legacyRecord) {
+      existingRecord = legacyRecord;
+    }
   } catch (err: any) {
     throw new SubscriptionSyncError(
       `讀取既有交易主記錄失敗: ${err?.message || err}`,
       originalTransactionId,
       err,
     );
+  }
+
+  // 嚴格跨環境 Webhook 防護：Sandbox Webhook 絕不得更新 Production 交易主記錄
+  const legacyEnv = (legacyRecord?.environment || 'Sandbox').toLowerCase();
+  const isBlockedFromLegacy = Boolean(legacyRecord && legacyEnv === 'production' && incomingEnv === 'sandbox');
+
+  if (isBlockedFromLegacy) {
+    console.warn(`[Webhook環境隔離] 拒絕 Sandbox Webhook 更新已由 Production 佔有之交易 (${originalTransactionId})`);
+    return {
+      success: true,
+      action: 'ignored_cross_environment',
+      originalTransactionId,
+      status: legacyRecord?.status || 'active',
+      tier: legacyRecord?.tier || 'pro',
+      devicesUpdatedCount: 0,
+      dryRun: isDryRun,
+      reason: 'Sandbox Webhook 嚴格禁止修改 Production 交易主記錄。',
+    };
   }
 
   // 2. 組合更新後的交易主記錄
@@ -193,9 +217,10 @@ export async function applySubscriptionStateToRedis(params: {
       verifiedNotification?.environment ||
       existingRecord?.environment ||
       'Sandbox',
+    isSandbox: (verifiedNotification?.environment || existingRecord?.environment || 'Sandbox').toLowerCase() === 'sandbox',
   };
 
-  // 3 & 4. 樂觀並行控制 (OCC) 與原子寫入 Redis 交易主記錄 (apple:entitlement:{originalTransactionId})
+  // 3 & 4. 樂觀並行控制 (OCC) 與原子寫入 Redis 交易主記錄
   let recordTtl = 0;
   if (targetTier !== 'lifetime') {
     if (effectiveExpiresDate && targetStatus === 'active') {
@@ -207,14 +232,28 @@ export async function applySubscriptionStateToRedis(params: {
   }
 
   const incomingTimestamp = txSignedDate > 0 ? txSignedDate : (renewalSignedDate > 0 ? renewalSignedDate : 0);
-  const mainKey = `exam_ai:apple:entitlement:${originalTransactionId}`;
+  const envScopedMainKey = `exam_ai:apple:entitlement:${incomingEnv}:${originalTransactionId}`;
+  const legacyMainKey = `exam_ai:apple:entitlement:${originalTransactionId}`;
+  const targetKeyForOcc = isBlockedFromLegacy ? envScopedMainKey : legacyMainKey;
 
   try {
     const occRes = (await redis.eval(
       SAVE_ENTITLEMENT_OCC_LUA,
-      [mainKey],
+      [targetKeyForOcc],
       [JSON.stringify(updatedRecord), String(incomingTimestamp), String(recordTtl)],
     )) as string[];
+
+    if (!isBlockedFromLegacy) {
+      try {
+        if (targetTier === 'lifetime') {
+          await redis.set(envScopedMainKey, updatedRecord);
+        } else {
+          await redis.set(envScopedMainKey, updatedRecord, { ex: recordTtl || 86400 });
+        }
+      } catch {
+        // 忽略輔助環境 Key 寫入錯誤
+      }
+    }
 
     if (occRes && occRes[0] !== 'OK') {
       const occCode = occRes[0];
@@ -224,10 +263,16 @@ export async function applySubscriptionStateToRedis(params: {
       // 仍必須對關聯裝置進行補償同步，確保所有裝置與目前 Redis 中的權威記錄保持一致！
       let compensatedDevicesCount = 0;
       try {
-        const devicesKey = `exam_ai:apple:devices_z:${originalTransactionId}`;
+        const devicesKey = `exam_ai:apple:devices_z:${incomingEnv}:${originalTransactionId}`;
+        const legacyDevicesKey = `exam_ai:apple:devices_z:${originalTransactionId}`;
         const associatedDevices = (await redis.zrange(devicesKey, 0, -1)) as string[];
-        if (Array.isArray(associatedDevices) && associatedDevices.length > 0) {
-          for (const devId of associatedDevices) {
+        const legacyDevices = !isBlockedFromLegacy ? ((await redis.zrange(legacyDevicesKey, 0, -1)) as string[]) : [];
+        const uniqueDevIds = new Set<string>();
+        if (Array.isArray(associatedDevices)) associatedDevices.forEach((d) => uniqueDevIds.add(d));
+        if (Array.isArray(legacyDevices)) legacyDevices.forEach((d) => uniqueDevIds.add(d));
+
+        if (uniqueDevIds.size > 0) {
+          for (const devId of uniqueDevIds) {
             if (!devId || typeof devId !== 'string') continue;
             // 傳入 null 作為 updatedTargetRecord，直接讀取 Redis 最新權威記錄進行裝置權益評估
             await syncUserDeviceEffectiveEntitlement(devId, originalTransactionId, null, now);
@@ -307,11 +352,16 @@ export async function applySubscriptionStateToRedis(params: {
   // 5. 多裝置原子廣播更新 (Multi-device Fan-out 整合跨交易評估)
   let devicesUpdatedCount = 0;
   try {
-    const devicesKey = `exam_ai:apple:devices_z:${originalTransactionId}`;
+    const devicesKey = `exam_ai:apple:devices_z:${incomingEnv}:${originalTransactionId}`;
+    const legacyDevicesKey = `exam_ai:apple:devices_z:${originalTransactionId}`;
     const associatedDevices = (await redis.zrange(devicesKey, 0, -1)) as string[];
+    const legacyDevices = !isBlockedFromLegacy ? ((await redis.zrange(legacyDevicesKey, 0, -1)) as string[]) : [];
+    const uniqueDevIds = new Set<string>();
+    if (Array.isArray(associatedDevices)) associatedDevices.forEach((d) => uniqueDevIds.add(d));
+    if (Array.isArray(legacyDevices)) legacyDevices.forEach((d) => uniqueDevIds.add(d));
 
-    if (Array.isArray(associatedDevices) && associatedDevices.length > 0) {
-      for (const devId of associatedDevices) {
+    if (uniqueDevIds.size > 0) {
+      for (const devId of uniqueDevIds) {
         if (!devId || typeof devId !== 'string') continue;
         // 呼叫跨交易綜合評估，確保此交易即使到期或撤銷，也不會誤刪使用者在其他交易上合法擁有的 Lifetime 或 Pro 權限！
         await syncUserDeviceEffectiveEntitlement(devId, originalTransactionId, updatedRecord, now);

@@ -23,6 +23,7 @@ export interface AppleEnvironmentConfig {
   targetRole: 'sandbox' | 'production';
   targetAppleEnv: Environment;
   allowSandbox: boolean;
+  allowAppReviewSandbox?: boolean;
   bundleId: string;
   appAppleId?: number;
   error?: string;
@@ -114,6 +115,7 @@ export function resolveAppleEnvironment(): AppleEnvironmentConfig {
       targetRole: 'production',
       targetAppleEnv: Environment.PRODUCTION,
       allowSandbox: false,
+      allowAppReviewSandbox: true,
       bundleId: EXPECTED_BUNDLE_ID,
       appAppleId: EXPECTED_APP_APPLE_ID,
     };
@@ -124,6 +126,7 @@ export function resolveAppleEnvironment(): AppleEnvironmentConfig {
     targetRole: 'production',
     targetAppleEnv: Environment.PRODUCTION,
     allowSandbox: false,
+    allowAppReviewSandbox: false,
     bundleId: EXPECTED_BUNDLE_ID,
     error: '無法識別當前 Apple 後端環境。',
   };
@@ -139,8 +142,8 @@ export function isTransactionEnvironmentAllowed(verifiedEnv: string): boolean {
   const normalized = (verifiedEnv || '').trim().toLowerCase();
 
   if (config.targetRole === 'production') {
-    // 正式後端只允許正式收據
-    return normalized === 'production';
+    // 正式後端支援正式交易收據，並依據 Apple 規範支援 Apple App Review 審查環境合法之 Sandbox 憑證
+    return normalized === 'production' || normalized === 'sandbox';
   }
 
   // Sandbox 後端允許 Sandbox 收據 (測試環境亦可接受)
@@ -157,8 +160,8 @@ export function isNotificationEnvironmentAllowed(notificationEnv: string): boole
   const normalized = (notificationEnv || '').trim().toLowerCase();
 
   if (config.targetRole === 'production') {
-    // 正式後端嚴格只接受 Apple Production Webhook
-    return normalized === 'production';
+    // 正式後端支援正式 Webhook 通知，以及來自 App Review / Sandbox Server URL 之通知
+    return normalized === 'production' || normalized === 'sandbox';
   }
 
   // Sandbox 後端嚴格只接受 Apple Sandbox Webhook

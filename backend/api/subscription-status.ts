@@ -209,6 +209,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             authenticatedUserId,
             boundOriginalTxId,
             userEntitlement.expiresAt,
+            userEntitlement.environment || mainRecord?.environment,
           );
         }
 
@@ -231,6 +232,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           willRenew: effectiveWillRenew,
           proofToken: responseStatus === 'active' ? activeProofToken : undefined,
           isVerified: responseTier !== 'free' && responseStatus === 'active',
+          environment: userEntitlement.environment || mainRecord?.environment,
+          isSandbox: (userEntitlement.environment || mainRecord?.environment)?.toLowerCase() === 'sandbox',
           serverTime: now,
         });
       }
@@ -358,13 +361,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         });
       }
 
-      // 簽發全新有效 Proof Token (採用最新有效續約到期日)
+      // 簽發全新有效 Proof Token (採用最新有效續約到期日與環境)
       const authoritativeExpiresDate =
         saveRes.effectiveExpiresDate || existingRecord?.expiresDate || verifyResult.expiresDate;
       const freshProofToken = generateEntitlementProofToken(
         userId,
         verifyResult.originalTransactionId!,
         authoritativeExpiresDate,
+        verifyResult.environment,
       );
 
       const effectiveWillRenew =
@@ -388,6 +392,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         willRenew: effectiveWillRenew,
         proofToken: freshProofToken,
         isVerified: effectiveTier !== 'free',
+        environment: verifyResult.environment,
+        isSandbox: verifyResult.isSandbox ?? (verifyResult.environment?.toLowerCase() === 'sandbox'),
         serverTime: now,
       });
     }

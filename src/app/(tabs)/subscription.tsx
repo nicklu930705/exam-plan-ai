@@ -117,15 +117,6 @@ export default function SubscriptionScreen() {
       return;
     }
 
-    // 2. 一般正式版安全防護：未在開發環境且非合規 Sandbox 測試版時，停用付費購買入口
-    if (!__DEV__ && !isSandboxAllowed && selectedProduct.tier !== 'free') {
-      Alert.alert(
-        '尚未開放付費購買',
-        '目前為 TestFlight 測試預覽版本，付費功能暫未開放。所有核心讀書計畫排程、計時器、進度追蹤與 AI 讀書建議皆可免費完整體驗！',
-      );
-      return;
-    }
-
     setIsLoading(true);
     try {
       const result = await storeKitService.purchase(selectedProductId);
@@ -156,15 +147,6 @@ export default function SubscriptionScreen() {
       Alert.alert(
         'Sandbox 環境設定錯誤',
         '此建置宣告啟用 Sandbox 內購測試，但後端網址未設定或不符合指定之 Sandbox URL，已安全阻斷恢復購買。',
-      );
-      return;
-    }
-
-    // 2. 一般正式版安全防護：未在開發環境且非合規 Sandbox 測試版時提示使用者
-    if (!__DEV__ && !isSandboxAllowed) {
-      Alert.alert(
-        '尚未開放付費功能',
-        '目前 TestFlight 版本尚未開放付費購買，暫無可恢復的 App Store 訂閱紀錄。',
       );
       return;
     }
@@ -611,23 +593,6 @@ export default function SubscriptionScreen() {
             已開啟 Sandbox 測試旗標，但後端網址不符合指定之 Sandbox URL。為防止污染正式環境，系統已全面阻斷所有購買與 API 請求。
           </AppText>
         </View>
-      ) : !__DEV__ ? (
-        <View style={styles.testFlightNoticeCard}>
-          <View style={styles.testFlightNoticeHeader}>
-            <Ionicons
-              name="information-circle"
-              size={18}
-              color={colors.primary}
-              style={{ marginRight: 6 }}
-            />
-            <AppText style={styles.testFlightNoticeTitle}>
-              TestFlight 測試階段說明
-            </AppText>
-          </View>
-          <AppText secondary style={styles.testFlightNoticeText}>
-            目前為 TestFlight 測試預覽版本，付費方案暫未開放購買。所有核心讀書計畫排程、計時器、任務進度追蹤與 AI 讀書建議皆可免費完整體驗！
-          </AppText>
-        </View>
       ) : null}
 
       {/* 購買與管理操作按鈕 */}
@@ -638,13 +603,11 @@ export default function SubscriptionScreen() {
               ? '處理中...'
               : isSandboxMisconfigured
                 ? 'Sandbox 設定錯誤・已安全阻斷'
-                : !__DEV__ && !isSandboxAllowed && selectedProduct.tier !== 'free'
-                  ? 'TestFlight 測試階段・暫未開放購買'
-                  : isSelectedProductCurrent
-                    ? '目前已是此方案'
-                    : isSandboxAllowed
-                      ? `以 ${selectedProduct.priceFormatted} 測試購買方案`
-                      : `以 ${selectedProduct.priceFormatted} 切換方案`
+                : isSelectedProductCurrent
+                  ? '目前已是此方案'
+                  : isSandboxAllowed
+                    ? `以 ${selectedProduct.priceFormatted} 測試購買方案`
+                    : `以 ${selectedProduct.priceFormatted} 開通方案`
           }
           loading={isLoading}
           onPress={handlePurchase}
@@ -652,8 +615,7 @@ export default function SubscriptionScreen() {
             isLoading ||
             isRestoring ||
             isSelectedProductCurrent ||
-            isSandboxMisconfigured ||
-            (!__DEV__ && !isSandboxAllowed && selectedProduct.tier !== 'free')
+            isSandboxMisconfigured
           }
           style={styles.mainActionButton}
         />
@@ -841,29 +803,6 @@ const styles = StyleSheet.create({
   statusNoticeCardPreview: {
     backgroundColor: '#FAF5EA',
     borderColor: '#EBDCB9',
-  },
-  testFlightNoticeCard: {
-    backgroundColor: '#F3F8F4',
-    borderRadius: radius.md,
-    padding: spacing.md,
-    marginBottom: spacing.lg,
-    borderWidth: 1,
-    borderColor: '#CDE5D4',
-  },
-  testFlightNoticeHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 4,
-  },
-  testFlightNoticeTitle: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: colors.primary,
-  },
-  testFlightNoticeText: {
-    fontSize: 12,
-    lineHeight: 18,
-    color: colors.textSecondary,
   },
   sandboxNoticeCard: {
     backgroundColor: '#FEF9EE',
