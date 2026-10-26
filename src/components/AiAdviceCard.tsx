@@ -3,7 +3,7 @@ import React from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, View } from 'react-native';
 
 import type { AiAdviceStatus, QuotaInfo, StructuredAdvice } from '../services/aiAdviceService';
-import type { AiQuotaStatus } from '../subscription/types';
+import type { AiQuotaStatus, PlanTier } from '../subscription/types';
 import { colors, radius, shadow, spacing } from '../theme';
 import { AppText } from './AppText';
 
@@ -12,6 +12,7 @@ interface Props {
   source?: 'openai_ai' | 'gemini_ai' | 'fallback_rule_engine';
   disclaimer?: string;
   note?: string;
+  tier?: PlanTier;
   quotaStatus?: AiQuotaStatus;
   quota?: QuotaInfo;
   status?: AiAdviceStatus;
@@ -19,6 +20,12 @@ interface Props {
   error?: string | null;
   errorCode?: string;
   examName?: string;
+  generatedAt?: string | null;
+  isOutdatedProgress?: boolean;
+  isQuotaStale?: boolean;
+  isHistorical?: boolean;
+  isQuotaSyncing?: boolean;
+  isQuotaFetchFailed?: boolean;
   onRefresh?: () => void;
   onRetry?: () => void;
   onDismiss?: () => void;
@@ -29,6 +36,7 @@ export const AiAdviceCard: React.FC<Props> = ({
   source = 'openai_ai',
   disclaimer,
   note,
+  tier,
   quotaStatus,
   quota,
   status,
@@ -36,6 +44,12 @@ export const AiAdviceCard: React.FC<Props> = ({
   error,
   errorCode,
   examName,
+  generatedAt,
+  isOutdatedProgress = false,
+  isQuotaStale = false,
+  isHistorical = false,
+  isQuotaSyncing = false,
+  isQuotaFetchFailed = false,
   onRefresh,
   onRetry,
   onDismiss,
@@ -49,6 +63,29 @@ export const AiAdviceCard: React.FC<Props> = ({
     (Boolean(error) ||
       (status !== undefined && status !== 'idle' && status !== 'loading' && status !== 'success') ||
       (!advice && Boolean(status) && status !== 'idle'));
+
+  const formattedGeneratedTime = React.useMemo(() => {
+    if (!generatedAt) return null;
+    try {
+      const d = new Date(generatedAt);
+      if (isNaN(d.getTime())) return null;
+      const hours = String(d.getHours()).padStart(2, '0');
+      const mins = String(d.getMinutes()).padStart(2, '0');
+      const now = new Date();
+      const isToday =
+        d.getFullYear() === now.getFullYear() &&
+        d.getMonth() === now.getMonth() &&
+        d.getDate() === now.getDate();
+      if (isToday) {
+        return `今日 ${hours}:${mins}`;
+      }
+      const month = d.getMonth() + 1;
+      const date = d.getDate();
+      return `${month}月${date}日 ${hours}:${mins}`;
+    } catch {
+      return null;
+    }
+  }, [generatedAt]);
 
   // ───── 1. 載入中狀態 (Loading State) ─────
   if (isBusy) {
@@ -224,9 +261,16 @@ export const AiAdviceCard: React.FC<Props> = ({
             style={{ fontWeight: '700' }}
           >
             {isAi
-              ? '✦ AI 讀書教練深度建議'
+              ? isHistorical
+                ? '✦ 歷史 AI 讀書建議'
+                : '✦ AI 讀書教練深度建議'
               : '智慧讀書教練 (本機引擎)'}
           </AppText>
+          {formattedGeneratedTime ? (
+            <AppText variant="caption" secondary style={styles.generatedTimeBadge}>
+              · {isHistorical ? (tier === 'free' ? `前次分析（原始分析時間：${formattedGeneratedTime}）` : `前次分析：${formattedGeneratedTime}`) : formattedGeneratedTime}
+            </AppText>
+          ) : null}
         </View>
 
         <View style={styles.headerActions}>
@@ -236,7 +280,7 @@ export const AiAdviceCard: React.FC<Props> = ({
               disabled={isLoading}
               hitSlop={8}
               accessibilityRole="button"
-              accessibilityLabel="重新取得 AI 建議"
+              accessibilityLabel="重新取得 AI 建議（將消耗 1 次本日配額）"
               style={({ pressed }) => [styles.actionIconBtn, pressed && { opacity: 0.6 }]}
             >
               <Ionicons name="refresh" size={16} color={colors.primary} />
@@ -256,6 +300,29 @@ export const AiAdviceCard: React.FC<Props> = ({
           ) : null}
         </View>
       </View>
+
+      {/* 歷史建議或進度已變更提示 */}
+      {isHistorical ? (
+        <View style={styles.historicalNoticeBox}>
+          <Ionicons name="time-outline" size={14} color={colors.primary} />
+          <AppText variant="caption" color={colors.primary} style={{ flex: 1, fontWeight: '600', lineHeight: 16 }}>
+            {tier === 'free'
+              ? isOutdatedProgress
+                ? `此為歷史建議（進度已有更新${formattedGeneratedTime ? `，原始分析時間：${formattedGeneratedTime}` : ''}）· 目前會員為免費版，舊內容可免費閱讀，重新產生新分析遵守目前免費版會員權益`
+                : `此為歷史 AI 建議${formattedGeneratedTime ? `（原始分析時間：${formattedGeneratedTime}）` : ''} · 目前會員為免費版，舊內容可免費閱讀，重新產生新分析遵守目前免費版會員權益`
+              : isOutdatedProgress
+                ? '此為前次分析建議（已跨日且進度已有更新）· 可免費閱讀，點擊右上角可消耗 1 次本日配額重新產生今日分析'
+                : '此為前次分析建議（已跨日）· 可免費閱讀，若需今日最新分析可點擊右上角重新整理（將消耗 1 次本日配額）'}
+          </AppText>
+        </View>
+      ) : isOutdatedProgress ? (
+        <View style={styles.outdatedNoticeBox}>
+          <Ionicons name="information-circle-outline" size={14} color={colors.warning} />
+          <AppText variant="caption" color={colors.warning} style={{ flex: 1, fontWeight: '600', lineHeight: 16 }}>
+            今日進度已有新更新 · 可點擊右上角重新整理以產生最新分析（將消耗 1 次配額）
+          </AppText>
+        </View>
+      ) : null}
 
       {/* 總結核心重點 */}
       <AppText variant="headline" style={styles.summaryTitle}>
@@ -330,18 +397,91 @@ export const AiAdviceCard: React.FC<Props> = ({
 
       {/* 配額與免責說明 */}
       <View style={styles.footer}>
-        {quota ? (
-          <View style={styles.quotaRow}>
-            <Ionicons name="sparkles" size={12} color={colors.primary} />
+        {/* 1. 歷史建議免責／免費閱讀提示（當為 Free 且為歷史建議時必定顯示） */}
+        {isHistorical && tier === 'free' ? (
+          <View style={styles.historicalNoticeBox}>
+            <Ionicons name="information-circle-outline" size={12} color={colors.primary} />
             <AppText variant="caption" color={colors.primary} style={styles.quotaHighlightText}>
-              {quota.tier === 'pro' ? '✦ Pro 會員' : '免費版'}今日已用 {quota.usedToday}/{quota.dailyLimit} 次（剩餘 {quota.remainingToday} 次 · 每日 00:00 重設）
+              免費版 · 舊內容可免費閱讀（新分析遵守目前免費版會員權益）
             </AppText>
           </View>
-        ) : !isAi ? (
-          <AppText variant="caption" secondary style={styles.quotaText}>
-            本機排程分析引擎（不消耗雲端每日 AI 額度）
-          </AppText>
         ) : null}
+
+        {/* 2. 當前額度狀態行 */}
+        {(() => {
+          const resolvedTier = tier || (quota?.tier as PlanTier | undefined);
+          let tierPrefix = '今日 AI 使用額度 · ';
+          if (resolvedTier === 'lifetime') {
+            tierPrefix = '✦ 終身版會員 · ';
+          } else if (resolvedTier === 'pro') {
+            tierPrefix = '✦ Pro 會員 · ';
+          } else if (resolvedTier === 'free') {
+            tierPrefix = '免費版 · ';
+          }
+
+          // A. 查詢中狀態
+          if (isQuotaSyncing) {
+            return (
+              <View style={styles.quotaRow}>
+                <Ionicons name="sync-outline" size={12} color={colors.textSecondary} />
+                <AppText variant="caption" color={colors.textSecondary} style={styles.quotaHighlightText}>
+                  {`${tierPrefix}額度同步中…`}
+                </AppText>
+              </View>
+            );
+          }
+
+          // B. 查詢失敗且無有效同日快取
+          if (isQuotaFetchFailed) {
+            return (
+              <View style={styles.quotaRow}>
+                <Ionicons name="alert-circle-outline" size={12} color={colors.textSecondary} />
+                <AppText variant="caption" color={colors.textSecondary} style={styles.quotaHighlightText}>
+                  {`${tierPrefix}目前無法取得額度`}
+                </AppText>
+              </View>
+            );
+          }
+
+          // C. 具有額度（查詢成功 或 離線同日快取）
+          if (quota || quotaStatus) {
+            const usedCount = quota?.usedToday ?? quotaStatus?.used ?? 0;
+            const limitCount = quota?.dailyLimit ?? quotaStatus?.limit ?? 0;
+            const remainingCount = quota?.remainingToday ?? quotaStatus?.remaining ?? 0;
+
+            if (isQuotaStale) {
+              return (
+                <View style={styles.quotaRow}>
+                  <Ionicons name="cloud-offline-outline" size={12} color={colors.textSecondary} />
+                  <AppText variant="caption" color={colors.textSecondary} style={styles.quotaHighlightText}>
+                    {`${tierPrefix}上次同步 ${usedCount}/${limitCount} 次（剩餘 ${remainingCount} 次）`}
+                  </AppText>
+                </View>
+              );
+            }
+
+            return (
+              <View style={styles.quotaRow}>
+                <Ionicons name="sparkles" size={12} color={colors.primary} />
+                <AppText variant="caption" color={colors.primary} style={styles.quotaHighlightText}>
+                  {`${tierPrefix}今日已用 ${usedCount}/${limitCount} 次（剩餘 ${remainingCount} 次 · 每日 00:00 重設）`}
+                </AppText>
+              </View>
+            );
+          }
+
+          // D. 本機排程分析引擎（無 quota 物件且非 AI）
+          if (!isAi) {
+            return (
+              <AppText variant="caption" secondary style={styles.quotaText}>
+                本機排程分析引擎（不消耗雲端每日 AI 額度）
+              </AppText>
+            );
+          }
+
+          return null;
+        })()}
+
         {disclaimer ? (
           <AppText variant="caption" secondary style={styles.disclaimerText}>
             {disclaimer}
@@ -438,6 +578,33 @@ const styles = StyleSheet.create({
   },
   localBadge: {
     backgroundColor: colors.warningSoft,
+  },
+  generatedTimeBadge: {
+    marginLeft: 4,
+    fontWeight: '500',
+    fontSize: 11,
+  },
+  outdatedNoticeBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 2,
+    marginBottom: spacing.xs,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: spacing.xs,
+    borderRadius: radius.sm,
+    backgroundColor: colors.warningSoft,
+  },
+  historicalNoticeBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 2,
+    marginBottom: spacing.xs,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: spacing.xs,
+    borderRadius: radius.sm,
+    backgroundColor: colors.primarySoft,
   },
   headerActions: {
     flexDirection: 'row',

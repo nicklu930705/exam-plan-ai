@@ -1,6 +1,7 @@
 {
   "cli": {
-    "version": ">= 16.0.0"
+    "version": ">= 16.0.0",
+    "promptToConfigurePushNotifications": false
   },
   "build": {
     "development": {
@@ -9,6 +10,26 @@
     },
     "preview": {
       "distribution": "internal"
+    },
+    "sandbox": {
+      "distribution": "internal",
+      "ios": {
+        "simulator": false
+      },
+      "env": {
+        "EXPO_PUBLIC_BACKEND_URL": "https://exam-plan-ai-backend-sandbox.vercel.app",
+        "EXPO_PUBLIC_ENABLE_IAP_SANDBOX": "true"
+      }
+    },
+    "sandbox-testflight": {
+      "distribution": "store",
+      "ios": {
+        "simulator": false
+      },
+      "env": {
+        "EXPO_PUBLIC_BACKEND_URL": "https://exam-plan-ai-backend-sandbox.vercel.app",
+        "EXPO_PUBLIC_ENABLE_IAP_SANDBOX": "true"
+      }
     },
     "production": {
       "distribution": "store",
@@ -21,6 +42,10 @@
     }
   },
   "submit": {
-    "production": {}
+    "production": {
+      "ios": {
+        "ascAppId": "6823259191"
+      }
+    }
   }
 }

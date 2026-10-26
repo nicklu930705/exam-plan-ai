@@ -21,18 +21,21 @@ interface Props {
 export function Screen({ children, topInset, footer, bottomInset, contentStyle }: Props) {
   const insets = useSafeAreaInsets();
   const bottomPad = bottomInset ? insets.bottom : 0;
+  // 分頁畫面在 iPhone 頂部需避開狀態列／瀏海／動態島
+  // 透過 SafeAreaProvider initialMetrics，首幀即可取得精確原生 insets
+  const topPad = topInset ? insets.top : 0;
 
   return (
     <View style={styles.root}>
       <ScrollView
         style={styles.root}
-        contentInsetAdjustmentBehavior="automatic"
+        contentInsetAdjustmentBehavior="never"
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="interactive"
         automaticallyAdjustKeyboardInsets
         contentContainerStyle={[
           styles.content,
-          { paddingTop: (topInset ? insets.top : 0) + spacing.lg },
+          { paddingTop: topPad + spacing.md },
           { paddingBottom: (footer ? 0 : bottomPad) + spacing.xxl },
           contentStyle,
         ]}

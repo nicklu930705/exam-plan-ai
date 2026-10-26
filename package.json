@@ -8,10 +8,14 @@
     "@react-native-community/datetimepicker": "9.1.0",
     "expo": "~57.0.27",
     "expo-constants": "~57.0.21",
+    "expo-document-picker": "~57.0.3",
+    "expo-file-system": "~57.0.7",
     "expo-font": "~57.0.4",
     "expo-iap": "^6.0.1",
     "expo-linking": "~57.0.12",
+    "expo-notifications": "~57.0.23",
     "expo-router": "~57.0.25",
+    "expo-sharing": "~57.0.23",
     "expo-splash-screen": "~57.0.10",
     "expo-status-bar": "~57.0.1",
     "react": "19.2.3",
@@ -40,6 +44,16 @@
   },
   "jest": {
     "preset": "jest-expo"
+  },
+  "expo": {
+    "install": {
+      "exclude": [
+        "expo",
+        "expo-linking",
+        "expo-router",
+        "jest-expo"
+      ]
+    }
   },
   "private": true
 }

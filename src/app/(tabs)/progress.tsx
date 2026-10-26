@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
 
 import { ActiveTimerBanner } from '../../components/ActiveTimerBanner';
@@ -28,6 +28,7 @@ import { useAppStore } from '../../store/AppStore';
 import {
   computeDashboardStats,
   computeProgress,
+  getActiveExamById,
   getBehindTasks,
   getExamById,
   getRecentPeriodStats,
@@ -44,25 +45,45 @@ export default function ProgressScreen() {
   const today = useToday();
   const { activeTimer, formattedTime, startTimer } = useStudyTimer();
 
-  // 選取的考試過濾：'all' 表示全部考試整合儀表，其餘為指定考試 ID
-  const [selectedFilter, setSelectedFilter] = useState<string>(() => data.selectedExamId ?? 'all');
+  const activeExams = useMemo(() => data.exams.filter((e) => !e.archived), [data.exams]);
+  const activeExamIds = useMemo(() => new Set(activeExams.map((e) => e.id)), [activeExams]);
+  const hasArchivedExams = useMemo(() => data.exams.some((e) => e.archived), [data.exams]);
+
+  // 選取的考試過濾：'all' 表示全部進行中考試整合儀表，其餘為指定進行中考試 ID
+  const [selectedFilter, setSelectedFilter] = useState<string>(() => {
+    if (data.selectedExamId && data.exams.some((e) => e.id === data.selectedExamId && !e.archived)) {
+      return data.selectedExamId;
+    }
+    return 'all';
+  });
+
   const [aiAdviceResult, setAiAdviceResult] = useState<AiAdviceServiceResult | null>(null);
   const [isLoadingAi, setIsLoadingAi] = useState<boolean>(false);
+  // 同步防重入鎖與非同步切換競態防護，避免極速連擊重複請求
+  const isRequestingAiRef = useRef<boolean>(false);
+  const activeRequestIdRef = useRef<number>(0);
+  const currentExamIdRef = useRef<string | undefined>(undefined);
   const [showAiCard, setShowAiCard] = useState<boolean>(false);
 
   const upcomingExam = useMemo(() => getUpcomingExam(data, today), [data, today]);
   const activeExam = useMemo(() => {
     if (selectedFilter === 'all') return null;
-    return getExamById(data, selectedFilter) ?? null;
+    return getActiveExamById(data, selectedFilter) ?? null;
   }, [data, selectedFilter]);
 
-  // 當前儀表板聚焦的任務集合
+  const targetExam = activeExam ?? upcomingExam ?? activeExams[0];
+  useEffect(() => {
+    currentExamIdRef.current = targetExam?.id;
+  }, [targetExam?.id]);
+
+  // 當前儀表板聚焦的任務集合（嚴格排除已封存考試之任務）
   const activeTasks = useMemo(() => {
+    const unarchivedTasks = data.tasks.filter((t) => activeExamIds.has(t.examId));
     if (selectedFilter === 'all') {
-      return data.tasks;
+      return unarchivedTasks;
     }
-    return tasksForExam(data.tasks, selectedFilter);
-  }, [data.tasks, selectedFilter]);
+    return tasksForExam(unarchivedTasks, selectedFilter);
+  }, [data.tasks, selectedFilter, activeExamIds]);
 
   // 核心綜合儀表統計數據
   const dashboardStats = useMemo(
@@ -86,20 +107,41 @@ export default function ProgressScreen() {
     [activeTasks, today],
   );
 
-  // 個人化讀書建議
+  // 個人化讀書建議（僅針對進行中考試與其任務）
   const recommendations = useMemo(
     () =>
       generateStudyRecommendations({
-        exams: data.exams,
-        tasks: data.tasks,
+        exams: activeExams,
+        tasks: data.tasks.filter((t) => activeExamIds.has(t.examId)),
         preferences: data.preferences,
         today,
         selectedExamId: activeExam?.id,
       }),
-    [data.exams, data.tasks, data.preferences, today, activeExam?.id],
+    [activeExams, data.tasks, activeExamIds, data.preferences, today, activeExam?.id],
   );
 
-  if (data.exams.length === 0) {
+  if (activeExams.length === 0) {
+    if (hasArchivedExams) {
+      return (
+        <Screen topInset>
+          <ScreenHeader title="進度儀表板" />
+          <EmptyState
+            title="所有考試皆已封存"
+            message="目前所有考試皆已封存，沒有進行中的進度數據。你可以建立新考試，或至「管理考試」解除封存舊目標。"
+            actionTitle="建立新考試"
+            onAction={() => router.push('/exam/new')}
+          />
+          <View style={{ alignItems: 'center', marginTop: spacing.md }}>
+            <Button
+              title="前往管理已封存考試"
+              variant="plain"
+              onPress={() => router.push('/exams')}
+            />
+          </View>
+        </Screen>
+      );
+    }
+
     return (
       <Screen topInset>
         <ScreenHeader title="進度儀表板" />
@@ -121,24 +163,27 @@ export default function ProgressScreen() {
       : null;
 
   const handleRequestAiAdvice = async () => {
-    const targetExam = activeExam ?? upcomingExam ?? data.exams[0];
-    logDiagnostic('AI_BUTTON_PRESSED', { examName: targetExam?.name, screen: 'progress' });
-    if (!targetExam || isLoadingAi) return;
+    const currentTarget = activeExam ?? upcomingExam ?? activeExams[0];
+    logDiagnostic('AI_BUTTON_PRESSED', { examName: currentTarget?.name, screen: 'progress' });
+    if (!currentTarget || isRequestingAiRef.current || isLoadingAi) return;
 
+    isRequestingAiRef.current = true;
+    const requestedExamId = currentTarget.id;
+    const requestId = ++activeRequestIdRef.current;
     setIsLoadingAi(true);
     setShowAiCard(true);
     setAiAdviceResult(null);
     logDiagnostic('AI_LOADING_STARTED', { screen: 'progress' });
 
     try {
-      const targetTasks = tasksForExam(data.tasks, targetExam.id);
+      const targetTasks = tasksForExam(data.tasks, currentTarget.id);
       const completedTasks = targetTasks.filter((t) => t.status === 'done');
       const completionRate =
         targetTasks.length > 0
           ? Math.round((completedTasks.length / targetTasks.length) * 100)
           : 0;
 
-      const subjectsInput = targetExam.subjects.map((s) => {
+      const subjectsInput = currentTarget.subjects.map((s) => {
         const sTasks = targetTasks.filter((t) => t.subjectId === s.id);
         const completedChapIds = new Set(
           sTasks.filter((t) => t.status === 'done' && t.chapterId).map((t) => t.chapterId),
@@ -153,8 +198,8 @@ export default function ProgressScreen() {
 
       const result = await requestAiStudyAdvice({
         request: {
-          examName: targetExam.name,
-          examDate: targetExam.examDate,
+          examName: currentTarget.name,
+          examDate: currentTarget.examDate,
           dailyAvailableMinutes: data.preferences.dailyMinutes,
           intensity: data.preferences.intensity,
           subjects: subjectsInput,
@@ -174,22 +219,31 @@ export default function ProgressScreen() {
         recordAiUsage();
       }
 
-      setAiAdviceResult(result);
+      // 檢查非同步回應競態：避免使用者切換考試時舊回應覆蓋畫面
+      if (activeRequestIdRef.current === requestId && currentExamIdRef.current === requestedExamId) {
+        setAiAdviceResult(result);
+      }
     } catch (err: any) {
       logDiagnostic('AI_REQUEST_FAILED', {
         screen: 'progress',
         error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
       });
-      setAiAdviceResult({
-        success: false,
-        status: 'network_error',
-        source: 'fallback_rule_engine',
-        disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
-        error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
-      });
+      if (activeRequestIdRef.current === requestId && currentExamIdRef.current === requestedExamId) {
+        setAiAdviceResult({
+          success: false,
+          status: 'network_error',
+          source: 'fallback_rule_engine',
+          disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
+          error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
+        });
+      }
     } finally {
-      setIsLoadingAi(false);
-      logDiagnostic('AI_LOADING_FINISHED', { screen: 'progress' });
+      // 確保在成功、失敗、逾時所有情況下均同步釋放鎖；舊請求完成不得錯誤解除新請求之鎖
+      if (activeRequestIdRef.current === requestId) {
+        isRequestingAiRef.current = false;
+        setIsLoadingAi(false);
+        logDiagnostic('AI_LOADING_FINISHED', { screen: 'progress' });
+      }
     }
   };
 
@@ -213,58 +267,67 @@ export default function ProgressScreen() {
       <ScreenHeader
         title="進度儀表板"
         subtitle="任務達成率 · 實讀時間對比 · 科目掌握度"
+        subtitlePosition="below"
       />
 
       <ActiveTimerBanner />
 
-      {/* ───── 考試切換 Chips ───── */}
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        contentContainerStyle={styles.examTabs}
-      >
-        <Pressable
-          onPress={() => setSelectedFilter('all')}
-          style={[styles.examChip, selectedFilter === 'all' && styles.examChipSelected]}
-          accessibilityRole="button"
-          accessibilityState={{ selected: selectedFilter === 'all' }}
+      {/* ───── 考試切換 Chips（僅顯示進行中考試） ───── */}
+      {activeExams.length > 1 ? (
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={styles.examTabs}
         >
-          <AppText
-            variant="footnote"
-            color={selectedFilter === 'all' ? colors.onPrimary : colors.text}
-            style={selectedFilter === 'all' && { fontWeight: '600' }}
+          <Pressable
+            onPress={() => {
+              setSelectedFilter('all');
+              setAiAdviceResult(null);
+              setShowAiCard(false);
+            }}
+            style={[styles.examChip, selectedFilter === 'all' && styles.examChipSelected]}
+            accessibilityRole="button"
+            accessibilityState={{ selected: selectedFilter === 'all' }}
           >
-            全部計畫 ({data.exams.length} 場)
-          </AppText>
-        </Pressable>
-
-        {data.exams.map((exam) => {
-          const isSelected = selectedFilter === exam.id;
-          const days = diffDays(today, exam.examDate);
-          const badgeText = days > 0 ? `${days}天` : days === 0 ? '今天' : '已結束';
-
-          return (
-            <Pressable
-              key={exam.id}
-              onPress={() => {
-                setSelectedFilter(exam.id);
-                setSelectedExamId(exam.id);
-              }}
-              style={[styles.examChip, isSelected && styles.examChipSelected]}
-              accessibilityRole="button"
-              accessibilityState={{ selected: isSelected }}
+            <AppText
+              variant="footnote"
+              color={selectedFilter === 'all' ? colors.onPrimary : colors.text}
+              style={selectedFilter === 'all' && { fontWeight: '600' }}
             >
-              <AppText
-                variant="footnote"
-                color={isSelected ? colors.onPrimary : colors.text}
-                style={isSelected && { fontWeight: '600' }}
+              全部計畫 ({activeExams.length} 場)
+            </AppText>
+          </Pressable>
+
+          {activeExams.map((exam) => {
+            const isSelected = selectedFilter === exam.id;
+            const days = diffDays(today, exam.examDate);
+            const badgeText = days > 0 ? `${days}天` : days === 0 ? '今天' : '已結束';
+
+            return (
+              <Pressable
+                key={exam.id}
+                onPress={() => {
+                  setSelectedFilter(exam.id);
+                  setSelectedExamId(exam.id);
+                  setAiAdviceResult(null);
+                  setShowAiCard(false);
+                }}
+                style={[styles.examChip, isSelected && styles.examChipSelected]}
+                accessibilityRole="button"
+                accessibilityState={{ selected: isSelected }}
               >
-                {exam.name} ({badgeText})
-              </AppText>
-            </Pressable>
-          );
-        })}
-      </ScrollView>
+                <AppText
+                  variant="footnote"
+                  color={isSelected ? colors.onPrimary : colors.text}
+                  style={isSelected && { fontWeight: '600' }}
+                >
+                  {exam.name} ({badgeText})
+                </AppText>
+              </Pressable>
+            );
+          })}
+        </ScrollView>
+      ) : null}
 
       {/* ───── 1. 考試倒數提醒卡片 ───── */}
       <View style={styles.countdownCard}>
@@ -710,8 +773,8 @@ export default function ProgressScreen() {
       )}
 
       {/* ───── 6. 距離每個考試的剩餘天數與完成率一覽 ───── */}
-      <Section title="所有考試進度與倒數">
-        {data.exams.map((examItem) => {
+      <Section title="進行中考試進度與倒數">
+        {activeExams.map((examItem) => {
           const itemTasks = tasksForExam(data.tasks, examItem.id);
           const p = computeProgress(itemTasks);
           const itemActual = itemTasks.reduce((s, t) => s + (t.actualMinutes ?? 0), 0);
@@ -725,6 +788,8 @@ export default function ProgressScreen() {
               onPress={() => {
                 setSelectedFilter(examItem.id);
                 setSelectedExamId(examItem.id);
+                setAiAdviceResult(null);
+                setShowAiCard(false);
               }}
               style={({ pressed }) => [
                 styles.examItemRow,

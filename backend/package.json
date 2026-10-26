@@ -10,6 +10,7 @@
     "start": "node dist/api/study-advice.js"
   },
   "dependencies": {
+    "@apple/app-store-server-library": "^3.1.0",
     "@google/genai": "^2.29.1",
     "@upstash/redis": "^1.39.0",
     "openai": "^7.33.0"

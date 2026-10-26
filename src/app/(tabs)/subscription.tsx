@@ -3,6 +3,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import {
   Alert,
+  Linking,
   Pressable,
   StyleSheet,
   View,
@@ -15,7 +16,12 @@ import { ScreenHeader } from '../../components/ScreenHeader';
 import { useAppStore } from '../../store/AppStore';
 import { getEffectiveTier, getPlanEntitlements } from '../../subscription/entitlements';
 import { SUBSCRIPTION_PRODUCTS } from '../../subscription/products';
-import { STOREKIT_PRODUCT_IDS } from '../../subscription/storeKitConfig';
+import {
+  APPLE_MANAGE_SUBSCRIPTIONS_URL,
+  isIapSandboxConfigured,
+  isSandboxIapAllowed,
+  STOREKIT_PRODUCT_IDS,
+} from '../../subscription/storeKitConfig';
 import { storeKitService, type StoreStatus } from '../../subscription/storeKitService';
 import type { PlanTier, ProductDefinition, UserSubscription } from '../../subscription/types';
 import { colors, radius, shadow, spacing } from '../../theme';
@@ -43,6 +49,11 @@ export default function SubscriptionScreen() {
   const [isLoading, setIsLoading] = useState(false);
   const [isRestoring, setIsRestoring] = useState(false);
 
+  // Apple IAP 沙盒環境狀態檢查
+  const isSandboxConfigured = isIapSandboxConfigured();
+  const isSandboxAllowed = isSandboxIapAllowed();
+  const isSandboxMisconfigured = isSandboxConfigured && !isSandboxAllowed;
+
   // 判斷該商品是否為使用者目前正在生效的方案
   const isProductCurrent = (product: ProductDefinition) => {
     if (product.tier === 'free') {
@@ -54,8 +65,7 @@ export default function SubscriptionScreen() {
     if (product.tier === 'pro') {
       return (
         currentTier === 'pro' &&
-        currentSub?.billingCycle === product.period &&
-        currentSub?.status === 'active'
+        currentSub?.billingCycle === product.period
       );
     }
     return false;
@@ -98,11 +108,11 @@ export default function SubscriptionScreen() {
 
   // 處理方案購買流程
   const handlePurchase = async () => {
-    // TestFlight 首次測試版安全防護：付費交易驗證尚未完成前，停用正式版付費入口
-    if (!__DEV__ && selectedProduct.tier !== 'free') {
+    // 1. 若宣告啟用 Sandbox 但環境不合規（如 URL 未設或誤指正式環境），安全阻斷
+    if (isSandboxMisconfigured) {
       Alert.alert(
-        '尚未開放付費購買',
-        '目前為 TestFlight 測試預覽版本，付費功能暫未開放。所有核心讀書計畫排程、計時器、進度追蹤與 AI 讀書建議皆可免費完整體驗！',
+        'Sandbox 環境設定錯誤',
+        '此建置宣告啟用 Sandbox 內購測試，但後端網址未設定或不符合指定之 Sandbox URL，已安全阻斷購買，絕不連線至正式後端。',
       );
       return;
     }
@@ -130,20 +140,25 @@ export default function SubscriptionScreen() {
     }
   };
 
-  // 處理恢復購買 (Restore Purchases)
-  const handleRestore = async () => {
-    // TestFlight 首次測試版安全防護：付費功能尚未正式開放時提示使用者
-    if (!__DEV__) {
+  // 處理恢復購買 (兩階段策略：優先查詢本機安全憑證快取，查無紀錄時引導向 Apple 伺服器深度同步)
+  const handleRestore = async (options?: { syncWithAppStore?: boolean }) => {
+    // 1. 若宣告啟用 Sandbox 但環境不合規，安全阻斷
+    if (isSandboxMisconfigured) {
       Alert.alert(
-        '尚未開放付費功能',
-        '目前 TestFlight 版本尚未開放付費購買，暫無可恢復的 App Store 訂閱紀錄。',
+        'Sandbox 環境設定錯誤',
+        '此建置宣告啟用 Sandbox 內購測試，但後端網址未設定或不符合指定之 Sandbox URL，已安全阻斷恢復購買。',
       );
       return;
     }
 
     setIsRestoring(true);
     try {
-      const result = await storeKitService.restorePurchases();
+      const restoreOpts =
+        options && typeof options === 'object' && typeof options.syncWithAppStore === 'boolean'
+          ? options
+          : undefined;
+
+      const result = await storeKitService.restorePurchases(restoreOpts);
 
       if (result.status === 'success' && result.subscription) {
         setSubscription(result.subscription);
@@ -151,10 +166,51 @@ export default function SubscriptionScreen() {
       } else if (result.status === 'expired' && result.subscription) {
         setSubscription(result.subscription);
         Alert.alert('訂閱過期通知', result.message);
+      } else if (result.status === 'needs_sync') {
+        // 本機快取無購買紀錄，主動詢問使用者是否執行 Apple 伺服器深度同步
+        Alert.alert(
+          '未查到本機購買紀錄',
+          result.message || '本機未查到有效訂閱紀錄。若您先前曾購買過，是否向 Apple 伺服器重新同步？',
+          [
+            { text: '取消', style: 'cancel' },
+            {
+              text: '向 Apple 伺服器同步',
+              onPress: () => {
+                handleRestore({ syncWithAppStore: true });
+              },
+            },
+          ],
+        );
       } else if (result.status === 'no_purchases') {
         Alert.alert('恢復購買結果', result.message);
+      } else if (result.status === 'sync_error') {
+        // Code 14 或 StoreKit 暫時錯誤：友善說明，保留本機狀態，指引檢查設定
+        Alert.alert(
+          'Apple 伺服器同步暫時中斷',
+          (result.message || 'Apple App Store 伺服器同步暫時中斷。') +
+            '\n\n您可稍後再次嘗試，或前往 iPhone「設定 → Apple 帳號 → 訂閱項目」確認您的訂閱狀態。',
+          [
+            { text: '確定', style: 'default' },
+            {
+              text: '重試同步',
+              onPress: () => handleRestore({ syncWithAppStore: true }),
+            },
+          ],
+        );
+      } else if (result.status === 'verification_failed') {
+        Alert.alert(
+          '安全驗證未通過',
+          result.message || 'Apple 交易憑證未能通過伺服器驗證，無法恢復會員權益。',
+        );
+      } else if (result.status === 'cancelled') {
+        // 使用者主動取消，安靜處理
+      } else if (result.status === 'busy') {
+        Alert.alert('處理中', result.message || '恢復購買程序正在進行中，請稍候。');
       } else {
-        Alert.alert('恢復失敗', result.message || '無法從 App Store 恢復購買，請稍後再試。');
+        Alert.alert(
+          '恢復未能完成',
+          result.message || '無法從 App Store 恢復購買，請稍後再試。',
+        );
       }
     } catch {
       Alert.alert('處理失敗', '無法完成恢復購買，請確認網路連線。');
@@ -165,7 +221,28 @@ export default function SubscriptionScreen() {
 
   // 開啟 Apple 官方訂閱管理頁面
   const handleManageSubscriptions = async () => {
-    await storeKitService.manageSubscriptions();
+    const res = await storeKitService.manageSubscriptions();
+    if (!res.success) {
+      if (res.status === 'dev_preview') {
+        Alert.alert('開發預覽模式', res.error || '開發測試模式下無真實 Apple 訂閱。');
+      } else if (res.status === 'unsupported_platform') {
+        Alert.alert('不支援的平台', res.error || '目前僅支援 iOS 裝置管理 Apple 訂閱。');
+      } else {
+        Alert.alert(
+          '無法直接開啟訂閱管理',
+          '未能直接開啟 Apple 原生訂閱管理視窗。\n\n【TestFlight 沙盒測試者】\n請前往 iPhone「設定 → App Store → 沙盒帳號」檢視或取消測試訂閱。\n\n【正式帳號用戶】\n若為正式 App Store 購買，可開啟系統訂閱頁。（注意：該頁僅顯示正式 Apple ID 訂閱，不包含沙盒測試項目）',
+          [
+            { text: '知道了', style: 'cancel' },
+            {
+              text: '開啟正式訂閱頁',
+              onPress: () => {
+                Linking.openURL(APPLE_MANAGE_SUBSCRIPTIONS_URL).catch(() => {});
+              },
+            },
+          ],
+        );
+      }
+    }
   };
 
   // 開發者測試用：一鍵切換方案狀態（僅在開發環境有效）
@@ -303,7 +380,9 @@ export default function SubscriptionScreen() {
               {currentTier === 'lifetime'
                 ? '永久授權'
                 : currentTier === 'pro'
-                  ? '有效訂閱中'
+                  ? currentSub?.status === 'canceled'
+                    ? '已取消續訂（效期內有效）'
+                    : '有效訂閱中'
                   : '免費體驗中'}
             </AppText>
           </View>
@@ -312,6 +391,11 @@ export default function SubscriptionScreen() {
         {currentSub?.expiresAt && currentTier === 'pro' && (
           <AppText secondary style={styles.expiresText}>
             有效期限至：{new Date(currentSub.expiresAt).toLocaleDateString()}
+          </AppText>
+        )}
+        {currentSub?.status === 'expired' && currentTier === 'free' && currentSub?.expiresAt && (
+          <AppText secondary style={styles.expiresText}>
+            先前訂閱已於 {new Date(currentSub.expiresAt).toLocaleDateString()} 到期（功能已切換回免費版）
           </AppText>
         )}
 
@@ -474,25 +558,42 @@ export default function SubscriptionScreen() {
         />
       </View>
 
-      {/* TestFlight 測試版安全說明卡片（僅非開發環境顯示） */}
-      {!__DEV__ && (
-        <View style={styles.testFlightNoticeCard}>
-          <View style={styles.testFlightNoticeHeader}>
+      {/* 依建置環境顯示對應說明卡片 */}
+      {isSandboxAllowed ? (
+        <View style={styles.sandboxNoticeCard}>
+          <View style={styles.sandboxNoticeHeader}>
             <Ionicons
-              name="information-circle"
+              name="flask"
               size={18}
-              color={colors.primary}
+              color="#B45309"
               style={{ marginRight: 6 }}
             />
-            <AppText style={styles.testFlightNoticeTitle}>
-              TestFlight 測試階段說明
+            <AppText style={styles.sandboxNoticeTitle}>
+              Apple StoreKit 2 沙盒測試環境
             </AppText>
           </View>
-          <AppText secondary style={styles.testFlightNoticeText}>
-            目前為 TestFlight 測試預覽版本，付費方案暫未開放購買。所有核心讀書計畫排程、計時器、任務進度追蹤與 AI 讀書建議皆可免費完整體驗！
+          <AppText secondary style={styles.sandboxNoticeText}>
+            本版本已連線至獨立 Sandbox 驗證伺服器，並啟用 StoreKit 2 測試購買。請使用 Apple Sandbox 測試帳號驗證交易，不會產生任何真實扣款。
           </AppText>
         </View>
-      )}
+      ) : isSandboxMisconfigured ? (
+        <View style={styles.sandboxErrorNoticeCard}>
+          <View style={styles.sandboxNoticeHeader}>
+            <Ionicons
+              name="warning"
+              size={18}
+              color={colors.danger}
+              style={{ marginRight: 6 }}
+            />
+            <AppText style={[styles.sandboxNoticeTitle, { color: colors.danger }]}>
+              Sandbox 環境設定異常
+            </AppText>
+          </View>
+          <AppText secondary style={[styles.sandboxNoticeText, { color: colors.danger }]}>
+            已開啟 Sandbox 測試旗標，但後端網址不符合指定之 Sandbox URL。為防止污染正式環境，系統已全面阻斷所有購買與 API 請求。
+          </AppText>
+        </View>
+      ) : null}
 
       {/* 購買與管理操作按鈕 */}
       <View style={styles.actionContainer}>
@@ -500,11 +601,13 @@ export default function SubscriptionScreen() {
           title={
             isLoading
               ? '處理中...'
-              : !__DEV__ && selectedProduct.tier !== 'free'
-                ? 'TestFlight 測試階段・暫未開放購買'
+              : isSandboxMisconfigured
+                ? 'Sandbox 設定錯誤・已安全阻斷'
                 : isSelectedProductCurrent
                   ? '目前已是此方案'
-                  : `以 ${selectedProduct.priceFormatted} 切換方案`
+                  : isSandboxAllowed
+                    ? `以 ${selectedProduct.priceFormatted} 測試購買方案`
+                    : `以 ${selectedProduct.priceFormatted} 開通方案`
           }
           loading={isLoading}
           onPress={handlePurchase}
@@ -512,14 +615,14 @@ export default function SubscriptionScreen() {
             isLoading ||
             isRestoring ||
             isSelectedProductCurrent ||
-            (!__DEV__ && selectedProduct.tier !== 'free')
+            isSandboxMisconfigured
           }
           style={styles.mainActionButton}
         />
 
         <View style={styles.actionButtonsRow}>
           <Pressable
-            onPress={handleRestore}
+            onPress={() => handleRestore()}
             disabled={isLoading || isRestoring}
             style={styles.secondaryActionBtn}
           >
@@ -701,28 +804,36 @@ const styles = StyleSheet.create({
     backgroundColor: '#FAF5EA',
     borderColor: '#EBDCB9',
   },
-  testFlightNoticeCard: {
-    backgroundColor: '#F3F8F4',
+  sandboxNoticeCard: {
+    backgroundColor: '#FEF9EE',
     borderRadius: radius.md,
     padding: spacing.md,
     marginBottom: spacing.lg,
     borderWidth: 1,
-    borderColor: '#CDE5D4',
+    borderColor: '#FDE68A',
   },
-  testFlightNoticeHeader: {
+  sandboxErrorNoticeCard: {
+    backgroundColor: '#FEF2F2',
+    borderRadius: radius.md,
+    padding: spacing.md,
+    marginBottom: spacing.lg,
+    borderWidth: 1,
+    borderColor: '#FECACA',
+  },
+  sandboxNoticeHeader: {
     flexDirection: 'row',
     alignItems: 'center',
     marginBottom: 4,
   },
-  testFlightNoticeTitle: {
+  sandboxNoticeTitle: {
     fontSize: 13,
     fontWeight: '700',
-    color: colors.primary,
+    color: '#B45309',
   },
-  testFlightNoticeText: {
+  sandboxNoticeText: {
     fontSize: 12,
     lineHeight: 18,
-    color: colors.textSecondary,
+    color: '#92400E',
   },
   statusNoticeHeader: {
     flexDirection: 'row',

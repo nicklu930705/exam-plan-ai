@@ -30,6 +30,7 @@ import {
 } from '../../scheduler/reschedule';
 import { createId, useAppStore } from '../../store/AppStore';
 import { countStudyDays, getExamById, tasksForExam } from '../../store/selectors';
+import { canUnarchiveExam } from '../../subscription/entitlements';
 import { colors, radius, shadow, spacing } from '../../theme';
 import type {
   Exam,
@@ -145,7 +146,7 @@ export default function EditExamScreen() {
 
   if (!originalExam) {
     return (
-      <Screen topInset>
+      <Screen>
         <EmptyState
           title="找不到此場考試"
           message="這場考試可能已被刪除或不存在。"
@@ -218,8 +219,18 @@ export default function EditExamScreen() {
       [
         { text: '取消', style: 'cancel' },
         {
-          text: originalExam.archived ? '取消封存' : '改為封存考試',
+          text: originalExam.archived ? '解除封存' : '改為封存考試',
           onPress: () => {
+            if (originalExam.archived) {
+              const check = canUnarchiveExam(data);
+              if (!check.allowed) {
+                Alert.alert('已達方案上限', check.reason, [
+                  { text: '稍後再說', style: 'cancel' },
+                  { text: '查看會員方案', onPress: () => router.push('/subscription') },
+                ]);
+                return;
+              }
+            }
             toggleArchiveExam(originalExam.id);
             Alert.alert(
               originalExam.archived ? '已解除封存' : '已封存考試',

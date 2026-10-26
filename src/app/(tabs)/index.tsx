@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
 
 import { ActiveTimerBanner } from '../../components/ActiveTimerBanner';
@@ -19,14 +19,26 @@ import { useToday } from '../../hooks/useToday';
 import { prioritizeTasks, TaskPriorityResult } from '../../scheduler/priority';
 import { generateStudyRecommendations } from '../../scheduler/recommendations';
 import {
+  createTaskProgressSnapshot,
+  getCachedAiAdvice,
+  getLatestQuotaCache,
+  isProgressChanged,
+  saveCachedAiAdvice,
+  saveLatestQuotaCache,
+  type TaskProgressSnapshot,
+} from '../../services/aiAdviceCacheService';
+import {
+  fetchAiQuotaFromBackend,
   logDiagnostic,
   requestAiStudyAdvice,
   type AiAdviceServiceResult,
 } from '../../services/aiAdviceService';
 import { useAppStore } from '../../store/AppStore';
+import { getEffectiveTier } from '../../subscription/entitlements';
 
 import {
   computeProgress,
+  getActiveExamById,
   getBehindTasks,
   getExamById,
   getSubject,
@@ -58,27 +70,53 @@ export default function HomeScreen() {
   const [aiAdviceResult, setAiAdviceResult] = useState<AiAdviceServiceResult | null>(null);
   const [isLoadingAi, setIsLoadingAi] = useState<boolean>(false);
   const [showAiCard, setShowAiCard] = useState<boolean>(false);
+  const [aiAdviceCreatedAt, setAiAdviceCreatedAt] = useState<string | null>(null);
+  const [savedTaskSnapshot, setSavedTaskSnapshot] = useState<TaskProgressSnapshot | null>(null);
+  const [isQuotaStale, setIsQuotaStale] = useState<boolean>(false);
+  const [isQuotaSyncing, setIsQuotaSyncing] = useState<boolean>(false);
+  const [isQuotaFetchFailed, setIsQuotaFetchFailed] = useState<boolean>(false);
+  const [isHistoricalAdvice, setIsHistoricalAdvice] = useState<boolean>(false);
 
-  const examWithTasks = data.exams.find((e) => tasksForExam(data.tasks, e.id).length > 0);
+  // 同步防重入鎖與當前考試識別，避免連擊穿透與非同步切換競態
+  const isRequestingAiRef = useRef<boolean>(false);
+  const activeRequestIdRef = useRef<number>(0);
+  const currentExamIdRef = useRef<string | undefined>(undefined);
+  const lastValidAdviceRef = useRef<AiAdviceServiceResult | null>(null);
+
+  const effectiveTier = useMemo(() => getEffectiveTier(data.subscription), [data.subscription]);
+
+  const activeExams = useMemo(() => data.exams.filter((e) => !e.archived), [data.exams]);
+  const activeExamIds = useMemo(() => new Set(activeExams.map((e) => e.id)), [activeExams]);
+  const hasArchivedExams = useMemo(() => data.exams.some((e) => e.archived), [data.exams]);
+
+  const examWithTasks = activeExams.find((e) => tasksForExam(data.tasks, e.id).length > 0);
   const exam =
-    getExamById(data, data.selectedExamId) ??
+    getActiveExamById(data, data.selectedExamId) ??
     examWithTasks ??
     getUpcomingExam(data, today) ??
-    data.exams[0];
+    activeExams[0];
 
-  // 依選取的考試過濾（若選擇 'all' 則包含今日所有考試的任務）
+  useEffect(() => {
+    currentExamIdRef.current = exam?.id;
+  }, [exam?.id]);
+
+  // 依選取的考試過濾（僅計算進行中考試的任務，嚴格排除已封存考試）
   const relevantTasks = useMemo(() => {
-    if (filterExamId === 'all') return data.tasks;
-    return tasksForExam(data.tasks, filterExamId);
-  }, [data.tasks, filterExamId]);
+    const unarchivedTasks = data.tasks.filter((t) => activeExamIds.has(t.examId));
+    if (filterExamId === 'all') return unarchivedTasks;
+    if (activeExamIds.has(filterExamId)) {
+      return tasksForExam(unarchivedTasks, filterExamId);
+    }
+    return unarchivedTasks;
+  }, [data.tasks, filterExamId, activeExamIds]);
 
   const todayTasks = useMemo(() => tasksForDate(relevantTasks, today), [relevantTasks, today]);
   const progress = useMemo(() => computeProgress(todayTasks), [todayTasks]);
 
-  // 個人化任務優先度計算
+  // 個人化任務優先度計算（僅針對進行中考試）
   const priorities = useMemo(
-    () => prioritizeTasks(relevantTasks, data.exams, data.preferences, today),
-    [relevantTasks, data.exams, data.preferences, today],
+    () => prioritizeTasks(relevantTasks, activeExams, data.preferences, today),
+    [relevantTasks, activeExams, data.preferences, today],
   );
 
   const priorityMap = useMemo(() => {
@@ -103,17 +141,17 @@ export default function HomeScreen() {
     });
   }, [todayTasks, sortByPriority, priorityMap]);
 
-  // 個人化讀書建議計算
+  // 個人化讀書建議計算（僅針對進行中考試與其任務）
   const allRecommendations = useMemo(
     () =>
       generateStudyRecommendations({
-        exams: data.exams,
-        tasks: data.tasks,
+        exams: activeExams,
+        tasks: data.tasks.filter((t) => activeExamIds.has(t.examId)),
         preferences: data.preferences,
         today,
         selectedExamId: exam?.id,
       }),
-    [data.exams, data.tasks, data.preferences, today, exam?.id],
+    [activeExams, data.tasks, activeExamIds, data.preferences, today, exam?.id],
   );
 
   const activeRecommendations = useMemo(
@@ -134,10 +172,160 @@ export default function HomeScreen() {
   const nextTask = todayTasks.find((t) => t.status !== 'done');
   const isRestDay = data.preferences.restDays.includes(weekdayOf(today));
 
+  // 當學習進度改變時，自動判定快取的 AI 建議是否落後於最新進度
+  const isOutdatedProgress = useMemo(() => {
+    if (!savedTaskSnapshot || !exam) return false;
+    const currentExamTasks = tasksForExam(data.tasks, exam.id);
+    return isProgressChanged(savedTaskSnapshot, currentExamTasks);
+  }, [savedTaskSnapshot, data.tasks, exam]);
+
+  // 冷啟動或切換考試 / 跨日 / 會員方案變動時：還原 AI 建議快取與即時額度
+  useEffect(() => {
+    let isCancelled = false;
+
+    async function restoreAdviceAndQuota() {
+      if (!exam?.id) {
+        setShowAiCard(false);
+        setAiAdviceResult(null);
+        setSavedTaskSnapshot(null);
+        setAiAdviceCreatedAt(null);
+        setIsHistoricalAdvice(false);
+        lastValidAdviceRef.current = null;
+        setIsQuotaSyncing(false);
+        setIsQuotaFetchFailed(false);
+        setIsQuotaStale(false);
+        return;
+      }
+
+      // 1. 查詢該考試、今日與該會員等級的本機快取（支援保留期內之跨日歷史建議平滑查閱）
+      const { cachedAdvice, isHistorical } = await getCachedAiAdvice(exam.id, today, effectiveTier);
+      if (isCancelled) return;
+
+      const isHistoricalProToFree = effectiveTier === 'free' && cachedAdvice?.tier !== 'free';
+
+      // 檢查本機是否有同日、同方案之有效額度快取
+      const sameDayQuota = await getLatestQuotaCache(today, effectiveTier);
+      if (isCancelled) return;
+
+      const validLocalQuota = isHistoricalProToFree
+        ? sameDayQuota
+        : (sameDayQuota ?? cachedAdvice?.quotaSnapshot);
+
+      if (cachedAdvice) {
+        setSavedTaskSnapshot(cachedAdvice.taskSnapshot ?? null);
+        setAiAdviceCreatedAt(cachedAdvice.createdAt);
+        setIsHistoricalAdvice(Boolean(isHistorical));
+        setShowAiCard(true);
+        setIsQuotaStale(Boolean(validLocalQuota)); // 若有同日有效快取，標記為 stale 直到後端即時更新
+        setIsQuotaFetchFailed(false);
+
+        const restoredResult: AiAdviceServiceResult = {
+          success: true,
+          status: 'success',
+          source: cachedAdvice.source,
+          advice: cachedAdvice.advice,
+          disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
+          cached: true,
+          quota: validLocalQuota ?? undefined,
+          quotaStatus: validLocalQuota
+            ? {
+                used: validLocalQuota.usedToday,
+                limit: validLocalQuota.dailyLimit,
+                remaining: validLocalQuota.remainingToday,
+                isExceeded: validLocalQuota.remainingToday <= 0,
+                resetsAt: validLocalQuota.resetsAt,
+              }
+            : undefined,
+        };
+        setAiAdviceResult(restoredResult);
+        lastValidAdviceRef.current = restoredResult;
+      } else {
+        setShowAiCard(false);
+        setAiAdviceResult(null);
+        setSavedTaskSnapshot(null);
+        setAiAdviceCreatedAt(null);
+        setIsHistoricalAdvice(false);
+        lastValidAdviceRef.current = null;
+      }
+
+      // 2. 背景唯讀查詢最新真實額度（不發起 AI 推論，不消耗額度）
+      setIsQuotaSyncing(true);
+      try {
+        const freshQuota = await fetchAiQuotaFromBackend();
+        if (isCancelled) return;
+
+        if (freshQuota) {
+          const isTierMatched =
+            effectiveTier === 'free'
+              ? freshQuota.tier === 'free'
+              : freshQuota.tier === 'pro';
+
+          if (isTierMatched || !freshQuota.tier) {
+            await saveLatestQuotaCache(freshQuota, today);
+            setIsQuotaSyncing(false);
+            setIsQuotaStale(false);
+            setIsQuotaFetchFailed(false);
+
+            setAiAdviceResult((prev) => {
+              if (!prev) return prev;
+              const updated = {
+                ...prev,
+                quota: freshQuota,
+                quotaStatus: {
+                  used: freshQuota.usedToday,
+                  limit: freshQuota.dailyLimit,
+                  remaining: freshQuota.remainingToday,
+                  isExceeded: freshQuota.remainingToday <= 0,
+                  resetsAt: freshQuota.resetsAt,
+                },
+              };
+              lastValidAdviceRef.current = updated;
+              return updated;
+            });
+          } else {
+            setIsQuotaSyncing(false);
+            if (!validLocalQuota) {
+              setIsQuotaFetchFailed(true);
+            } else {
+              setIsQuotaStale(true);
+            }
+          }
+        } else {
+          // freshQuota 為 null（離線或伺服器未回應）
+          setIsQuotaSyncing(false);
+          if (!validLocalQuota) {
+            setIsQuotaFetchFailed(true);
+          } else {
+            setIsQuotaStale(true);
+          }
+        }
+      } catch {
+        if (!isCancelled) {
+          setIsQuotaSyncing(false);
+          if (!validLocalQuota) {
+            setIsQuotaFetchFailed(true);
+          } else {
+            setIsQuotaStale(true);
+          }
+        }
+      }
+    }
+
+    restoreAdviceAndQuota();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [exam?.id, today, effectiveTier]);
+
   const handleRequestAiAdvice = async () => {
     logDiagnostic('AI_BUTTON_PRESSED', { examName: exam?.name, screen: 'index' });
-    if (!exam || isLoadingAi) return;
+    // 同步防重入鎖定：React setState 非同步期間若有極速連點，立即同步攔截
+    if (!exam || isRequestingAiRef.current || isLoadingAi) return;
 
+    isRequestingAiRef.current = true;
+    const requestedExamId = exam.id;
+    const requestId = ++activeRequestIdRef.current;
     setIsLoadingAi(true);
     setShowAiCard(true);
     setAiAdviceResult(null);
@@ -187,22 +375,86 @@ export default function HomeScreen() {
         recordAiUsage();
       }
 
-      setAiAdviceResult(result);
+      // 檢查非同步回應競態：避免使用者快速切換考試或舊請求延遲返回時覆蓋目前畫面
+      const isCurrentExam =
+        activeRequestIdRef.current === requestId && currentExamIdRef.current === requestedExamId;
+
+      if (result.success && result.advice) {
+        const nowIso = new Date().toISOString();
+        const currentExamTasks = tasksForExam(data.tasks, requestedExamId);
+        const snapshot = createTaskProgressSnapshot(currentExamTasks);
+
+        // 無論當前畫面是否切換，成功結果一律安全寫入該考試的專屬快取中，避免浪費已扣之額度
+        await saveCachedAiAdvice({
+          examId: requestedExamId,
+          date: today,
+          tier: effectiveTier,
+          createdAt: nowIso,
+          advice: result.advice,
+          source: result.source || 'openai_ai',
+          taskSnapshot: snapshot,
+          quotaSnapshot: result.quota,
+        });
+
+        if (result.quota) {
+          await saveLatestQuotaCache(result.quota, today);
+        }
+
+        if (isCurrentExam) {
+          setIsQuotaSyncing(false);
+          setIsQuotaFetchFailed(false);
+          setIsQuotaStale(false);
+          setIsHistoricalAdvice(false);
+          setSavedTaskSnapshot(snapshot);
+          setAiAdviceCreatedAt(nowIso);
+          setAiAdviceResult(result);
+          lastValidAdviceRef.current = result;
+        }
+      } else if (isCurrentExam) {
+        setAiAdviceResult(result);
+      }
     } catch (err: any) {
       logDiagnostic('AI_REQUEST_FAILED', {
         screen: 'index',
         error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
       });
-      setAiAdviceResult({
-        success: false,
-        status: 'network_error',
-        source: 'fallback_rule_engine',
-        disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
-        error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
-      });
+      if (activeRequestIdRef.current === requestId && currentExamIdRef.current === requestedExamId) {
+        setAiAdviceResult({
+          success: false,
+          status: 'network_error',
+          source: 'fallback_rule_engine',
+          disclaimer: 'AI 建議僅供學習策略與心理激勵參考。',
+          error: err?.message || '網路連線失敗，請檢查 iPhone 網路連線。',
+        });
+      }
     } finally {
-      setIsLoadingAi(false);
-      logDiagnostic('AI_LOADING_FINISHED', { screen: 'index' });
+      // 確保在成功、失敗、逾時所有情況下均同步釋放鎖；舊請求完成不得錯誤解除新請求之鎖
+      if (activeRequestIdRef.current === requestId) {
+        isRequestingAiRef.current = false;
+        setIsLoadingAi(false);
+        logDiagnostic('AI_LOADING_FINISHED', { screen: 'index' });
+      }
+    }
+  };
+
+  const handleOpenOrRequestAiAdvice = () => {
+    if (isRequestingAiRef.current || isLoadingAi) return;
+    if (aiAdviceResult?.advice) {
+      setShowAiCard(true);
+      return;
+    }
+    if (lastValidAdviceRef.current?.advice) {
+      setAiAdviceResult(lastValidAdviceRef.current);
+      setShowAiCard(true);
+      return;
+    }
+    handleRequestAiAdvice();
+  };
+
+  const handleDismissAiCard = () => {
+    setShowAiCard(false);
+    if (!aiAdviceResult?.advice && lastValidAdviceRef.current) {
+      setAiAdviceResult(lastValidAdviceRef.current);
     }
   };
 
@@ -221,8 +473,29 @@ export default function HomeScreen() {
     </Pressable>
   );
 
-  // ───── 沒有任何考試：空白狀態 ─────
+  // ───── 沒有任何進行中的考試：空白狀態 ─────
   if (!exam) {
+    if (hasArchivedExams) {
+      return (
+        <Screen topInset>
+          <ScreenHeader title="今天" subtitle={formatFullDate(today)} />
+          <EmptyState
+            title="所有考試皆已封存"
+            message="目前沒有進行中的考試計畫。你可以建立新考試，或至「管理考試」解除封存舊目標。"
+            actionTitle="建立新考試"
+            onAction={() => router.push('/exam/new')}
+          />
+          <View style={{ alignItems: 'center', marginTop: spacing.md }}>
+            <Button
+              title="前往管理已封存考試"
+              variant="plain"
+              onPress={() => router.push('/exams')}
+            />
+          </View>
+        </Screen>
+      );
+    }
+
     return (
       <Screen topInset>
         <ScreenHeader title="今天" subtitle={formatFullDate(today)} />
@@ -275,8 +548,8 @@ export default function HomeScreen() {
         </AppText>
       ) : null}
 
-      {/* 考試快速切換標籤列（若有多場考試） */}
-      {data.exams.length > 1 ? (
+      {/* 考試快速切換標籤列（若有多場進行中考試） */}
+      {activeExams.length > 1 ? (
         <ScrollView
           horizontal
           showsHorizontalScrollIndicator={false}
@@ -296,7 +569,7 @@ export default function HomeScreen() {
             </AppText>
           </Pressable>
 
-          {data.exams.map((e) => {
+          {activeExams.map((e) => {
             const isSelected = e.id === filterExamId || (filterExamId !== 'all' && e.id === exam.id);
             return (
               <Pressable
@@ -370,12 +643,19 @@ export default function HomeScreen() {
             error={aiAdviceResult?.error}
             errorCode={aiAdviceResult?.errorCode}
             examName={exam?.name}
+            tier={effectiveTier}
             quotaStatus={aiAdviceResult?.quotaStatus}
             quota={aiAdviceResult?.quota}
+            generatedAt={aiAdviceCreatedAt}
+            isOutdatedProgress={isOutdatedProgress}
+            isQuotaStale={isQuotaStale}
+            isHistorical={isHistoricalAdvice}
+            isQuotaSyncing={isQuotaSyncing}
+            isQuotaFetchFailed={isQuotaFetchFailed}
             isLoading={isLoadingAi}
             onRefresh={handleRequestAiAdvice}
             onRetry={handleRequestAiAdvice}
-            onDismiss={() => setShowAiCard(false)}
+            onDismiss={handleDismissAiCard}
           />
         </View>
       ) : activeRecommendations.length > 0 ? (
@@ -388,7 +668,7 @@ export default function HomeScreen() {
               </AppText>
             </View>
             <Pressable
-              onPress={handleRequestAiAdvice}
+              onPress={handleOpenOrRequestAiAdvice}
               disabled={isLoadingAi}
               style={({ pressed }) => [styles.aiHeaderPill, pressed && { opacity: 0.7 }]}
               hitSlop={8}
@@ -420,7 +700,7 @@ export default function HomeScreen() {
       ) : (
         <View style={styles.recommendationSection}>
           <Pressable
-            onPress={handleRequestAiAdvice}
+            onPress={handleOpenOrRequestAiAdvice}
             disabled={isLoadingAi}
             style={({ pressed }) => [styles.aiStandaloneBtn, pressed && { opacity: 0.8 }]}
             hitSlop={8}

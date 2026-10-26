@@ -5,15 +5,31 @@ import { addDays, diffDays, weekdayOf } from '../utils/date';
  * 從資料中計算畫面需要的資訊（純函式，方便日後撰寫測試）
  */
 
-/** 最近一場尚未結束的考試（考試當天仍算） */
+/** 最近一場尚未結束且進行中（未封存）的考試（考試當天仍算） */
 export function getUpcomingExam(data: AppData, today: ISODate): Exam | undefined {
   return [...data.exams]
-    .filter((e) => diffDays(today, e.examDate) >= 0)
+    .filter((e) => !e.archived && diffDays(today, e.examDate) >= 0)
     .sort((a, b) => a.examDate.localeCompare(b.examDate))[0];
 }
 
 export function getExamById(data: AppData, id: string | undefined): Exam | undefined {
   return data.exams.find((e) => e.id === id);
+}
+
+/** 取得所有進行中（未封存）的考試 */
+export function getActiveExams(data: AppData): Exam[] {
+  return data.exams.filter((e) => !e.archived);
+}
+
+/** 取得所有已封存的考試 */
+export function getArchivedExams(data: AppData): Exam[] {
+  return data.exams.filter((e) => e.archived);
+}
+
+/** 取得指定 ID 且未封存之進行中考試 */
+export function getActiveExamById(data: AppData, id: string | undefined): Exam | undefined {
+  if (!id) return undefined;
+  return data.exams.find((e) => e.id === id && !e.archived);
 }
 
 export function getSubject(data: AppData, subjectId: string): Subject | undefined {

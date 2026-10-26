@@ -6,7 +6,13 @@ export type PlanTier = 'free' | 'pro' | 'lifetime';
 
 export type BillingPeriod = 'monthly' | 'annual' | 'lifetime' | 'none';
 
-export type SubscriptionStatus = 'active' | 'expired' | 'canceled' | 'none';
+export type SubscriptionStatus =
+  | 'active'
+  | 'expired'
+  | 'canceled'
+  | 'revoked'
+  | 'refunded'
+  | 'none';
 
 export interface UserSubscription {
   plan: PlanTier;
@@ -20,6 +26,8 @@ export interface UserSubscription {
   purchaseDate?: string;
   isAutoRenewing?: boolean;
   revocationDate?: string;
+  proofToken?: string;
+  signedTransaction?: string;
 }
 
 export interface AiUsageRecord {
