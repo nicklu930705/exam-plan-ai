@@ -534,7 +534,7 @@
         <a href="#faq-tiers" class="nav-pill">💎 會員方案差異</a>
         <a href="#faq-restore" class="nav-pill">🔄 恢復購買教學</a>
         <a href="#faq-subscription" class="nav-pill">⚙️ 取消與管理訂閱</a>
-        <a href="#contact" class="nav-pill">✉️ 客服聯絡狀態</a>
+        <a href="#contact" class="nav-pill">✉️ 聯絡官方客服</a>
       </nav>
     </header>
 
@@ -924,55 +924,26 @@
         </div>
       </section>
 
-      <!-- 6. 客服支援管道說明 (無虛構 Email，具備可配置欄位) -->
+      <!-- 6. 客服支援管道與聯絡方式 -->
       <section id="contact" class="card contact-card">
         <div class="card-header">
           <div class="card-icon">✉️</div>
           <h2 class="card-title">6. 客服支援管道與聯絡方式</h2>
         </div>
         <p style="font-size: 14.5px; color: var(--text-sub); margin-bottom: 12px;">
-          若您在排程使用、帳號權益或功能操作上遇到疑難，請參閱下方官方聯絡狀態說明。
+          若您在排程使用、帳號權益或功能操作上遇到任何問題，歡迎透過官方客服信箱與我們聯繫。
         </p>
 
-        <!-- 動態聯絡卡片（支援有信箱與無信箱之安全自動適配，不虛構任何資訊） -->
+        <!-- 官方客服聯絡卡片 -->
         <div id="contactStatusBox" class="contact-status-box">
-          <!-- 狀態 A：專案管理員配置正式信箱後自動顯示此區塊 -->
-          <div id="contactConfiguredState" style="display: none;">
-            <div class="contact-info-row">
-              <span class="contact-info-label">官方客服信箱：</span>
-              <a id="supportEmailLink" class="email-link" href=""></a>
-              <button type="button" class="copy-btn" id="copyEmailBtn" onclick="copySupportEmail()">複製信箱</button>
-            </div>
-            <div class="contact-info-row">
-              <span class="contact-info-label">服務時段：</span>
-              <span id="supportHoursText">週一至週五 09:30 - 18:30 (台北時間 UTC+8)</span>
-            </div>
-            <div class="contact-info-row">
-              <span class="contact-info-label">回覆時效：</span>
-              <span>收到來信後將於 24 至 48 小時內依序回覆（國定例假日順延）</span>
-            </div>
+          <div class="contact-info-row">
+            <span class="contact-info-label">官方客服信箱：</span>
+            <a id="supportEmailLink" class="email-link" href="mailto:examplanai.support@gmail.com">examplanai.support@gmail.com</a>
+            <button type="button" class="copy-btn" id="copyEmailBtn" onclick="copySupportEmail()">複製信箱</button>
           </div>
-
-          <!-- 狀態 B：客服信箱尚未配置時的安全指引（絕不虛構信箱、絕不聲稱未實作之回饋表單） -->
-          <div id="contactUnconfiguredState">
-            <div style="display: flex; align-items: flex-start; gap: 10px; margin-bottom: 12px;">
-              <span style="font-size: 20px;">📌</span>
-              <div>
-                <strong style="color: var(--text-main); font-size: 15px;">官方專屬客服信箱建置中</strong>
-                <p style="font-size: 13.5px; color: var(--text-sub); margin-top: 4px;">
-                  目前官方專屬客服電子郵件通道尚待專案管理員完成設定，尚未正式啟用。
-                </p>
-              </div>
-            </div>
-
-            <div class="note-box">
-              💬 <strong>在客服信箱正式就緒前的支援與排解途徑：</strong>
-              <ul style="margin-left: 20px; margin-top: 6px;">
-                <li><strong>常見問題快速排解：</strong>建議先查閱上方 5 大專題說明（涵蓋建立排程、AI 額度、訂閱管理與備份還原），多數常見疑問均有詳細解答。</li>
-                <li><strong>TestFlight 測試階段回饋：</strong>若您目前使用的是 TestFlight 測試版本，可直接透過 TestFlight App 內建之「傳送 Beta 版回饋」功能（支援附加畫面截圖與系統紀錄）反映給開發團隊。</li>
-                <li><strong>問題回報建議記錄資訊：</strong>建議考生先記錄「裝置型號（如 iPhone 15）」、「iOS 版本」與「操作步驟或異常畫面」，以便正式通道開啟後能第一時間提供完整資訊以加速排查。</li>
-              </ul>
-            </div>
+          <div class="contact-info-row">
+            <span class="contact-info-label">處理說明：</span>
+            <span>來信請註明您的 iOS 裝置機型、系統版本與問題描述，我們將依序儘速為您排查與回覆。</span>
           </div>
         </div>
 
@@ -1033,35 +1004,18 @@
   <!-- 客服配置腳本與互動邏輯 -->
   <script>
     // =========================================================================
-    // 【客服聯絡資訊配置區 - Support Configuration】
-    // 若已開通官方客服信箱，請直接在下方 email 填入實際信箱（例如 'support@yourdomain.com'）
-    // 若尚未配置或尚未開通，請保持空字串 ""，系統將自動以「建置中安全指引」模式安全顯示，絕不顯示任何虛構信箱。
+    // 【官方客服聯絡資訊配置 - Support Configuration】
     // =========================================================================
     const SUPPORT_CONFIG = {
-      email: "", // 可配置欄位：填入真實信箱後將自動啟用顯示與 mailto 連結
-      serviceHours: "週一至週五 09:30 - 18:30 (台北時間 UTC+8)",
-      responseLeadTime: "工作日內 24 至 48 小時內回覆"
+      email: "examplanai.support@gmail.com"
     };
 
-    // 1. 初始化客服配置狀態
+    // 1. 初始化官方客服信箱
     (function initSupportContact() {
-      const configuredBox = document.getElementById("contactConfiguredState");
-      const unconfiguredBox = document.getElementById("contactUnconfiguredState");
       const emailLink = document.getElementById("supportEmailLink");
-      const hoursText = document.getElementById("supportHoursText");
-
-      if (SUPPORT_CONFIG.email && SUPPORT_CONFIG.email.trim() !== "") {
-        const cleanEmail = SUPPORT_CONFIG.email.trim();
-        emailLink.href = "mailto:" + cleanEmail;
-        emailLink.textContent = cleanEmail;
-        if (SUPPORT_CONFIG.serviceHours && hoursText) {
-          hoursText.textContent = SUPPORT_CONFIG.serviceHours;
-        }
-        configuredBox.style.display = "block";
-        unconfiguredBox.style.display = "none";
-      } else {
-        configuredBox.style.display = "none";
-        unconfiguredBox.style.display = "block";
+      if (emailLink && SUPPORT_CONFIG.email) {
+        emailLink.href = "mailto:" + SUPPORT_CONFIG.email;
+        emailLink.textContent = SUPPORT_CONFIG.email;
       }
     })();
 
